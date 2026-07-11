@@ -222,6 +222,7 @@
 - 修复复用现有 `test_mooncake_layerwise_connector.py` 的模块隔离窗口：先保存并移除伪模块，导入真实 MultiConnector/Layerwise 模块，再恢复伪模块；删除会受全局收集顺序影响的独立测试文件。生产代码未为 UT 增加 import 兜底。
 - 重新运行 main2main evaluator 后，38 个预测文件仅 8 个与实际修改相交，precision 为 0.211；因此所有候选重新按 direct call、override、monkeypatch、注册替换及实际运行门禁逐项验证。复核删除了 310P 非支持 CP 公式与 coordinator 不可达 Uniform-Mamba 分支，并发现、补齐了工具未直接给出结论的两处 EAGLE effective-block 漏同步。
 - 非 #40996 的四组修改也已逐项复核：#47381 两处均为真实 override；#46865 为工厂注册替换；#46694 只影响复制版 BalanceScheduler；#48085 为 Ascend 全路径覆写。未因同名接口、参数存在性或测试期望而新增修改。
+- `fc42c3e5` 对应 run `29147023887` 的远程 pre-commit、mypy、coverage config 与 test selection 全部通过；main/tag CPU 各仅失败 1 项，均为新增 310P row-size UT 的第二次调用离开 `NPUInputBatch` mock 作用域，误构造真实 block table 后触发未初始化 PCP group 的断言。修复只重新隔离第二次构造并检查传参，不修改生产 PCP 初始化或增加兜底。
 
 ## 8. 后续每小时 CI 观察项
 

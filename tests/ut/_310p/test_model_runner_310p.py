@@ -158,8 +158,12 @@ class TestNPUModelRunner310(TestBase):
         )
 
         runner.cache_config.enable_prefix_caching = True
-        runner.may_reinitialize_input_batch(kv_cache_config)
-        prefix_kwargs = mock_input_batch.call_args.kwargs
+        with (
+            patch("vllm_ascend._310p.model_runner_310p.NPUInputBatch") as prefix_input_batch,
+            patch("vllm_ascend._310p.model_runner_310p.get_total_cp_world_size", return_value=1),
+        ):
+            runner.may_reinitialize_input_batch(kv_cache_config)
+        prefix_kwargs = prefix_input_batch.call_args.kwargs
         self.assertEqual(prefix_kwargs["max_num_blocks_per_req"], [4, 6])
         self.assertIs(kwargs["kv_cache_groups"], kv_cache_config.kv_cache_groups)
         self.assertEqual(kwargs["cp_kv_cache_interleave_size"], 4)
