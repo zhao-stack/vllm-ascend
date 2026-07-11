@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.single_type_kv_cache_manager import (
     SlidingWindowManager,
 )
@@ -288,7 +289,7 @@ def test_uniform_mamba_hash_view_and_pd_skip_match_installed_contract() -> None:
     coordinator.eagle_attn_group_indices = set()
     coordinator.block_pool = MagicMock()
     coordinator.lcm_block_size = 16
-    block_hashes = []
+    block_hashes: list[BlockHash] = []
 
     coordinator.find_longest_cache_hit(block_hashes, max_cache_hit_length=16)
     if vllm_version_is("0.23.0"):
