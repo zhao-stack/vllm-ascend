@@ -215,15 +215,13 @@
 
 本节记录的是推送前源码闭包；推送后只处理新 CI 中能够证明由 `(ab7961a, e5588e49]` 引入、且属于上述或新增上游契约变化的失败。不得更新 golden、放宽阈值、关闭功能或增加兜底来换取用例通过。
 
-### 7.4 0710 适配后的 CPU UT 收集修复与必要性复核
+### 7.4 0710 适配必要性与测试范围复核
 
-- 首次 0710 head `9ba3cd2d` 的 mypy 只失败于新增测试缺少 `block_hashes` 类型标注；补为 `list[BlockHash]` 后，lint、mypy 与手工 pre-commit 均通过，并提交为 `502a6240`。
-- `502a6240` 对应 run `29145563567` 的 main/tag CPU job 均在收集 `tests/ut/distributed/test_ascend_multi_connector.py` 时失败：`tests/ut/distributed/ascend_store/_mock_deps.py` 为隔离 AscendStore 安装了 `__path__` 为空的伪 `vllm_ascend.distributed.kv_transfer` 父包，后收集的新测试无法在该伪父包下导入真实 `ascend_multi_connector`。这不是生产模块缺失，也不是 main/tag API 差异。
-- 修复复用现有 `test_mooncake_layerwise_connector.py` 的模块隔离窗口：先保存并移除伪模块，导入真实 MultiConnector/Layerwise 模块，再恢复伪模块；删除会受全局收集顺序影响的独立测试文件。生产代码未为 UT 增加 import 兜底。
 - 重新运行 main2main evaluator 后，38 个预测文件仅 8 个与实际修改相交，precision 为 0.211；因此所有候选重新按 direct call、override、monkeypatch、注册替换及实际运行门禁逐项验证。复核删除了 310P 非支持 CP 公式与 coordinator 不可达 Uniform-Mamba 分支，并发现、补齐了工具未直接给出结论的两处 EAGLE effective-block 漏同步。
-- 非 #40996 的四组修改也已逐项复核：#47381 两处均为真实 override；#46865 为工厂注册替换；#46694 只影响复制版 BalanceScheduler；#48085 为 Ascend 全路径覆写。未因同名接口、参数存在性或测试期望而新增修改。
-- `fc42c3e5` 对应 run `29147023887` 的远程 pre-commit、mypy、coverage config 与 test selection 全部通过；main/tag CPU 各仅失败 1 项，均为新增 310P row-size UT 的第二次调用离开 `NPUInputBatch` mock 作用域，误构造真实 block table 后触发未初始化 PCP group 的断言。修复只重新隔离第二次构造并检查传参，不修改生产 PCP 初始化或增加兜底。
-- 修复 head `d0e5afc4` 对应 run `29147491841` 已完成目标验收：远程 pre-commit、mypy、coverage config、test selection 全部成功；main `e5588e49` CPU job `86531883346` 与 tag `v0.23.0` CPU job `86531883357` 均成功，两个 `Run selected tests without device` 步骤均通过。
+- 非 #40996 的四组生产修改也已逐项复核：#47381 两处均为真实 override；#46865 为工厂注册替换；#46694 只影响复制版 BalanceScheduler；#48085 为 Ascend 全路径覆写。未因同名接口、参数存在性或测试期望而新增生产修改。
+- 对 `(1a56e8eb, 0710 head]` 的测试改动按 PR 职责再次精简：纯新增回归看护用例不在本 main2main PR 中呈现，完整版本保存在本地分支 `codex/m2m-0710-adaptation-tests`，不推送远端。
+- 本 PR 只保留既有 UT 为适配新接口所必需的调整：310P runner fixture 补齐 `VllmConfig` 字段；BalanceScheduler 既有 tag-copy AST 检查规范化版本 helper；hybrid CP block-size 既有断言按 main/tag 契约分流。
+- 精简前生产 head `d0e5afc4` 的 run `29147491841` 已确认远程 pre-commit、mypy、coverage config、test selection 以及 main `e5588e49` / tag `v0.23.0` 双 CPU UT 全部成功；精简后的最终结果以新 head CI 为准。
 
 ## 8. 后续每小时 CI 观察项
 

@@ -45,9 +45,6 @@ for k in list(sys.modules):
 for _m in _to_remove:
     _saved_modules[_m] = sys.modules.pop(_m)
 
-from vllm_ascend.distributed.kv_transfer.ascend_multi_connector import (  # noqa: E402
-    AscendMultiConnector,
-)
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (  # noqa: E402
     KVCacheRecvingLayerThread,
     KVCacheSendingLayerThread,
@@ -67,7 +64,6 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     string_to_int64_hash,
     zmq_ctx,
 )
-from vllm_ascend.utils import vllm_version_is  # noqa: E402
 
 # Restore the mocked modules so other test files still work correctly.
 # For keys that our real import loaded, overwrite with the saved mock.
@@ -98,48 +94,6 @@ def _make_mock_kv_cache_config(block_size=16):
     kv_cache_config = MagicMock()
     kv_cache_config.kv_cache_groups = [group_spec]
     return kv_cache_config
-
-
-def test_multi_connector_update_after_alloc_matches_installed_contract():
-    connector = AscendMultiConnector.__new__(AscendMultiConnector)
-    chosen = MagicMock()
-    other = MagicMock()
-    layerwise = MagicMock(spec=MooncakeLayerwiseConnector)
-    connector._connectors = [chosen, other, layerwise]
-    connector._requests_to_connector = {"req": 0}
-
-    request = SimpleNamespace(request_id="req")
-    blocks = MagicMock()
-    empty_blocks = blocks.new_empty.return_value
-
-    connector.update_state_after_alloc(request, blocks, 32)
-
-    chosen.update_state_after_alloc.assert_called_once_with(request, blocks, 32)
-    expected_other_blocks = empty_blocks if vllm_version_is("0.23.0") else blocks
-    assert blocks.new_empty.call_count == (1 if vllm_version_is("0.23.0") else 0)
-    other.update_state_after_alloc.assert_called_once_with(
-        request,
-        expected_other_blocks,
-        0,
-    )
-    layerwise.update_state_after_alloc.assert_called_once_with(request, blocks, 32)
-
-
-def test_multi_connector_update_after_alloc_without_chosen_connector():
-    connector = AscendMultiConnector.__new__(AscendMultiConnector)
-    other = MagicMock()
-    connector._connectors = [other]
-    connector._requests_to_connector = {}
-
-    request = SimpleNamespace(request_id="cold-request")
-    blocks = MagicMock()
-    empty_blocks = blocks.new_empty.return_value
-
-    connector.update_state_after_alloc(request, blocks, 0)
-
-    expected_blocks = empty_blocks if vllm_version_is("0.23.0") else blocks
-    assert blocks.new_empty.call_count == (1 if vllm_version_is("0.23.0") else 0)
-    other.update_state_after_alloc.assert_called_once_with(request, expected_blocks, 0)
 
 
 class TestKVCacheSendingLayerThread(unittest.TestCase):

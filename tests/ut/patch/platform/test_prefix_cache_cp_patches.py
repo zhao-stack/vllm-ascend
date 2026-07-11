@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.single_type_kv_cache_manager import (
     SlidingWindowManager,
 )
@@ -134,15 +133,15 @@ def _make_coordinator_for_effective_block_size(
 @pytest.mark.parametrize(
     ("enable_prefix_caching", "expected_hash_block_size"),
     [
-        pytest.param(False, math.lcm(24, 16) * 2 * 2, id="cp-without-prefix-caching"),
-        pytest.param(True, math.gcd(24, 16), id="cp-with-prefix-caching"),
+        pytest.param(False, math.lcm(16, 32) * 2 * 2, id="cp-without-prefix-caching"),
+        pytest.param(True, math.gcd(16, 32), id="cp-with-prefix-caching"),
     ],
 )
 def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
     enable_prefix_caching: bool,
     expected_hash_block_size: int,
 ) -> None:
-    kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=24, mamba_block_size=16)
+    kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=16, mamba_block_size=32)
     vllm_config = _make_vllm_config(
         enable_prefix_caching=enable_prefix_caching,
         dcp=2,
@@ -155,11 +154,11 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
     )
 
     if vllm_version_is("0.23.0"):
-        expected_scheduler_block_size = math.lcm(24, 16) * 2 * 2
+        expected_scheduler_block_size = math.lcm(16, 32) * 2 * 2
     else:
-        # Attention blocks are CP-sharded (24 * 4); Mamba blocks remain 16.
-        expected_scheduler_block_size = math.lcm(24 * 2 * 2, 16)
-        expected_hash_block_size = math.gcd(24 * 2 * 2, 16) if enable_prefix_caching else expected_scheduler_block_size
+        # Attention blocks are CP-sharded (16 * 4); Mamba blocks remain 32.
+        expected_scheduler_block_size = math.lcm(16 * 2 * 2, 32)
+        expected_hash_block_size = math.gcd(16 * 2 * 2, 32) if enable_prefix_caching else expected_scheduler_block_size
     assert scheduler_block_size == expected_scheduler_block_size
     assert hash_block_size == expected_hash_block_size
 
@@ -194,19 +193,6 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
             id="mamba-keeps-physical-block-size-with-prefix-caching",
         ),
         pytest.param(
-            lambda: MambaSpec(
-                block_size=16,
-                shapes=((1,),),
-                dtypes=(torch.float32,),
-                mamba_cache_mode="none",
-            ),
-            2,
-            2,
-            False,
-            64 if vllm_version_is("0.23.0") else 16,
-            id="mamba-main-keeps-physical-block-size-with-connector-only-hashing",
-        ),
-        pytest.param(
             lambda: FullAttentionSpec(
                 block_size=16,
                 num_kv_heads=8,
@@ -235,58 +221,6 @@ def test_get_effective_block_size(
     )
 
     assert coordinator._get_effective_block_size(spec_factory()) == expected
-
-
-@pytest.mark.parametrize(
-    "method_name",
-    ["find_longest_cache_hit", "find_longest_cache_hit_per_group"],
-)
-def test_eagle_probe_uses_installed_group_block_contract(method_name: str) -> None:
-    spec = FullAttentionSpec(
-        block_size=16,
-        num_kv_heads=8,
-        head_size=64,
-        dtype=torch.float16,
-    )
-
-    class CapturingManager:
-        max_lengths: list[int] = []
-
-        @classmethod
-        def find_longest_cache_hit(cls, *, max_length: int, **_kwargs):
-            cls.max_lengths.append(max_length)
-            return ([MagicMock(), MagicMock()],)
-
-    class ReducingManager:
-        @classmethod
-        def find_longest_cache_hit(cls, **_kwargs):
-            return ([MagicMock(), MagicMock()],)
-
-    coordinator = _make_coordinator_for_effective_block_size(
-        dcp_world_size=2,
-        pcp_world_size=1,
-        enable_caching=True,
-    )
-    coordinator.hash_block_size = 32
-    coordinator.kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=["attn-0"], kv_cache_spec=spec),
-            KVCacheGroupSpec(layer_names=["attn-1"], kv_cache_spec=spec),
-        ]
-    )
-    coordinator.attention_groups = [
-        (spec, [0], ReducingManager),
-        (spec, [1], CapturingManager),
-    ]
-    coordinator.eagle_attn_group_indices = {1}
-    coordinator.block_pool = MagicMock()
-    coordinator.lcm_block_size = 32
-    block_hashes: list[BlockHash] = []
-
-    getattr(coordinator, method_name)(block_hashes, max_cache_hit_length=96)
-
-    expected_max_length = 80 if vllm_version_is("0.23.0") else 96
-    assert CapturingManager.max_lengths == [expected_max_length]
 
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:

@@ -13,20 +13,7 @@ if vllm_version_is("0.23.0"):
         allow_module_level=True,
     )
 
-from vllm_ascend.worker.v2 import attn_utils, model_runner  # noqa: E402
-
-
-def test_sort_batch_req_ids_keeps_uniform_decodes_first():
-    req_ids = model_runner._sort_batch_req_ids(
-        {
-            "short-extend": 2,
-            "uniform-decode": 5,
-            "prefill": 64,
-        },
-        decode_query_len=5,
-    )
-
-    assert req_ids == ["uniform-decode", "short-extend", "prefill"]
+from vllm_ascend.worker.v2 import attn_utils  # noqa: E402
 
 
 def test_build_attn_metadata_resolves_causal_per_kv_cache_group(monkeypatch):

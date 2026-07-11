@@ -74,11 +74,9 @@ _UPSTREAM_SCHED_FILE = _upstream_sched_mod.__file__
 #   EngineCoreProc.run_engine_core = _balance_run_engine_core            (eager)
 #   vllm.v1.engine.core.DPEngineCoreProc = BalanceDPEngineCoreProc       (DEFERRED:
 #       swapped inside _balance_run_engine_core only when balance is enabled)
-import vllm_ascend.patch.platform.patch_balance_schedule as balance_patch  # noqa: E402
 from vllm_ascend.patch.platform.patch_balance_schedule import (  # noqa: E402
     BalanceScheduler,
     _balance_run_engine_core,
-    _limit_async_kv_lookahead,
     _OriginalRunEngineCore,
 )
 
@@ -273,30 +271,6 @@ def test_balance_deltas_present_in_schedule():
 
     # delta 3: `if request_queue is None: break` replaces upstream's assert.
     assert "if request_queue is None:" in src
-
-
-def test_async_kv_lookahead_uses_versioned_upstream_contract(monkeypatch):
-    monkeypatch.setattr(balance_patch, "vllm_version_is", lambda _version: True)
-    assert not _limit_async_kv_lookahead(True, False, 4)
-    assert _limit_async_kv_lookahead(True, True, 4)
-
-    monkeypatch.setattr(balance_patch, "vllm_version_is", lambda _version: False)
-    assert _limit_async_kv_lookahead(True, False, 4)
-    assert not _limit_async_kv_lookahead(True, True, 0)
-
-    schedule_tree = ast.parse(textwrap.dedent(inspect.getsource(BalanceScheduler.schedule)))
-    helper_call = next(
-        node
-        for node in ast.walk(schedule_tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "_limit_async_kv_lookahead"
-    )
-    assert [ast.unparse(arg) for arg in helper_call.args] == [
-        "load_kv_async",
-        "self.use_eagle",
-        "self.num_lookahead_tokens",
-    ]
 
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
-from vllm_ascend.utils import vllm_version_is
 
 
 def _prepare_inputs_source() -> str:
@@ -92,7 +91,7 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
-    def test_may_reinitialize_input_batch_preserves_tag_mamba_formula(self):
+    def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
         runner.max_num_reqs = 8
         runner.max_model_len = 512
@@ -104,7 +103,7 @@ class TestNPUModelRunner310(TestBase):
         runner.model_config = SimpleNamespace(max_model_len=512, get_vocab_size=lambda: 32000)
         runner.cache_config = SimpleNamespace(
             block_size=128,
-            enable_prefix_caching=False,
+            enable_prefix_caching=True,
             mamba_cache_mode="align",
         )
         runner.parallel_config = SimpleNamespace(
@@ -151,19 +150,6 @@ class TestNPUModelRunner310(TestBase):
         kwargs = mock_input_batch.call_args.kwargs
         self.assertEqual(kwargs["block_sizes"], [128, 128])
         self.assertEqual(kwargs["kernel_block_sizes"], [[128, 64], [0]])
-        expected_mamba_blocks = 4 if vllm_version_is("0.23.0") else 6
-        self.assertEqual(
-            kwargs["max_num_blocks_per_req"],
-            [4, expected_mamba_blocks],
-        )
-
-        runner.cache_config.enable_prefix_caching = True
-        with (
-            patch("vllm_ascend._310p.model_runner_310p.NPUInputBatch") as prefix_input_batch,
-            patch("vllm_ascend._310p.model_runner_310p.get_total_cp_world_size", return_value=1),
-        ):
-            runner.may_reinitialize_input_batch(kv_cache_config)
-        prefix_kwargs = prefix_input_batch.call_args.kwargs
-        self.assertEqual(prefix_kwargs["max_num_blocks_per_req"], [4, 6])
+        self.assertEqual(kwargs["max_num_blocks_per_req"], [4, 6])
         self.assertIs(kwargs["kv_cache_groups"], kv_cache_config.kv_cache_groups)
         self.assertEqual(kwargs["cp_kv_cache_interleave_size"], 4)
