@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.utils import vllm_version_is
 
 
 def _prepare_inputs_source() -> str:
@@ -91,7 +92,7 @@ def test_model_forward_updates_mtp_full_graph_params_before_replay() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
-    def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
+    def test_may_reinitialize_input_batch_preserves_tag_mamba_formula(self):
         runner = object.__new__(NPUModelRunner310)
         runner.max_num_reqs = 8
         runner.max_model_len = 512
@@ -101,9 +102,21 @@ class TestNPUModelRunner310(TestBase):
         runner.pin_memory = False
         runner.is_pooling_model = False
         runner.model_config = SimpleNamespace(max_model_len=512, get_vocab_size=lambda: 32000)
-        runner.cache_config = SimpleNamespace(block_size=128, enable_prefix_caching=True)
-        runner.parallel_config = SimpleNamespace(cp_kv_cache_interleave_size=4)
-        runner.vllm_config = SimpleNamespace(speculative_config=None)
+        runner.cache_config = SimpleNamespace(
+            block_size=128,
+            enable_prefix_caching=False,
+            mamba_cache_mode="align",
+        )
+        runner.parallel_config = SimpleNamespace(
+            cp_kv_cache_interleave_size=4,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        )
+        runner.vllm_config = SimpleNamespace(
+            speculative_config=None,
+            cache_config=runner.cache_config,
+            parallel_config=runner.parallel_config,
+        )
         runner.offload_config = SimpleNamespace(uva=SimpleNamespace(cpu_offload_gb=0))
         runner.input_batch = SimpleNamespace(logitsprocs=MagicMock())
         attention_backend = SimpleNamespace(get_supported_kernel_block_sizes=lambda: [128, 64])
@@ -138,6 +151,15 @@ class TestNPUModelRunner310(TestBase):
         kwargs = mock_input_batch.call_args.kwargs
         self.assertEqual(kwargs["block_sizes"], [128, 128])
         self.assertEqual(kwargs["kernel_block_sizes"], [[128, 64], [0]])
-        self.assertEqual(kwargs["max_num_blocks_per_req"], [4, 6])
+        expected_mamba_blocks = 4 if vllm_version_is("0.23.0") else 6
+        self.assertEqual(
+            kwargs["max_num_blocks_per_req"],
+            [4, expected_mamba_blocks],
+        )
+
+        runner.cache_config.enable_prefix_caching = True
+        runner.may_reinitialize_input_batch(kv_cache_config)
+        prefix_kwargs = mock_input_batch.call_args.kwargs
+        self.assertEqual(prefix_kwargs["max_num_blocks_per_req"], [4, 6])
         self.assertIs(kwargs["kv_cache_groups"], kv_cache_config.kv_cache_groups)
         self.assertEqual(kwargs["cp_kv_cache_interleave_size"], 4)

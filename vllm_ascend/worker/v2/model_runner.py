@@ -57,6 +57,20 @@ from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
 
 
+def _sort_batch_req_ids(
+    num_tokens_per_req: dict[str, int],
+    decode_query_len: int,
+) -> list[str]:
+    if vllm_version_is("0.23.0"):
+        return sorted(num_tokens_per_req, key=num_tokens_per_req.__getitem__)
+    # vLLM #47381 orders uniform decodes before short-extend requests so
+    # split_decodes_and_prefills does not misclassify spec decodes as prefills.
+    return vllm_model_runner.sort_batch_req_ids(
+        num_tokens_per_req,
+        decode_query_len,
+    )
+
+
 class NPUModelRunner(GPUModelRunner):
     """Model runner for Ascend NPUs."""
 
@@ -180,9 +194,8 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_per_req = scheduler_output.num_scheduled_tokens
         num_reqs = len(num_tokens_per_req)
 
-        # Decode first, then prefill.
         # batch_idx -> req_id
-        req_ids = sorted(num_tokens_per_req, key=num_tokens_per_req.get)  # type: ignore
+        req_ids = _sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
 
         self._update_seq_lens_cpu(scheduler_output, req_ids)
 

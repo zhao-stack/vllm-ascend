@@ -21,6 +21,7 @@ import torch
 from vllm.distributed.parallel_state import GroupCoordinator
 
 from tests.ut.base import TestBase
+from vllm_ascend.utils import vllm_version_is
 
 
 class TestBlockTable310(TestBase):
@@ -209,6 +210,44 @@ class TestBlockTable310(TestBase):
         expected = np.array([0, -1, -1, -1, -1, -1, -1, -1, 1, -1, -1, -1, -1, -1, -1, -1], dtype=np.int32)
         np.testing.assert_array_equal(block_table.slot_mapping.np[:16], expected)
         np.testing.assert_array_equal(block_table.slot_mapping.gpu[:16].cpu().numpy(), expected)
+
+    def test_compute_slot_mapping_uses_physical_blocks_for_main_cp_split(self):
+        self.kernel_sizes = [64]
+        block_table = self._create_block_table(
+            dcp_world_size=2,
+            dcp_rank=1,
+            pcp_world_size=1,
+            pcp_rank=0,
+            cp_kv_cache_interleave_size=128,
+        )
+        self._setup_block_table_data(block_table, num_reqs=1)
+
+        block_table.compute_slot_mapping(
+            np.zeros(2, dtype=np.int32),
+            np.array([128, 192], dtype=np.int64),
+        )
+
+        expected = (
+            np.array([-1, -1], dtype=np.int32) if vllm_version_is("0.23.0") else np.array([0, 64], dtype=np.int32)
+        )
+        np.testing.assert_array_equal(block_table.slot_mapping.np[:2], expected)
+
+    def test_main_multi_group_skips_mamba_slot_mapping(self):
+        from vllm_ascend._310p.block_table import MultiGroupBlockTable
+
+        multi_group = MultiGroupBlockTable.__new__(MultiGroupBlockTable)
+        mamba_table = MagicMock(is_mamba_group=True)
+        multi_group.block_tables = [mamba_table]
+
+        multi_group.compute_slot_mapping(
+            1,
+            torch.tensor([0, 1]),
+            torch.tensor([0]),
+        )
+        if vllm_version_is("0.23.0"):
+            mamba_table.compute_slot_mapping.assert_called_once()
+        else:
+            mamba_table.compute_slot_mapping.assert_not_called()
 
     def test_compute_slot_mapping_rejects_device_tensor_inputs(self):
         block_table = self._create_block_table(

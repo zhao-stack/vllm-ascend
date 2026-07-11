@@ -55,7 +55,13 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import (
     update_num_computed_tokens_for_batch_change,
 )
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, is_rc_device, lmhead_tp_enable
+from vllm_ascend.utils import (
+    ACL_FORMAT_FRACTAL_NZ,
+    is_rc_device,
+    lmhead_tp_enable,
+    vllm_version_is,
+)
+from vllm_ascend.worker.block_table import get_max_num_blocks_per_req
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
@@ -988,15 +994,33 @@ class NPUModelRunner310(NPUModelRunner):
 
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
-        total_cp_world_size = get_total_cp_world_size()
         for kv_cache_spec in kv_cache_specs:
-            max_num_blocks_per_req = cdiv(max_model_len, kv_cache_spec.block_size * total_cp_world_size)
-            if isinstance(kv_cache_spec, MambaSpec):
-                mamba_blocks_per_req = (
-                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                ) + kv_cache_spec.num_speculative_blocks
-                max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
-            max_num_blocks.append(max_num_blocks_per_req)
+            if vllm_version_is("0.23.0"):
+                # Preserve the 310P tag formula: speculative blocks are part
+                # of the Mamba alternative before max(), unlike MRV1's legacy
+                # row-size path.
+                max_num_blocks_per_req = cdiv(
+                    max_model_len,
+                    kv_cache_spec.block_size * get_total_cp_world_size(),
+                )
+                if isinstance(kv_cache_spec, MambaSpec):
+                    mamba_blocks_per_req = (
+                        max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
+                    ) + kv_cache_spec.num_speculative_blocks
+                    max_num_blocks_per_req = max(
+                        max_num_blocks_per_req,
+                        mamba_blocks_per_req,
+                    )
+                max_num_blocks.append(max_num_blocks_per_req)
+                continue
+
+            max_num_blocks.append(
+                get_max_num_blocks_per_req(
+                    kv_cache_spec,
+                    self.vllm_config,
+                    max_model_len,
+                )
+            )
 
         if (
             block_sizes != [self.cache_config.block_size]

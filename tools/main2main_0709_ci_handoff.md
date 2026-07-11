@@ -5,9 +5,11 @@
 ## 1. 分析基线与已确认范围
 
 - 下游 PR：`vllm-project/vllm-ascend#11709`，本轮残差分析基于远端 head `696323578a10e1f58c7c17c30a3e1e1ecdc715a1`；本地保留其上的 fixup 提交 `177eef18`。
-- 当前目标 vLLM commit：`ab7961a14a59be9a0170f1654315d5c2be44c015`。
+- 本轮升级前全绿基线：下游 `1a56e8ebf6565661177de51936a7232f7d09b0b2`，vLLM main `ab7961a14a59be9a0170f1654315d5c2be44c015`，full E2E run `29140862370`。
+- 当前目标 vLLM commit：`e5588e49bc2642670116664a7fc4096e27adb179`（2026-07-10 上午最后提交，`vllm#45261`）。
+- `ab7961a` 是 `e5588e49` 的祖先；本轮新增适配区间为 `(ab7961a, e5588e49]`，共 28 个上游提交、95 个变更文件，其中 48 个位于 `vllm/`。
 - 已知可以通过精度用例的 vLLM 边界：`ba22152096b2484faa3579624a253d54804d876d`。
-- `ba221520` 是 `ab7961a` 的祖先；待适配区间为 `(ba221520, ab7961a]`，共 155 个上游提交。
+- 前一轮已适配区间为 `(ba221520, ab7961a]`，共 155 个上游提交。
 - 当前已证明会触发问题的上游修改均处于该区间：
     - `vllm#47668` / `07f9baf7564b42ba7218ce9167bfcc4128028473`：多个运行期事件从 `torch.Event` 恢复为 `torch.cuda.Event`，覆盖 MRV2、spec decode、LoRA、multi-stream、offload 等路径。
     - `vllm#47081` / `d3e69fd6714e9d1bb6e8e4f03157090dc32e7960`：MRV1/MRV2 异步输出事件改为 `torch.cuda.Event(blocking=True)`。
@@ -164,6 +166,41 @@
 - 推送 `66c2ebb0` 后，main CPU UT 已通过；v0.23.0 CPU job `86510109431` 在收集新增的 `tests/ut/worker/test_attn_utils.py` 时失败。
 - traceback 为 `AttributeError: module 'vllm.v1.worker.gpu' has no attribute 'spec_decode'`。v0.23.0 虽包含 `gpu/spec_decode/speculator.py`，但本项目已明确禁用该版本的全部 V2 patch，release 只使用 V1，因此不会加载 V2 import 链。
 - 这是 main-only V2 回归测试缺少版本门控，不是 DSpark causal 修复在 main 上失效。修复是在导入 `attn_utils` 前对 v0.23.0 执行模块级 skip；main lane 继续执行完整 `[False, True]` 回归断言，不扩大 v0.23.0 的生产支持范围。
+
+### 7.3 2026-07-11 升级至 0710 上午 `e5588e49`
+
+升级前已确认 PR head `1a56e8eb` 的 full E2E run `29140862370` 全量通过。新目标 `e5588e49` 是 `ab7961a` 的线性后继；本轮只审计 `(ab7961a, e5588e49]` 的 28 个上游提交。main2main analyzer 给出 38 个下游候选文件，但结果仅作为检索提示，所有修改均经过上下游源码和运行门禁复核。
+
+本轮确定需要适配的上游契约如下：
+
+1. **`vllm#40996` / `95ed0feaa5`：DCP hybrid block-table 契约**
+    - 上游 `_compute_slot_mapping_kernel` 新增必填 constexpr `KV_CACHE_BLOCK_SIZE` 和 `BLOCKS_PER_KV_BLOCK`，用于在物理 KV block 与 attention kernel block 不同时正确换算 table index。Ascend 直接调用该 kernel，main 若仍按旧签名启动会缺少必填参数；v0.23.0 的旧 kernel 又不接受新参数。
+    - 上游新增 `KVCacheSpec.max_num_blocks_per_req()`，明确 Attention KV 按 DCP/PCP 分片、Mamba state 在各 rank 复制。Ascend 原逻辑先统一除 CP，再在 `BlockTable` 内单独乘回 Mamba，不能直接用于新 main，否则会重复缩放。
+    - 同一改动把 KV group 类型判断统一为 `get_kv_cache_spec_kind()`，使 `UniformTypeKVCacheSpecs` 包装的 Mamba/encoder-only group 仍能正确选择 `SlotMappingMode.NONE` 或从 worker block-table 列表排除。Ascend 旧 direct `isinstance` 会把包装组误分类，并导致 block-size/kernel-size/max-row 三张表错位。
+    - 310P 不调用上述 Triton kernel，但它复制的 numpy slot mapping 同样按 kernel block 判定 CP ownership；physical block 与 kernel block 分裂时会把本 rank token 错标为 padding。main 分支同步按 physical block 选 rank、再换算 kernel-block table index，并补充 CP + split-block 回归。
+    - 上游 `resolve_kv_cache_block_sizes()` 同步改为逐 group 计算 effective block size，并在 prefix cache **或 KV connector** 启用时计算 hash 粒度。Ascend 对该函数有整函数 monkeypatch，必须显式同步新语义，否则 hybrid + CP + connector 会得到与 scheduler/coordinator 不一致的 block/hash 粒度。
+    - 修复：所有新旧分支均由 `vllm_version_is("0.23.0")` 决定；tag 保留旧 kernel kwargs 和旧 row-size/哈希算法，main 使用新 constexpr、新 spec helper，并仅对 Attention group 应用 CP 缩放。coordinator 的 effective block size、两条 hash-view 路径和 P/D per-group Mamba 跳过逻辑统一使用同一版本化分类，避免包装 Mamba 在后续阶段重新乘 CP 或把 FullAttention 命中压成 0。没有参数探测或异常兜底。
+2. **`vllm#47381` / `85b3a7264b`：MRV2 请求排序与 DeepSeek MTP top-k**
+    - 上游 MRV2 不再简单按 scheduled-token 数排序，而是用 `sort_batch_req_ids(..., decode_query_len)` 将 uniform decode 放在 short-extend 前；Ascend 覆盖的 `prepare_inputs()` 仍是旧排序，会使 `split_decodes_and_prefills` 把 spec decode 错判为 prefill。
+    - 同一 PR 把 DeepSeek MTP layer 的初始 `skip_topk` 强制为 false，避免 draft step 读取从未写入的 top-k buffer；Ascend 整体替换 `DeepseekV2MLAAttention.__init__`，因此不会继承上游修复。
+    - 修复：main 调用上游排序 helper，并对 MTP 应用新 `skip_topk` 语义；tag 由 `vllm_version_is` 保留原行为。
+3. **`vllm#46865` / `2285cfca46`：MultiConnector 分配后调用协议**
+    - 新 main 要求所有 sub-connector 接收请求的真实 blocks，只以 `num_external_tokens=0` 表示“未被选中、不加载”。Ascend override 仍向未选中的 connector 传 empty blocks，并通过 Layerwise 特判绕开旧协议。
+    - 修复：main 对普通未选中 connector 按新协议传真实 blocks 和 0 external tokens；tag 继续传 empty blocks。下游 Layerwise + KV-pool 组合仍保留其既有特判：即使由另一 connector 命中，Layerwise 也必须看到真实 blocks 和该次 external-token 状态，否则会以空 blocks 提前消费 `do_remote_prefill`。
+4. **`vllm#46694` / `ae6170f874`：P/D async KV load 的 lookahead**
+    - 上游把限制条件从 `load_kv_async and use_eagle` 扩为 `load_kv_async and num_lookahead_tokens > 0`：async load 当步不执行 forward，MTP 等其他 speculative method 同样不能提前分配 lookahead blocks。
+    - 普通 scheduler 会继承上游；三个自研 scheduler 只在 `request.num_computed_tokens == 0` 查询 async load，既有逻辑已在同一条件把 lookahead 置零。`BalanceScheduler.schedule()` 是 v0.23 整体复制体，必须单独同步：通过 `vllm_version_is` 让 tag 保留 Eagle 条件、main 使用所有 speculative method 的新条件。
+5. **`vllm#48085` / `1cd75b3dd4`：KVBlockZeroer pinned-buffer 竞态**
+    - 非阻塞 pinned-host→device copy 完成前复用同一个 pinned ID buffer，会让下一批覆盖上一批仍在传输的 block IDs，最终清零错误 KV block。Ascend 复制了同样的单 buffer 实现；310P 使用同步 tensor zero，不受此竞态影响。
+    - 修复：按 `max_concurrent_batches` 分配并轮转 pinned/GPU ID buffer；扩容前同步，避免释放仍在传输的源 buffer。该修复所需配置在 tag/main 都存在，两个 lane 共用同一明确实现。
+
+已人工判定不修改的 analyzer/邻近候选：
+
+- `vllm#48135` / `e08a9151` 的 Tensor `causal` 只修复 DiffusionGemma；Ascend 当前无该模型支持，也没有可消费 per-request Tensor causal 的 attention backend。仅扩类型会把错误从 `.get()` 推迟到布尔判断，不构成完整适配，因此不改。
+- `vllm#47317` / `2ded1b24e7ef48e21f71f51fc923a352deefbde2` 只减少 Mooncake SWA lookup 中被 mask chunk 的 hash 分配，PR 明确说明输出不变，属于性能优化而非升级兼容缺口。
+- `vllm#48132` 的 Mamba state reset 位于上游 model-state selector，但 Ascend V2 override 绕过该实现；当前 Ascend 不支持 hybrid Mamba + MRV2 speculative decode，也没有可触发该契约的消费者，因此本 PR 不引入无运行路径的修改。`vllm#47923`、`vllm#45261` 的 KV offload/full-report event 改动由未覆盖的上游实现直接生效；ROCm/XPU/CI/已删除模型提交不属于 Ascend main2main 适配范围。
+
+本节记录的是推送前源码闭包；推送后只处理新 CI 中能够证明由 `(ab7961a, e5588e49]` 引入、且属于上述或新增上游契约变化的失败。不得更新 golden、放宽阈值、关闭功能或增加兜底来换取用例通过。
 
 ## 8. 后续每小时 CI 观察项
 

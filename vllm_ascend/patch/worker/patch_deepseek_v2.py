@@ -47,6 +47,15 @@ def _should_skip_indexer_init(
     return isinstance(indexer_type, str) and indexer_type.lower() == "shared"
 
 
+def _resolve_mla_skip_topk(skip_topk: bool, is_mtp_layer: bool) -> bool:
+    if vllm_version_is("0.23.0"):
+        return skip_topk
+    # vLLM #47381: an MTP layer's indexer writes the top-k buffer at draft
+    # step 0. Freezing skip_topk=True would leave later draft steps reading a
+    # buffer that was never populated.
+    return skip_topk and not is_mtp_layer
+
+
 def _deepseek_v2_mla_attention_init(
     self,
     vllm_config: VllmConfig,
@@ -206,6 +215,8 @@ def _deepseek_v2_mla_attention_init(
     )
 
     layer_id = extract_layer_index(prefix)
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    is_mtp_layer = num_hidden_layers is not None and layer_id >= num_hidden_layers
 
     if _index_topk_pattern is None:
         _skip_topk = (
@@ -276,7 +287,7 @@ def _deepseek_v2_mla_attention_init(
         cache_config,
         quant_config,
         prefix,
-        skip_topk=_skip_topk,
+        skip_topk=_resolve_mla_skip_topk(_skip_topk, is_mtp_layer),
     )
 
 

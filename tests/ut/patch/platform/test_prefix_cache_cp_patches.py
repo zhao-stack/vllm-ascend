@@ -30,6 +30,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _ascend_resolve_kv_cache_block_sizes,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
+from vllm_ascend.utils import vllm_version_is
 
 
 def _make_hybrid_kv_cache_config(
@@ -106,11 +107,13 @@ def _make_vllm_config(
         cache_config=SimpleNamespace(
             block_size=block_size,
             enable_prefix_caching=enable_prefix_caching,
+            hash_block_size=None,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=dcp,
             prefill_context_parallel_size=pcp,
         ),
+        kv_transfer_config=None,
     )
 
 
@@ -130,15 +133,15 @@ def _make_coordinator_for_effective_block_size(
 @pytest.mark.parametrize(
     ("enable_prefix_caching", "expected_hash_block_size"),
     [
-        pytest.param(False, math.lcm(16, 32) * 2 * 2, id="cp-without-prefix-caching"),
-        pytest.param(True, math.gcd(16, 32), id="cp-with-prefix-caching"),
+        pytest.param(False, math.lcm(24, 16) * 2 * 2, id="cp-without-prefix-caching"),
+        pytest.param(True, math.gcd(24, 16), id="cp-with-prefix-caching"),
     ],
 )
 def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
     enable_prefix_caching: bool,
     expected_hash_block_size: int,
 ) -> None:
-    kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=16, mamba_block_size=32)
+    kv_cache_config = _make_hybrid_kv_cache_config(full_block_size=24, mamba_block_size=16)
     vllm_config = _make_vllm_config(
         enable_prefix_caching=enable_prefix_caching,
         dcp=2,
@@ -150,7 +153,12 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
         vllm_config,
     )
 
-    expected_scheduler_block_size = math.lcm(16, 32) * 2 * 2
+    if vllm_version_is("0.23.0"):
+        expected_scheduler_block_size = math.lcm(24, 16) * 2 * 2
+    else:
+        # Attention blocks are CP-sharded (24 * 4); Mamba blocks remain 16.
+        expected_scheduler_block_size = math.lcm(24 * 2 * 2, 16)
+        expected_hash_block_size = math.gcd(24 * 2 * 2, 16) if enable_prefix_caching else expected_scheduler_block_size
     assert scheduler_block_size == expected_scheduler_block_size
     assert hash_block_size == expected_hash_block_size
 
@@ -185,6 +193,19 @@ def test_resolve_kv_cache_block_sizes_with_cp_hybrid_groups(
             id="mamba-keeps-physical-block-size-with-prefix-caching",
         ),
         pytest.param(
+            lambda: MambaSpec(
+                block_size=16,
+                shapes=((1,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="none",
+            ),
+            2,
+            2,
+            False,
+            64 if vllm_version_is("0.23.0") else 16,
+            id="mamba-main-keeps-physical-block-size-with-connector-only-hashing",
+        ),
+        pytest.param(
             lambda: FullAttentionSpec(
                 block_size=16,
                 num_kv_heads=8,
@@ -213,6 +234,74 @@ def test_get_effective_block_size(
     )
 
     assert coordinator._get_effective_block_size(spec_factory()) == expected
+
+
+def test_get_effective_block_size_recognizes_uniform_mamba_on_main() -> None:
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="none",
+    )
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs({"mamba": mamba_spec})
+    assert uniform_spec is not None
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=2,
+        pcp_world_size=2,
+        enable_caching=False,
+    )
+
+    expected = 64 if vllm_version_is("0.23.0") else 16
+    assert coordinator._get_effective_block_size(uniform_spec) == expected
+
+
+def test_uniform_mamba_hash_view_and_pd_skip_match_installed_contract() -> None:
+    mamba_spec = MambaSpec(
+        block_size=16,
+        shapes=((1,),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="none",
+    )
+    uniform_spec = UniformTypeKVCacheSpecs.from_specs({"mamba": mamba_spec})
+    assert uniform_spec is not None
+
+    class CapturingManager:
+        calls = 0
+        received_hashes = None
+
+        @classmethod
+        def find_longest_cache_hit(cls, *, block_hashes, **_kwargs):
+            cls.calls += 1
+            cls.received_hashes = block_hashes
+            return ([MagicMock()],)
+
+    coordinator = _make_coordinator_for_effective_block_size(
+        dcp_world_size=2,
+        pcp_world_size=2,
+        enable_caching=False,
+    )
+    coordinator.hash_block_size = 16
+    coordinator.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["mamba"], kv_cache_spec=uniform_spec)]
+    )
+    coordinator.attention_groups = [(uniform_spec, [0], CapturingManager)]
+    coordinator.eagle_attn_group_indices = set()
+    coordinator.block_pool = MagicMock()
+    coordinator.lcm_block_size = 16
+    block_hashes = []
+
+    coordinator.find_longest_cache_hit(block_hashes, max_cache_hit_length=16)
+    if vllm_version_is("0.23.0"):
+        assert CapturingManager.received_hashes is not block_hashes
+    else:
+        assert CapturingManager.received_hashes is block_hashes
+
+    CapturingManager.calls = 0
+    coordinator.find_longest_cache_hit_per_group(
+        block_hashes,
+        max_cache_hit_length=16,
+    )
+    assert CapturingManager.calls == (1 if vllm_version_is("0.23.0") else 0)
 
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:

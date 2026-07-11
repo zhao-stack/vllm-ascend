@@ -91,9 +91,6 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import copy_num_valid_draft_tokens
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
-from vllm.v1.worker.cp_utils import (
-    get_total_cp_world_size,
-)
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -165,6 +162,10 @@ from vllm_ascend.utils import (
     should_skip_allreduce_across_dp_group,
     sparse_kv_cache_has_indexer,
     vllm_version_is,
+)
+from vllm_ascend.worker.block_table import (
+    get_max_num_blocks_per_req,
+    is_encoder_only_kv_cache_spec,
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
@@ -4788,7 +4789,7 @@ class NPUModelRunner(GPUModelRunner):
         block_sizes = [
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
-            if not isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec)
+            if not is_encoder_only_kv_cache_spec(kv_cache_group.kv_cache_spec)
         ]
 
         # Generate kernel_block_sizes that matches each block_size
@@ -4827,18 +4828,16 @@ class NPUModelRunner(GPUModelRunner):
 
         max_num_blocks = []
         max_model_len = max(self.max_model_len, self.max_encoder_len)
-        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+        for kv_cache_group in kv_cache_config.kv_cache_groups:
+            if is_encoder_only_kv_cache_spec(kv_cache_group.kv_cache_spec):
                 continue
-            max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
-            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
-                mamba_blocks_per_req = (
-                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
-                ) 
-
-                max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
-                max_num_blocks_per_req += kv_cache_group.kv_cache_spec.num_speculative_blocks
-            max_num_blocks.append(max_num_blocks_per_req)
+            max_num_blocks.append(
+                get_max_num_blocks_per_req(
+                    kv_cache_group.kv_cache_spec,
+                    self.vllm_config,
+                    max_model_len,
+                )
+            )
 
         if (block_sizes != [self.cache_config.block_size]
                 or self.kernel_block_sizes != [[self.cache_config.block_size]]
@@ -5196,7 +5195,11 @@ class NPUModelRunner(GPUModelRunner):
         Delegates to KVBlockZeroer.init_meta with the runner's state.
         Called from gpu_worker.py outside the CuMem pool context.
         """
-        self._kv_block_zeroer = AscendKVBlockZeroer(self.device, self.pin_memory)
+        self._kv_block_zeroer = AscendKVBlockZeroer(
+            self.device,
+            self.pin_memory,
+            max_concurrency=self.vllm_config.max_concurrent_batches,
+        )
         self._kv_block_zeroer.init_meta(
             attn_groups_iter=self._kv_cache_spec_attn_group_iterator(),
             kernel_block_sizes=self.kernel_block_sizes,

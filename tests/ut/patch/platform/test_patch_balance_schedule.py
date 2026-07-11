@@ -26,7 +26,8 @@ What is guarded here (everything reachable from CPU UT):
 * the copied ``schedule()`` body stays a verbatim copy of the ``schedule()``
   at vllm-ascend's pinned vLLM release tag (read from
   ``.github/vllm-release-tag.commit`` -- the same file CI uses), modulo exactly
-  those 3 deltas. Reading the tag from the pin file means a pin advance
+  those 3 balance deltas and the versioned #46694 lookahead sync. Reading the
+  tag from the pin file means a pin advance
   auto-flips this guard to the new tag until the copy is re-synced.
 
 What is NOT guarded here (structurally unreachable without a real engine):
@@ -73,9 +74,11 @@ _UPSTREAM_SCHED_FILE = _upstream_sched_mod.__file__
 #   EngineCoreProc.run_engine_core = _balance_run_engine_core            (eager)
 #   vllm.v1.engine.core.DPEngineCoreProc = BalanceDPEngineCoreProc       (DEFERRED:
 #       swapped inside _balance_run_engine_core only when balance is enabled)
+import vllm_ascend.patch.platform.patch_balance_schedule as balance_patch  # noqa: E402
 from vllm_ascend.patch.platform.patch_balance_schedule import (  # noqa: E402
     BalanceScheduler,
     _balance_run_engine_core,
+    _limit_async_kv_lookahead,
     _OriginalRunEngineCore,
 )
 
@@ -102,6 +105,33 @@ def _schedule_body_ast(source: str) -> str:
         bodies align.
     """
     tree = ast.parse(textwrap.dedent(source))
+
+    class NormalizeVersionedLookahead(ast.NodeTransformer):
+        def visit_Assign(self, node: ast.Assign):
+            self.generic_visit(node)
+            if (
+                len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "limit_lookahead_tokens"
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "_limit_async_kv_lookahead"
+            ):
+                node.value = ast.BoolOp(
+                    op=ast.And(),
+                    values=[
+                        ast.Name(id="load_kv_async", ctx=ast.Load()),
+                        ast.Attribute(
+                            value=ast.Name(id="self", ctx=ast.Load()),
+                            attr="use_eagle",
+                            ctx=ast.Load(),
+                        ),
+                    ],
+                )
+            return node
+
+    tree = NormalizeVersionedLookahead().visit(tree)
+    ast.fix_missing_locations(tree)
     func = next(
         (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "schedule"),
         None,
@@ -245,6 +275,30 @@ def test_balance_deltas_present_in_schedule():
     assert "if request_queue is None:" in src
 
 
+def test_async_kv_lookahead_uses_versioned_upstream_contract(monkeypatch):
+    monkeypatch.setattr(balance_patch, "vllm_version_is", lambda _version: True)
+    assert not _limit_async_kv_lookahead(True, False, 4)
+    assert _limit_async_kv_lookahead(True, True, 4)
+
+    monkeypatch.setattr(balance_patch, "vllm_version_is", lambda _version: False)
+    assert _limit_async_kv_lookahead(True, False, 4)
+    assert not _limit_async_kv_lookahead(True, True, 0)
+
+    schedule_tree = ast.parse(textwrap.dedent(inspect.getsource(BalanceScheduler.schedule)))
+    helper_call = next(
+        node
+        for node in ast.walk(schedule_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_limit_async_kv_lookahead"
+    )
+    assert [ast.unparse(arg) for arg in helper_call.args] == [
+        "load_kv_async",
+        "self.use_eagle",
+        "self.num_lookahead_tokens",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 1c. copied schedule() body stays verbatim with the pinned release tag
 # ---------------------------------------------------------------------------
@@ -252,8 +306,8 @@ def test_balance_deltas_present_in_schedule():
 
 def test_schedule_body_matches_pinned_release_tag():
     """The copied ``schedule()`` body must stay a verbatim copy of the
-    ``schedule()`` at vllm-ascend's pinned vLLM release tag, modulo exactly the
-    3 balance deltas.
+    ``schedule()`` at vllm-ascend's pinned vLLM release tag, modulo the three
+    balance deltas and the versioned #46694 lookahead sync.
 
     The tag is read dynamically from ``.github/vllm-release-tag.commit`` -- the
     same file CI uses to pick the tag, NOT a hardcoded string or a design doc
@@ -276,9 +330,10 @@ def test_schedule_body_matches_pinned_release_tag():
     theirs = _schedule_body_ast(pinned_src)
     assert ours == theirs, (
         f"BalanceScheduler.schedule body drifted from the pinned release tag "
-        f"({tag}) beyond the 3 balance deltas. Re-sync the copy against "
+        f"({tag}) beyond the 3 balance deltas and #46694 sync. Re-sync the copy against "
         f"{tag} and re-apply only: (1) disabled-path early return, "
-        f"(2) balance_flag gate, (3) if request_queue is None: break."
+        f"(2) balance_flag gate, (3) if request_queue is None: break, "
+        f"(4) versioned async-KV lookahead."
     )
 
 

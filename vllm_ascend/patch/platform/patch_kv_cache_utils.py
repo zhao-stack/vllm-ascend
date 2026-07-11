@@ -2,16 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 import math
 from collections import defaultdict
+from collections.abc import Iterable
 
 import vllm.v1.core.kv_cache_utils
 from vllm.config import VllmConfig
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.core.kv_cache_utils import _approximate_gcd, may_override_num_blocks
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
     KVCacheTensor,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
@@ -20,6 +23,16 @@ from vllm.v1.kv_cache_interface import (
 from vllm_ascend.utils import vllm_version_is
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
+
+
+def _iter_group_specs(kv_cache_spec: KVCacheSpec) -> Iterable[KVCacheSpec]:
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        return kv_cache_spec.kv_cache_specs.values()
+    return (kv_cache_spec,)
+
+
+def _is_attention_group(kv_cache_spec: KVCacheSpec) -> bool:
+    return all(isinstance(spec, AttentionSpec) for spec in _iter_group_specs(kv_cache_spec))
 
 
 def _ascend_resolve_kv_cache_block_sizes(
@@ -33,9 +46,10 @@ def _ascend_resolve_kv_cache_block_sizes(
     This restriction is correct for CUDA but not for Ascend, which implements
     context parallelism for MLA and SWA-MLA layers independently.
 
-    For multiple KV cache groups with CP, compute scheduler_block_size as
-    lcm(group_block_sizes) * dcp * pcp to maintain alignment, consistent
-    with the pre-PR-#40860 behavior of block_size * dcp * pcp.
+    v0.23.0 keeps the existing Ascend formula. On main, vLLM #40996 defines
+    effective group sizes explicitly: attention KV is CP-sharded, while Mamba
+    state is replicated. Ascend keeps its broader MLA/SWA-MLA CP support but
+    follows that same per-group scaling and hashing contract.
     """
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
@@ -47,14 +61,41 @@ def _ascend_resolve_kv_cache_block_sizes(
         return bs, bs
 
     if dcp != 1 or pcp != 1:
-        # Ascend supports CP with multiple KV cache groups; compute
-        # scheduler_block_size using the LCM of all group block sizes
-        # multiplied by the CP factors for proper alignment.
-        group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
-        scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp
-        if not cache_config.enable_prefix_caching:
+        if vllm_version_is("0.23.0"):
+            group_block_sizes = [g.kv_cache_spec.block_size for g in groups]
+            scheduler_block_size = math.lcm(*group_block_sizes) * dcp * pcp
+            if not cache_config.enable_prefix_caching:
+                return scheduler_block_size, scheduler_block_size
+            hash_block_size = math.gcd(*group_block_sizes)
+            return scheduler_block_size, hash_block_size
+
+        group_block_sizes = [
+            group.kv_cache_spec.block_size * dcp * pcp
+            if _is_attention_group(group.kv_cache_spec)
+            else group.kv_cache_spec.block_size
+            for group in groups
+        ]
+        scheduler_block_size = math.lcm(*group_block_sizes)
+        connector_enabled = vllm_config.kv_transfer_config is not None
+        if not (cache_config.enable_prefix_caching or connector_enabled):
             return scheduler_block_size, scheduler_block_size
-        hash_block_size = math.gcd(*group_block_sizes)
+
+        if any(
+            isinstance(spec, MambaSpec) and spec.block_size != cache_config.block_size
+            for group in groups
+            for spec in _iter_group_specs(group.kv_cache_spec)
+        ):
+            return scheduler_block_size, scheduler_block_size
+
+        hash_block_size = (
+            cache_config.hash_block_size if cache_config.hash_block_size is not None else math.gcd(*group_block_sizes)
+        )
+        if any(size % hash_block_size != 0 for size in group_block_sizes):
+            raise ValueError(
+                f"Invalid hash_block_size={hash_block_size}; all KV cache "
+                "group block sizes must be divisible by hash_block_size. "
+                f"Got group block sizes={group_block_sizes}."
+            )
         return scheduler_block_size, hash_block_size
 
     return _orig_resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)

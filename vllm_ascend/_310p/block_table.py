@@ -7,6 +7,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.block_table import BlockTable as AscendBlockTable
 from vllm_ascend.worker.block_table import MultiGroupBlockTable as AscendMultiGroupBlockTable
 
@@ -23,22 +24,42 @@ class BlockTable(AscendBlockTable):
             return
 
         if self.dcp_world_size * self.pcp_world_size > 1:
-            virtual_block_size = self.block_size * self.dcp_world_size * self.pcp_world_size
-            logical_block_idx = positions // virtual_block_size
-            block_table_indices = self._get_block_table_indices(req_indices, logical_block_idx)
-            block_numbers = self.block_table.np.ravel()[block_table_indices]
-            virtual_block_offsets = positions % virtual_block_size
+            total_cp_world_size = self.dcp_world_size * self.pcp_world_size
             current_rank = self.dcp_world_size * self.pcp_rank + self.dcp_rank
-            mask = (
-                virtual_block_offsets // self.cp_kv_cache_interleave_size % (self.dcp_world_size * self.pcp_world_size)
-                == current_rank
+            if vllm_version_is("0.23.0"):
+                virtual_block_size = self.block_size * total_cp_world_size
+                logical_block_idx = positions // virtual_block_size
+                virtual_block_offsets = positions % virtual_block_size
+                block_offsets = (
+                    virtual_block_offsets
+                    // (total_cp_world_size * self.cp_kv_cache_interleave_size)
+                    * self.cp_kv_cache_interleave_size
+                    + virtual_block_offsets % self.cp_kv_cache_interleave_size
+                )
+            else:
+                # vLLM #40996: CP ownership is defined over physical KV
+                # blocks. Convert the local physical offset to the expanded
+                # kernel-block table only after selecting the local rank.
+                virtual_block_size = self.physical_block_size * total_cp_world_size
+                physical_block_idx = positions // virtual_block_size
+                virtual_block_offsets = positions % virtual_block_size
+                local_physical_offsets = (
+                    virtual_block_offsets
+                    // (total_cp_world_size * self.cp_kv_cache_interleave_size)
+                    * self.cp_kv_cache_interleave_size
+                    + virtual_block_offsets % self.cp_kv_cache_interleave_size
+                )
+                logical_block_idx = (
+                    physical_block_idx * self.blocks_per_phys_block + local_physical_offsets // self.block_size
+                )
+                block_offsets = local_physical_offsets % self.block_size
+
+            block_table_indices = self._get_block_table_indices(
+                req_indices,
+                logical_block_idx,
             )
-            block_offsets = (
-                virtual_block_offsets
-                // (self.dcp_world_size * self.pcp_world_size * self.cp_kv_cache_interleave_size)
-                * self.cp_kv_cache_interleave_size
-                + virtual_block_offsets % self.cp_kv_cache_interleave_size
-            )
+            block_numbers = self.block_table.np.ravel()[block_table_indices]
+            mask = virtual_block_offsets // self.cp_kv_cache_interleave_size % total_cp_world_size == current_rank
             slot_mapping = block_numbers * self.block_size + block_offsets
             self.slot_mapping.np[:num_tokens] = np.where(mask, slot_mapping, PAD_SLOT_ID)
         else:
@@ -167,6 +188,8 @@ class MultiGroupBlockTable(AscendMultiGroupBlockTable):
     ) -> None:
         for i, block_table_base in enumerate(self.block_tables):
             block_table = cast(BlockTable, block_table_base)
+            if not vllm_version_is("0.23.0") and block_table.is_mamba_group:
+                continue
             if positions_compressed_list is not None and req_indices_compressed_list is not None:
                 block_table.compute_slot_mapping(
                     req_indices_compressed_list[i],
@@ -193,6 +216,8 @@ class MultiGroupBlockTable(AscendMultiGroupBlockTable):
     ) -> None:
         for i, block_table_base in enumerate(self.block_tables):
             block_table = cast(BlockTable, block_table_base)
+            if not vllm_version_is("0.23.0") and block_table.is_mamba_group:
+                continue
             if positions_compressed_list is not None and req_indices_compressed_list is not None:
                 block_table.compute_slot_mapping(
                     req_indices_compressed_list[i],

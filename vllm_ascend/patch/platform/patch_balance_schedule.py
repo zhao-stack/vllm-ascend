@@ -11,12 +11,15 @@ there is no leader. See ``docs/.../balance_schedule_refactor.md`` for the
 design.
 
 The ``schedule()`` body is a verbatim copy of the **v0.23.0** release tag's
-``Scheduler.schedule()`` (the production pin), plus exactly three balance
+``Scheduler.schedule()`` (the production pin), plus three balance
 deltas: (1) the disabled-path early return that delegates to ``super()``,
 (2) the ``balance_flag`` break inside the WAITING loop
 (``any-rank-at-cap => global freeze``), and (3) ``if request_queue is None:
 break`` in place of upstream's ``assert request_queue is not None`` (so a
-drained-rank schedule does not assert when balance defers admission).
+drained-rank schedule does not assert when balance defers admission). One
+versioned main2main sync is also applied: vLLM #46694 suppresses async-load
+lookahead for every speculative method on main, while v0.23.0 keeps its Eagle
+condition.
 
 The **signature**, in contrast, must work across BOTH vllm versions that
 vllm-ascend CI runs simultaneously: the release tag v0.23.0 (whose engine
@@ -91,6 +94,8 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
+from vllm_ascend.utils import vllm_version_is
+
 # Whether the *installed* upstream ``Scheduler.schedule`` accepts the
 # ``throttle_prefills`` argument. vllm-ascend CI runs against TWO vllm
 # versions at once: the release tag v0.23.0 (``schedule(self)``, engine calls
@@ -103,6 +108,18 @@ from vllm.v1.utils import record_function_or_nullcontext
 # both lanes -- including dev checkouts whose ``__version__`` is not a clean
 # PEP 440 release (which would make a ``vllm_version_is`` check raise).
 _SUPER_SCHEDULE_HAS_THROTTLE = "throttle_prefills" in inspect.signature(Scheduler.schedule).parameters
+
+
+def _limit_async_kv_lookahead(
+    load_kv_async: bool,
+    use_eagle: bool,
+    num_lookahead_tokens: int,
+) -> bool:
+    if vllm_version_is("0.23.0"):
+        return load_kv_async and use_eagle
+    # vLLM #46694: async KV loading performs no forward pass in this step, so
+    # every speculative method must defer lookahead allocation, not only Eagle.
+    return load_kv_async and num_lookahead_tokens > 0
 
 
 def _balance_scheduling_enabled(vllm_config) -> bool:
@@ -562,7 +579,11 @@ class BalanceScheduler(Scheduler):
                 # extra block gets allocated which
                 # creates a mismatch between the number
                 # of local and remote blocks.
-                limit_lookahead_tokens = load_kv_async and self.use_eagle
+                limit_lookahead_tokens = _limit_async_kv_lookahead(
+                    load_kv_async,
+                    self.use_eagle,
+                    self.num_lookahead_tokens,
+                )
                 effective_lookahead_tokens = 0 if limit_lookahead_tokens else self.num_lookahead_tokens
 
                 # Determine if we need to allocate cross-attention blocks.

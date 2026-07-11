@@ -8,6 +8,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import MooncakeLayerwiseConnector
+from vllm_ascend.utils import vllm_version_is
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -34,11 +35,14 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
         empty_blocks = blocks.new_empty()
         for i, c in enumerate(self._connectors):
             if i == chosen_connector or isinstance(c, MooncakeLayerwiseConnector):
-                # Forward call to the chosen connector (if any).
+                # Layerwise + KV-pool composition requires Layerwise to observe
+                # the allocation even when another connector supplied the hit.
                 c.update_state_after_alloc(request, blocks, num_external_tokens)
             else:
-                # Call with empty blocks for other connectors.
-                c.update_state_after_alloc(request, empty_blocks, 0)
+                # vLLM #46865 requires real blocks for every sub-connector on
+                # main. Preserve v0.23.0's empty-block protocol on the tag lane.
+                other_blocks = empty_blocks if vllm_version_is("0.23.0") else blocks
+                c.update_state_after_alloc(request, other_blocks, 0)
 
     def get_num_new_matched_tokens(
         self,

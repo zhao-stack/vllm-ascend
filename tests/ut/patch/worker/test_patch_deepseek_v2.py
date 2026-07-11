@@ -2,7 +2,11 @@
 
 from types import SimpleNamespace
 
-from vllm_ascend.patch.worker.patch_deepseek_v2 import _should_skip_indexer_init
+from vllm_ascend.patch.worker.patch_deepseek_v2 import (
+    _resolve_mla_skip_topk,
+    _should_skip_indexer_init,
+)
+from vllm_ascend.utils import vllm_version_is
 
 
 def _config(**overrides) -> SimpleNamespace:
@@ -34,3 +38,9 @@ def test_mtp_layer_keeps_indexer():
         "model.layers.80.self_attn",
         skip_topk=True,
     )
+
+
+def test_mtp_layer_skip_topk_matches_installed_vllm_contract():
+    assert _resolve_mla_skip_topk(True, is_mtp_layer=False)
+    assert _resolve_mla_skip_topk(False, is_mtp_layer=True) is False
+    assert _resolve_mla_skip_topk(True, is_mtp_layer=True) is vllm_version_is("0.23.0")

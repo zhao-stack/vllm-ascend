@@ -1,12 +1,59 @@
 import numpy as np
 import torch
+from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import (
+    EncoderOnlyAttentionSpec,
+    KVCacheGroupSpec,
+    KVCacheSpec,
+    KVCacheSpecKind,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+    get_kv_cache_spec_kind,
+)
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
+
+from vllm_ascend.utils import vllm_version_is
+
+
+def get_max_num_blocks_per_req(
+    kv_cache_spec: KVCacheSpec,
+    vllm_config: VllmConfig,
+    max_model_len: int,
+) -> int:
+    """Resolve a worker block-table row length for both supported vLLM lanes."""
+    if not vllm_version_is("0.23.0"):
+        # vLLM #40996 moved the CP/Mamba distinction into KVCacheSpec:
+        # attention state is sharded across CP ranks, while Mamba state is
+        # replicated. Use that contract directly on the main lane.
+        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+            return max(
+                spec.max_num_blocks_per_req(vllm_config, max_model_len)
+                for spec in kv_cache_spec.kv_cache_specs.values()
+            )
+        return kv_cache_spec.max_num_blocks_per_req(vllm_config, max_model_len)
+
+    max_num_blocks = cdiv(
+        max_model_len,
+        kv_cache_spec.block_size * get_total_cp_world_size(),
+    )
+    if isinstance(kv_cache_spec, MambaSpec):
+        mamba_blocks = max_num_blocks if vllm_config.cache_config.enable_prefix_caching else 1
+        max_num_blocks = max(max_num_blocks, mamba_blocks)
+        max_num_blocks += kv_cache_spec.num_speculative_blocks
+    return max_num_blocks
+
+
+def is_encoder_only_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
+    """Match the installed runner's encoder-only group classification."""
+    return isinstance(kv_cache_spec, EncoderOnlyAttentionSpec) or (
+        not vllm_version_is("0.23.0")
+        and get_kv_cache_spec_kind(kv_cache_spec) == KVCacheSpecKind.ENCODER_ONLY_ATTENTION
+    )
 
 
 class BlockTable:
@@ -42,7 +89,12 @@ class BlockTable:
             and hasattr(kv_cache_group, "kv_cache_spec")
             and (self.pcp_world_size * self.dcp_world_size > 1)
             and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+            and vllm_version_is("0.23.0")
         ):
+            # The v0.23.0 runner computes every row from CP-sharded token
+            # capacity, so restore Mamba's replicated row length here. On main,
+            # KVCacheSpec.max_num_blocks_per_req() already returns the correct
+            # unsharded Mamba size and must not be scaled a second time.
             max_num_blocks_per_req = max_num_blocks_per_req * self.pcp_world_size * self.dcp_world_size
         max_num_blocks_per_req = max(cdiv(max_num_blocks_per_req, compress_ratio), 1)
         self.max_num_blocks_per_req = max_num_blocks_per_req
@@ -50,10 +102,14 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
         self.physical_block_size = block_size
-        self.is_mamba_group = (
-            kv_cache_group is not None
-            and hasattr(kv_cache_group, "kv_cache_spec")
-            and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
+        kv_cache_spec = (
+            kv_cache_group.kv_cache_spec
+            if kv_cache_group is not None and hasattr(kv_cache_group, "kv_cache_spec")
+            else None
+        )
+        self.is_mamba_group = kv_cache_spec is not None and (
+            isinstance(kv_cache_spec, MambaSpec)
+            or (not vllm_version_is("0.23.0") and get_kv_cache_spec_kind(kv_cache_spec) == KVCacheSpecKind.MAMBA)
         )
 
         # If kernel_sizes is None or [0], use physical block size (no splitting)
@@ -157,6 +213,21 @@ class BlockTable:
             )
             self._compute_pcp_dcp_slot_mapping(req_indices, positions)
         else:
+            kernel_kwargs = {
+                "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
+                "TOTAL_CP_RANK": total_cp_rank,
+                "CP_KV_CACHE_INTERLEAVE_SIZE": self.cp_kv_cache_interleave_size,
+                "PAD_ID": PAD_SLOT_ID,
+                "BLOCK_SIZE": 1024,
+            }
+            if not vllm_version_is("0.23.0"):
+                # vLLM #40996 split physical KV blocks into kernel blocks in
+                # the slot-mapping kernel. These are required constexprs on
+                # main; the v0.23.0 kernel does not accept them.
+                kernel_kwargs.update(
+                    KV_CACHE_BLOCK_SIZE=self.physical_block_size,
+                    BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
+                )
             _compute_slot_mapping_kernel[(num_reqs + 1,)](
                 num_tokens,
                 self.max_num_batched_tokens,
@@ -166,11 +237,7 @@ class BlockTable:
                 self.block_table.gpu.stride(0),
                 self.block_size,
                 self.slot_mapping.gpu,
-                TOTAL_CP_WORLD_SIZE=total_cp_world_size,
-                TOTAL_CP_RANK=total_cp_rank,
-                CP_KV_CACHE_INTERLEAVE_SIZE=self.cp_kv_cache_interleave_size,
-                PAD_ID=PAD_SLOT_ID,
-                BLOCK_SIZE=1024,
+                **kernel_kwargs,
             )
 
     def compute_slot_mapping_draft(self, req_indices: np.ndarray, positions: np.ndarray) -> None:
