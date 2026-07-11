@@ -116,6 +116,7 @@ def test_multi_connector_update_after_alloc_matches_installed_contract():
 
     chosen.update_state_after_alloc.assert_called_once_with(request, blocks, 32)
     expected_other_blocks = empty_blocks if vllm_version_is("0.23.0") else blocks
+    assert blocks.new_empty.call_count == (1 if vllm_version_is("0.23.0") else 0)
     other.update_state_after_alloc.assert_called_once_with(
         request,
         expected_other_blocks,
@@ -137,6 +138,7 @@ def test_multi_connector_update_after_alloc_without_chosen_connector():
     connector.update_state_after_alloc(request, blocks, 0)
 
     expected_blocks = empty_blocks if vllm_version_is("0.23.0") else blocks
+    assert blocks.new_empty.call_count == (1 if vllm_version_is("0.23.0") else 0)
     other.update_state_after_alloc.assert_called_once_with(request, expected_blocks, 0)
 
 

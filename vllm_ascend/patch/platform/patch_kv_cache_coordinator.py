@@ -27,9 +27,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
-    KVCacheSpecKind,
     MambaSpec,
-    get_kv_cache_spec_kind,
 )
 
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
@@ -38,13 +36,6 @@ from vllm_ascend.utils import vllm_version_is
 USE_MULTI_GROUPS_KV_CACHE = True
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
-
-
-def _is_mamba_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
-    """Match the installed coordinator's Mamba group classification."""
-    return isinstance(kv_cache_spec, MambaSpec) or (
-        not vllm_version_is("0.23.0") and get_kv_cache_spec_kind(kv_cache_spec) == KVCacheSpecKind.MAMBA
-    )
 
 
 def _select_kv_token_budget(
@@ -183,7 +174,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
     def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
         block_size = kv_cache_spec.block_size
-        if _is_mamba_kv_cache_spec(kv_cache_spec) and (self.enable_caching or not vllm_version_is("0.23.0")):
+        if isinstance(kv_cache_spec, MambaSpec) and (self.enable_caching or not vllm_version_is("0.23.0")):
             # vLLM #40996 makes Mamba state replicated across CP ranks. Main
             # therefore keeps the physical block size even when hashes are
             # consumed only by a KV connector (prefix caching disabled).
@@ -290,7 +281,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             target_block_size = kv_cache_spec.block_size
-            if not _is_mamba_kv_cache_spec(kv_cache_spec) and self.dcp_world_size * self.pcp_world_size > 1:
+            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
                 target_block_size *= self.dcp_world_size * self.pcp_world_size
             if target_block_size == self.hash_block_size:
                 return block_hashes
@@ -329,7 +320,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 _max_length = curr_hit_length
                 if use_eagle:
                     # Eagle needs to match one more block and then pop the last.
-                    _max_length = min(curr_hit_length + spec.block_size, max_cache_hit_length)
+                    eagle_block_size = spec.block_size if vllm_version_is("0.23.0") else effective_block_size
+                    _max_length = min(curr_hit_length + eagle_block_size, max_cache_hit_length)
                 eagle_kwarg = {"drop_eagle_block": use_eagle}
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),
@@ -382,7 +374,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             target_block_size = kv_cache_spec.block_size
-            if not _is_mamba_kv_cache_spec(kv_cache_spec) and self.dcp_world_size * self.pcp_world_size > 1:
+            if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
                 target_block_size *= self.dcp_world_size * self.pcp_world_size
             if target_block_size == self.hash_block_size:
                 return block_hashes
@@ -410,7 +402,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 # cache hit. If we let Mamba groups participate in the min-reduction,
                 # their zero hit collapses the FullAttention hit length to 0 and
                 # defeats prefix caching on the D side. Skip them instead.
-                if _is_mamba_kv_cache_spec(spec):
+                if isinstance(spec, MambaSpec):
                     if hit_blocks_by_group[group_ids[0]] is None:
                         for gid in group_ids:
                             hit_blocks_by_group[gid] = []
@@ -431,7 +423,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 _max_length = curr_hit_length
                 if use_eagle:
                     # Eagle needs to match one more block and then pop the last.
-                    _max_length = min(curr_hit_length + spec.block_size, max_cache_hit_length)
+                    eagle_block_size = spec.block_size if vllm_version_is("0.23.0") else effective_block_size
+                    _max_length = min(curr_hit_length + eagle_block_size, max_cache_hit_length)
                 eagle_kwarg = {"drop_eagle_block": use_eagle}
                 hit_blocks = manager_cls.find_longest_cache_hit(
                     block_hashes=_get_block_hashes(spec),

@@ -32,7 +32,8 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         chosen_connector = self._requests_to_connector.get(request.request_id, -1)
-        empty_blocks = blocks.new_empty()
+        use_empty_blocks = vllm_version_is("0.23.0")
+        other_blocks = blocks.new_empty() if use_empty_blocks else blocks
         for i, c in enumerate(self._connectors):
             if i == chosen_connector or isinstance(c, MooncakeLayerwiseConnector):
                 # Layerwise + KV-pool composition requires Layerwise to observe
@@ -41,7 +42,6 @@ class AscendMultiConnector(MultiConnector, SupportsHMA):
             else:
                 # vLLM #46865 requires real blocks for every sub-connector on
                 # main. Preserve v0.23.0's empty-block protocol on the tag lane.
-                other_blocks = empty_blocks if vllm_version_is("0.23.0") else blocks
                 c.update_state_after_alloc(request, other_blocks, 0)
 
     def get_num_new_matched_tokens(

@@ -237,72 +237,56 @@ def test_get_effective_block_size(
     assert coordinator._get_effective_block_size(spec_factory()) == expected
 
 
-def test_get_effective_block_size_recognizes_uniform_mamba_on_main() -> None:
-    mamba_spec = MambaSpec(
+@pytest.mark.parametrize(
+    "method_name",
+    ["find_longest_cache_hit", "find_longest_cache_hit_per_group"],
+)
+def test_eagle_probe_uses_installed_group_block_contract(method_name: str) -> None:
+    spec = FullAttentionSpec(
         block_size=16,
-        shapes=((1,),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="none",
+        num_kv_heads=8,
+        head_size=64,
+        dtype=torch.float16,
     )
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs({"mamba": mamba_spec})
-    assert uniform_spec is not None
-    coordinator = _make_coordinator_for_effective_block_size(
-        dcp_world_size=2,
-        pcp_world_size=2,
-        enable_caching=False,
-    )
-
-    expected = 64 if vllm_version_is("0.23.0") else 16
-    assert coordinator._get_effective_block_size(uniform_spec) == expected
-
-
-def test_uniform_mamba_hash_view_and_pd_skip_match_installed_contract() -> None:
-    mamba_spec = MambaSpec(
-        block_size=16,
-        shapes=((1,),),
-        dtypes=(torch.float32,),
-        mamba_cache_mode="none",
-    )
-    uniform_spec = UniformTypeKVCacheSpecs.from_specs({"mamba": mamba_spec})
-    assert uniform_spec is not None
 
     class CapturingManager:
-        calls = 0
-        received_hashes = None
+        max_lengths: list[int] = []
 
         @classmethod
-        def find_longest_cache_hit(cls, *, block_hashes, **_kwargs):
-            cls.calls += 1
-            cls.received_hashes = block_hashes
-            return ([MagicMock()],)
+        def find_longest_cache_hit(cls, *, max_length: int, **_kwargs):
+            cls.max_lengths.append(max_length)
+            return ([MagicMock(), MagicMock()],)
+
+    class ReducingManager:
+        @classmethod
+        def find_longest_cache_hit(cls, **_kwargs):
+            return ([MagicMock(), MagicMock()],)
 
     coordinator = _make_coordinator_for_effective_block_size(
         dcp_world_size=2,
-        pcp_world_size=2,
-        enable_caching=False,
+        pcp_world_size=1,
+        enable_caching=True,
     )
-    coordinator.hash_block_size = 16
+    coordinator.hash_block_size = 32
     coordinator.kv_cache_config = SimpleNamespace(
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=["mamba"], kv_cache_spec=uniform_spec)]
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["attn-0"], kv_cache_spec=spec),
+            KVCacheGroupSpec(layer_names=["attn-1"], kv_cache_spec=spec),
+        ]
     )
-    coordinator.attention_groups = [(uniform_spec, [0], CapturingManager)]
-    coordinator.eagle_attn_group_indices = set()
+    coordinator.attention_groups = [
+        (spec, [0], ReducingManager),
+        (spec, [1], CapturingManager),
+    ]
+    coordinator.eagle_attn_group_indices = {1}
     coordinator.block_pool = MagicMock()
-    coordinator.lcm_block_size = 16
+    coordinator.lcm_block_size = 32
     block_hashes: list[BlockHash] = []
 
-    coordinator.find_longest_cache_hit(block_hashes, max_cache_hit_length=16)
-    if vllm_version_is("0.23.0"):
-        assert CapturingManager.received_hashes is not block_hashes
-    else:
-        assert CapturingManager.received_hashes is block_hashes
+    getattr(coordinator, method_name)(block_hashes, max_cache_hit_length=96)
 
-    CapturingManager.calls = 0
-    coordinator.find_longest_cache_hit_per_group(
-        block_hashes,
-        max_cache_hit_length=16,
-    )
-    assert CapturingManager.calls == (1 if vllm_version_is("0.23.0") else 0)
+    expected_max_length = 80 if vllm_version_is("0.23.0") else 96
+    assert CapturingManager.max_lengths == [expected_max_length]
 
 
 def test_get_kv_cache_coordinator_delegates_single_group(monkeypatch) -> None:

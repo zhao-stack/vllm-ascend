@@ -176,31 +176,52 @@
 1. **`vllm#40996` / `95ed0feaa5`：DCP hybrid block-table 契约**
     - 上游 `_compute_slot_mapping_kernel` 新增必填 constexpr `KV_CACHE_BLOCK_SIZE` 和 `BLOCKS_PER_KV_BLOCK`，用于在物理 KV block 与 attention kernel block 不同时正确换算 table index。Ascend 直接调用该 kernel，main 若仍按旧签名启动会缺少必填参数；v0.23.0 的旧 kernel 又不接受新参数。
     - 上游新增 `KVCacheSpec.max_num_blocks_per_req()`，明确 Attention KV 按 DCP/PCP 分片、Mamba state 在各 rank 复制。Ascend 原逻辑先统一除 CP，再在 `BlockTable` 内单独乘回 Mamba，不能直接用于新 main，否则会重复缩放。
-    - 同一改动把 KV group 类型判断统一为 `get_kv_cache_spec_kind()`，使 `UniformTypeKVCacheSpecs` 包装的 Mamba/encoder-only group 仍能正确选择 `SlotMappingMode.NONE` 或从 worker block-table 列表排除。Ascend 旧 direct `isinstance` 会把包装组误分类，并导致 block-size/kernel-size/max-row 三张表错位。
-    - 310P 不调用上述 Triton kernel，但它复制的 numpy slot mapping 同样按 kernel block 判定 CP ownership；physical block 与 kernel block 分裂时会把本 rank token 错标为 padding。main 分支同步按 physical block 选 rank、再换算 kernel-block table index，并补充 CP + split-block 回归。
+    - 同一改动把 worker 的 KV group 类型判断统一为 `get_kv_cache_spec_kind()`，使 `UniformTypeKVCacheSpecs` 包装的 Mamba/encoder-only group 仍能正确跳过 token slot mapping 或从 worker block-table 列表排除。worker 配置保留包装 spec，因此 Ascend 旧 direct `isinstance` 会把实际生产组误分类，并导致 block-size/kernel-size/max-row 三张表错位。
+    - 310P 的受支持 hybrid/GDN 路径同样使用 Mamba block table；其 override 不会继承上游 `SlotMappingMode.NONE`，因此只同步 Mamba row-size 与跳过 slot mapping。310P attention backend 不支持 PCP/DCP，所以映射工具提示的 CP + split-block numpy 公式经复核后删除，不为非支持配置增加防御性语义。
     - 上游 `resolve_kv_cache_block_sizes()` 同步改为逐 group 计算 effective block size，并在 prefix cache **或 KV connector** 启用时计算 hash 粒度。Ascend 对该函数有整函数 monkeypatch，必须显式同步新语义，否则 hybrid + CP + connector 会得到与 scheduler/coordinator 不一致的 block/hash 粒度。
-    - 修复：所有新旧分支均由 `vllm_version_is("0.23.0")` 决定；tag 保留旧 kernel kwargs 和旧 row-size/哈希算法，main 使用新 constexpr、新 spec helper，并仅对 Attention group 应用 CP 缩放。coordinator 的 effective block size、两条 hash-view 路径和 P/D per-group Mamba 跳过逻辑统一使用同一版本化分类，避免包装 Mamba 在后续阶段重新乘 CP 或把 FullAttention 命中压成 0。没有参数探测或异常兜底。
+    - Ascend 整体覆写了 `HybridKVCacheCoordinator.find_longest_cache_hit` 的两条路径。上游把 EAGLE 额外探测步长从 `spec.block_size` 改为真实 `group_block_size`；若不跟随，DCP/压缩组会先少探测一块，随后 `drop_eagle_block` 再 pop，最终 prefix hit 少一整块。main 使用已计算的 `effective_block_size`，tag 保留旧步长。
+    - 修复：所有新旧分支均由 `vllm_version_is("0.23.0")` 决定；tag 保留旧 kernel kwargs 和旧 row-size/哈希算法，main 使用新 constexpr、新 spec helper，并仅对 Attention group 应用 CP 缩放。coordinator 在 scheduler 已解包后的实际 Mamba spec 上同步 effective block size 和 EAGLE 探测步长；没有参数探测、异常兜底或不可达 wrapper 分支。
 2. **`vllm#47381` / `85b3a7264b`：MRV2 请求排序与 DeepSeek MTP top-k**
     - 上游 MRV2 不再简单按 scheduled-token 数排序，而是用 `sort_batch_req_ids(..., decode_query_len)` 将 uniform decode 放在 short-extend 前；Ascend 覆盖的 `prepare_inputs()` 仍是旧排序，会使 `split_decodes_and_prefills` 把 spec decode 错判为 prefill。
     - 同一 PR 把 DeepSeek MTP layer 的初始 `skip_topk` 强制为 false，避免 draft step 读取从未写入的 top-k buffer；Ascend 整体替换 `DeepseekV2MLAAttention.__init__`，因此不会继承上游修复。
     - 修复：main 调用上游排序 helper，并对 MTP 应用新 `skip_topk` 语义；tag 由 `vllm_version_is` 保留原行为。
 3. **`vllm#46865` / `2285cfca46`：MultiConnector 分配后调用协议**
     - 新 main 要求所有 sub-connector 接收请求的真实 blocks，只以 `num_external_tokens=0` 表示“未被选中、不加载”。Ascend override 仍向未选中的 connector 传 empty blocks，并通过 Layerwise 特判绕开旧协议。
-    - 修复：main 对普通未选中 connector 按新协议传真实 blocks 和 0 external tokens；tag 继续传 empty blocks。下游 Layerwise + KV-pool 组合仍保留其既有特判：即使由另一 connector 命中，Layerwise 也必须看到真实 blocks 和该次 external-token 状态，否则会以空 blocks 提前消费 `do_remote_prefill`。
+    - 修复：main 对普通未选中 connector 按新协议传真实 blocks 和 0 external tokens，且不再创建无用 empty blocks；tag 继续创建并传 empty blocks。下游 Layerwise + KV-pool 组合仍保留其既有特判：即使由另一 connector 命中，Layerwise 也必须看到真实 blocks 和该次 external-token 状态，否则会以空 blocks 提前消费 `do_remote_prefill`。这是下游 PR #7032 已有的局部例外，不在本轮扩大或删除。
 4. **`vllm#46694` / `ae6170f874`：P/D async KV load 的 lookahead**
     - 上游把限制条件从 `load_kv_async and use_eagle` 扩为 `load_kv_async and num_lookahead_tokens > 0`：async load 当步不执行 forward，MTP 等其他 speculative method 同样不能提前分配 lookahead blocks。
     - 普通 scheduler 会继承上游；三个自研 scheduler 只在 `request.num_computed_tokens == 0` 查询 async load，既有逻辑已在同一条件把 lookahead 置零。`BalanceScheduler.schedule()` 是 v0.23 整体复制体，必须单独同步：通过 `vllm_version_is` 让 tag 保留 Eagle 条件、main 使用所有 speculative method 的新条件。
 5. **`vllm#48085` / `1cd75b3dd4`：KVBlockZeroer pinned-buffer 竞态**
     - 非阻塞 pinned-host→device copy 完成前复用同一个 pinned ID buffer，会让下一批覆盖上一批仍在传输的 block IDs，最终清零错误 KV block。Ascend 复制了同样的单 buffer 实现；310P 使用同步 tensor zero，不受此竞态影响。
-    - 修复：按 `max_concurrent_batches` 分配并轮转 pinned/GPU ID buffer；扩容前同步，避免释放仍在传输的源 buffer。该修复所需配置在 tag/main 都存在，两个 lane 共用同一明确实现。
+    - 修复：按 `max_concurrent_batches` 分配并轮转 pinned/GPU ID buffer；扩容前同步，避免释放仍在传输的源 buffer。该修改的触发依据是 main 新引入的上游修复被 Ascend 整体 override 遮蔽，不是映射同名；tag 使用相同的 nonblocking 单-buffer 实现并具备多 in-flight batch，因此共用确定性修复，明确作为双 lane bugfix，而不是实验性兜底。
+
+逐项关系复核结果：
+
+| 上游 PR | 下游实际关系 | 不跟随的具体后果 | 结论 |
+| --- | --- | --- | --- |
+| #40996 | direct kernel call；MRV1/310P runner override；KV cache utils/coordinator monkeypatch | main kernel 缺 constexpr；Mamba row/slot mode 错误；hybrid hash 粒度不一致；EAGLE prefix hit 少一块 | 仅保留生产可达修改，并补齐 EAGLE 两条路径 |
+| #47381 | MRV2 `prepare_inputs` override；DeepSeek 构造器直接替换 | spec decode 被误分为 prefill；MTP 读取未写 top-k buffer | 保留，main/tag 由 `vllm_version_is` 分流 |
+| #46865 | 工厂移除上游注册并注册 `AscendMultiConnector`；方法 override | 非选中 connector 丢失真实 block bookkeeping | 保留普通 connector 新协议；保留下游 Layerwise 既有例外 |
+| #46694 | `BalanceScheduler.schedule` 为 tag 整体复制体并替换上游 Scheduler | 非 Eagle speculative async load 提前分配 lookahead，导致本地/远端 block 数不一致 | 仅修改 BalanceScheduler；其他 scheduler 或继承路径不复制 |
+| #48085 | `AscendKVBlockZeroer` 覆写 ctor/init/zero 全路径 | 下一批覆盖在途 pinned IDs，清零错误 KV block | 保留 main 对齐；同一确定性竞态双 lane 修复 |
 
 已人工判定不修改的 analyzer/邻近候选：
 
+- 310P CP + split-block numpy slot mapping 只在不受支持的 PCP/DCP 配置或合成 UT 中可达；310P backend 没有 CP attention 实现，因此删除该防御性公式，只保留 CP=1 可达的 Mamba 修改。
+- scheduler coordinator 接收的配置已由上游 `generate_scheduler_kv_cache_config()` 解包 `UniformTypeKVCacheSpecs`；因此删除 coordinator 的 Uniform-Mamba 分类和人工构造 UT。worker 侧配置不会解包，相关 row-size/slot-mode 适配继续保留。
 - `vllm#48135` / `e08a9151` 的 Tensor `causal` 只修复 DiffusionGemma；Ascend 当前无该模型支持，也没有可消费 per-request Tensor causal 的 attention backend。仅扩类型会把错误从 `.get()` 推迟到布尔判断，不构成完整适配，因此不改。
 - `vllm#47317` / `2ded1b24e7ef48e21f71f51fc923a352deefbde2` 只减少 Mooncake SWA lookup 中被 mask chunk 的 hash 分配，PR 明确说明输出不变，属于性能优化而非升级兼容缺口。
 - `vllm#48132` 的 Mamba state reset 位于上游 model-state selector，但 Ascend V2 override 绕过该实现；当前 Ascend 不支持 hybrid Mamba + MRV2 speculative decode，也没有可触发该契约的消费者，因此本 PR 不引入无运行路径的修改。`vllm#47923`、`vllm#45261` 的 KV offload/full-report event 改动由未覆盖的上游实现直接生效；ROCm/XPU/CI/已删除模型提交不属于 Ascend main2main 适配范围。
 
 本节记录的是推送前源码闭包；推送后只处理新 CI 中能够证明由 `(ab7961a, e5588e49]` 引入、且属于上述或新增上游契约变化的失败。不得更新 golden、放宽阈值、关闭功能或增加兜底来换取用例通过。
+
+### 7.4 0710 适配后的 CPU UT 收集修复与必要性复核
+
+- 首次 0710 head `9ba3cd2d` 的 mypy 只失败于新增测试缺少 `block_hashes` 类型标注；补为 `list[BlockHash]` 后，lint、mypy 与手工 pre-commit 均通过，并提交为 `502a6240`。
+- `502a6240` 对应 run `29145563567` 的 main/tag CPU job 均在收集 `tests/ut/distributed/test_ascend_multi_connector.py` 时失败：`tests/ut/distributed/ascend_store/_mock_deps.py` 为隔离 AscendStore 安装了 `__path__` 为空的伪 `vllm_ascend.distributed.kv_transfer` 父包，后收集的新测试无法在该伪父包下导入真实 `ascend_multi_connector`。这不是生产模块缺失，也不是 main/tag API 差异。
+- 修复复用现有 `test_mooncake_layerwise_connector.py` 的模块隔离窗口：先保存并移除伪模块，导入真实 MultiConnector/Layerwise 模块，再恢复伪模块；删除会受全局收集顺序影响的独立测试文件。生产代码未为 UT 增加 import 兜底。
+- 重新运行 main2main evaluator 后，38 个预测文件仅 8 个与实际修改相交，precision 为 0.211；因此所有候选重新按 direct call、override、monkeypatch、注册替换及实际运行门禁逐项验证。复核删除了 310P 非支持 CP 公式与 coordinator 不可达 Uniform-Mamba 分支，并发现、补齐了工具未直接给出结论的两处 EAGLE effective-block 漏同步。
+- 非 #40996 的四组修改也已逐项复核：#47381 两处均为真实 override；#46865 为工厂注册替换；#46694 只影响复制版 BalanceScheduler；#48085 为 Ascend 全路径覆写。未因同名接口、参数存在性或测试期望而新增修改。
 
 ## 8. 后续每小时 CI 观察项
 
