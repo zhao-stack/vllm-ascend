@@ -31,7 +31,8 @@ def init_speculator(
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
-    if speculative_config.use_dspark():
+    use_dspark = getattr(speculative_config, "use_dspark", None)
+    if use_dspark is not None and use_dspark():
         from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
             AscendDSparkSpeculator,
         )
