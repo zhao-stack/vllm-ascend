@@ -27,6 +27,7 @@ from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
+from inspect import signature
 from multiprocessing import Manager
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
@@ -5102,25 +5103,18 @@ class NPUModelRunner(GPUModelRunner):
                     min_cg_attn_backend = attn_backend.__name__
 
         with update_pass_config(self):
-            if vllm_version_is("0.23.0"):
-                cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
-                    min_cg_support=min_cg_support,
-                    min_cg_attn_backend=min_cg_attn_backend,
-                    uniform_decode_query_len=self.uniform_decode_query_len,
-                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
-                    kv_cache_config=self.kv_cache_config,
-                    max_num_reqs=self.max_num_reqs,
-                )
-            else:
-                cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
-                    min_cg_support=min_cg_support,
-                    min_cg_attn_backend=min_cg_attn_backend,
-                    uniform_decode_query_len=self.uniform_decode_query_len,
-                    use_v2_model_runner=False,
-                    tensor_parallel_size=self.parallel_config.tensor_parallel_size,
-                    kv_cache_config=self.kv_cache_config,
-                    max_num_reqs=self.max_num_reqs,
-                )
+            resolve_cudagraph = self.compilation_config.resolve_cudagraph_mode_and_sizes
+            resolve_kwargs: dict[str, Any] = {
+                "min_cg_support": min_cg_support,
+                "min_cg_attn_backend": min_cg_attn_backend,
+                "uniform_decode_query_len": self.uniform_decode_query_len,
+                "tensor_parallel_size": self.parallel_config.tensor_parallel_size,
+                "kv_cache_config": self.kv_cache_config,
+                "max_num_reqs": self.max_num_reqs,
+            }
+            if "use_v2_model_runner" in signature(resolve_cudagraph).parameters:
+                resolve_kwargs["use_v2_model_runner"] = False
+            cudagraph_mode = resolve_cudagraph(**resolve_kwargs)
             self.cudagraph_dispatcher.initialize_cudagraph_keys(
                 cudagraph_mode, self.uniform_decode_query_len
             )

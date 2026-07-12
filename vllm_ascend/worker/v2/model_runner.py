@@ -47,7 +47,7 @@ from vllm_ascend.ascend_forward_context import (
     set_mc2_tokens_capacity,
 )
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
-from vllm_ascend.utils import set_weight_prefetch_method, vllm_version_is
+from vllm_ascend.utils import set_weight_prefetch_method
 from vllm_ascend.worker.v2.aclgraph_utils import ModelAclGraphManager
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch, AscendInputBuffers
@@ -360,10 +360,12 @@ class NPUModelRunner(GPUModelRunner):
             seq_lens_np=self.input_buffers.seq_lens_np,
             attn_state=attn_state,
         )
-        if not vllm_version_is("0.23.0"):
-            # Upstream main adds prompt_lens for R-SWA; v0.23.0 InputBatch
-            # does not have this dataclass field yet.
+        input_batch_fields = AscendInputBatch.__dataclass_fields__
+        if "prompt_lens" in input_batch_fields:
+            # Upstream main adds prompt_lens for R-SWA; release InputBatch
+            # dataclasses do not have this field yet.
             input_batch_kwargs["prompt_lens"] = None
+        if "is_padding" in input_batch_fields:
             input_batch_kwargs["is_padding"] = self.input_buffers.is_padding[:num_tokens_after_padding]
         self.input_batch = AscendInputBatch(**input_batch_kwargs)
 
