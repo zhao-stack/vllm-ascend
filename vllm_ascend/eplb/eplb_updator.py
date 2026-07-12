@@ -18,7 +18,6 @@
 import numpy
 import torch
 import torch.distributed as dist
-import vllm.envs as envs
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
 from vllm.v1.utils import record_function_or_nullcontext
@@ -56,14 +55,8 @@ class EplbUpdator:
         self.expert_map_path = expert_map_path
         self.expert_map_record_path = self.eplb_config.expert_map_record_path
 
-        try:
-            if not envs.VLLM_ALLOW_EXPERT_LOAD_COLLECTING:
-                self.num_expert_load_gather = self.expert_heat_collection_interval
-                self.periodic_load_gather = False
-        except Exception:
-            logger.debug("[eplb/updator] VLLM_ALLOW_EXPERT_LOAD_COLLECTING unavailable in current vllm version.")
-            self.num_expert_load_gather = self.expert_heat_collection_interval
-            self.periodic_load_gather = False
+        self.num_expert_load_gather = self.expert_heat_collection_interval
+        self.periodic_load_gather = False
 
         self.reqs = []
         self.update_info_all = []

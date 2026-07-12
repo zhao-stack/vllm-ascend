@@ -65,12 +65,9 @@ def _patch_model_runner_output() -> None:
     from vllm.v1 import outputs as outputs_mod
 
     model_runner_output_cls = outputs_mod.ModelRunnerOutput
-    fields = getattr(model_runner_output_cls, "__dataclass_fields__", {})
-    if "spec_token_ids" not in fields:
-        model_runner_output_cls.spec_token_ids = None
-        original_init = model_runner_output_cls.__init__
-        if getattr(original_init, "_vllm_ascend_pp_mtp_patched", False):
-            return
+    model_runner_output_cls.spec_token_ids = None
+    original_init = model_runner_output_cls.__init__
+    if not getattr(original_init, "_vllm_ascend_pp_mtp_patched", False):
 
         @wraps(original_init)
         def _patched_init(self, *args, spec_token_ids=None, **kwargs):
@@ -81,8 +78,7 @@ def _patch_model_runner_output() -> None:
         model_runner_output_cls.__init__ = _patched_init
 
     empty_output = outputs_mod.EMPTY_MODEL_RUNNER_OUTPUT
-    if not hasattr(empty_output, "spec_token_ids"):
-        empty_output.spec_token_ids = None
+    empty_output.spec_token_ids = None
 
 
 def _patch_engine_core() -> None:

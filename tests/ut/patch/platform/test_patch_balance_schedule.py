@@ -9,10 +9,8 @@ engine on NPU and live under e2e/nightly.
 
 What is guarded here (everything reachable from CPU UT):
 
-* the ``schedule`` override signature stays callable by BOTH vllm versions CI
-  runs (v0.23.0 calls ``schedule()``; 1f486d96 calls ``schedule(throttle_prefills)``)
-  and carries every parameter the installed ``schedule`` exposes -- NOT an
-  exact-match to the installed signature, which differs per lane;
+* the ``schedule`` override signature carries every parameter exposed by the
+  supported vLLM refs and accepts ``throttle_prefills``;
 * the ``BalanceScheduler.__init__`` signature stays drop-in compatible with
   upstream's ``Scheduler.__init__`` (upstream constructs ``Scheduler(...)``
   with kwargs, which after the swap constructs our subclass);
@@ -178,34 +176,17 @@ def _pinned_release_schedule_source() -> tuple[str, str] | None:
 
 
 # ---------------------------------------------------------------------------
-# 1. schedule() signature is callable by BOTH engine versions (dual-version CI)
+# 1. schedule() signature covers both supported refs
 # ---------------------------------------------------------------------------
 
 
-def test_schedule_signature_covers_both_engine_versions():
-    """vllm-ascend CI runs against TWO vllm versions at once: the release tag
-    v0.23.0 (whose engine calls ``schedule()`` with no args) and the
-    main-verified commit 1f486d96 (whose engine calls
-    ``schedule(throttle_prefills)``). A single override signature must be
-    callable by BOTH engines, so it carries ``throttle_prefills`` with a
-    default -- a deliberate superset of v0.23.0's ``schedule(self)``.
-
-    Asserting exact equality with the *installed* signature would be wrong:
-    on the v0.23.0 lane the installed signature is ``schedule(self)`` while
-    ours is ``schedule(self, throttle_prefills=False)``, so an equality check
-    can only ever pass on ONE of the two lanes. Instead we assert the two
-    things that actually matter on both lanes:
-
-    * both engines' call shapes bind cleanly to our signature (callable); and
-    * our signature carries every parameter the installed ``schedule`` exposes
-      (so an upstream parameter addition is caught here regardless of lane)."""
+def test_schedule_signature_covers_supported_vllm_refs():
+    """The override accepts the supported engine call shape and upstream args."""
     sig = inspect.signature(BalanceScheduler.schedule)
     # The engine invokes schedule() on an instance, so ``self`` is implicitly
     # bound; strip it before simulating the engine's call shapes, otherwise
     # sig.bind() complains about the missing ``self`` argument.
     sig = sig.replace(parameters=[p for p in sig.parameters.values() if p.name != "self"])
-    # v0.23.0 engine call shape, then 1f486d96 engine call shape.
-    sig.bind()
     sig.bind(throttle_prefills=True)
 
     up = {k for k in inspect.signature(_UpstreamScheduler.schedule).parameters if k != "self"}
@@ -229,13 +210,8 @@ def test_balance_deltas_present_in_schedule():
     src = inspect.getsource(BalanceScheduler.schedule)
 
     # delta 1: disabled-path early return delegates to super().schedule().
-    # Whether throttle_prefills is forwarded is decided by signature
-    # introspection (_SUPER_SCHEDULE_HAS_THROTTLE), NOT a version string, so
-    # the disabled path works on BOTH the v0.23.0 and 1f486d96 CI lanes.
     assert "if not self._balance_enabled:" in src
-    assert "_SUPER_SCHEDULE_HAS_THROTTLE" in src
     assert "super().schedule(throttle_prefills)" in src
-    assert "super().schedule()" in src
 
     # delta 2: the balance_flag admission gate (leader-at-cap => global freeze).
     assert "max(t.item() for t in self.balance_queue)" in src

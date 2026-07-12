@@ -17,7 +17,6 @@
 # MiniMax-M2 linear attention: MiniMaxText01RMSNormTP weight sharding and NPU q/k norm path.
 #
 
-import logging
 from functools import partial
 
 import torch
@@ -33,30 +32,8 @@ from vllm.model_executor.layers.minimax_rms_norm import (  # type: ignore[import
 )
 from vllm.platforms import current_platform
 
-logger = logging.getLogger(__name__)
-
-_ORIG_QK_METHOD_NAME: str | None = None
-_original_qk_method = None
-_qk_is_staticmethod = False
-
-if hasattr(MiniMaxText01RMSNormTP, "forward_qk"):
-    _ORIG_QK_METHOD_NAME = "forward_qk"
-    _original_qk_method = getattr(MiniMaxText01RMSNormTP, _ORIG_QK_METHOD_NAME)
-elif hasattr(MiniMaxText01RMSNormTP, "_normalize_qk"):
-    # Older vLLM versions
-    _ORIG_QK_METHOD_NAME = "_normalize_qk"
-    _original_qk_method = getattr(MiniMaxText01RMSNormTP, _ORIG_QK_METHOD_NAME)
-
-if _ORIG_QK_METHOD_NAME is not None:
-    # Detect whether upstream defined it as a staticmethod (some versions do).
-    _orig_desc = MiniMaxText01RMSNormTP.__dict__.get(_ORIG_QK_METHOD_NAME)
-    _qk_is_staticmethod = isinstance(_orig_desc, staticmethod)
-else:
-    logger.warning(
-        "Neither forward_qk nor _normalize_qk found on MiniMaxText01RMSNormTP; "
-        "MiniMax-M2 linear attention patching is a no-op. "
-        "This may indicate a vLLM API change."
-    )
+_ORIG_QK_METHOD_NAME = "forward_qk"
+_original_qk_method = MiniMaxText01RMSNormTP.forward_qk
 
 
 def _patched_qk(
@@ -95,7 +72,6 @@ def _patched_qk(
 
         return q, k
 
-    assert _original_qk_method is not None
     # We install the patch as a staticmethod below, so prefer the static calling
     # convention for the original as well.
     return _original_qk_method(q_norm, k_norm, q, k)
@@ -149,6 +125,5 @@ def _patched_init(
 MiniMaxText01RMSNormTP.__init__ = _patched_init
 MiniMaxText01RMSNormTP.weight_loader = staticmethod(_patched_weight_loader)
 
-if _ORIG_QK_METHOD_NAME is not None:
-    # Force staticmethod style, as requested.
-    setattr(MiniMaxText01RMSNormTP, _ORIG_QK_METHOD_NAME, staticmethod(_patched_qk))
+# Force staticmethod style, as requested.
+setattr(MiniMaxText01RMSNormTP, _ORIG_QK_METHOD_NAME, staticmethod(_patched_qk))

@@ -9,32 +9,7 @@ import pytest
 import vllm_ascend.patch.hunyuan_vl_processor_compat as compat
 
 
-@pytest.mark.parametrize(("available", "expected"), [(True, True), (False, False)])
-def test_detects_legacy_bundled_processors(monkeypatch, available, expected):
-    monkeypatch.setattr(
-        compat,
-        "find_spec",
-        lambda _module_name: object() if available else None,
-    )
-
-    assert compat._uses_legacy_bundled_processors() is expected
-
-
-def test_rejects_partial_legacy_bundled_processors(monkeypatch):
-    module_names = iter(compat._STALE_PROCESSOR_MODULES.values())
-    available_module = next(module_names)
-    missing_module = next(module_names)
-    monkeypatch.setattr(
-        compat,
-        "find_spec",
-        lambda module_name: object() if module_name == available_module else None,
-    )
-
-    with pytest.raises(RuntimeError, match=missing_module):
-        compat._uses_legacy_bundled_processors()
-
-
-def test_legacy_imports_native_processors_without_persistent_aliases(monkeypatch):
+def test_v024_imports_native_processors_without_persistent_aliases(monkeypatch):
     import transformers.models.hunyuan_vl.image_processing_hunyuan_vl as native_image
     import vllm.transformers_utils.processors as vllm_processors
 
@@ -73,7 +48,7 @@ def test_legacy_imports_native_processors_without_persistent_aliases(monkeypatch
     monkeypatch.setattr(native_image, "smart_resize", fake_smart_resize)
     monkeypatch.setattr(compat.importlib, "import_module", import_hunyuan_vision)
 
-    assert compat._import_legacy_hunyuan_vision() is hunyuan_vision
+    assert compat._import_v024_hunyuan_vision() is hunyuan_vision
 
     for module_name, previous_module in previous_modules.items():
         assert sys.modules.get(module_name) is previous_module
@@ -81,7 +56,7 @@ def test_legacy_imports_native_processors_without_persistent_aliases(monkeypatch
         assert vars(vllm_processors).get(attribute_name) is previous_attribute
 
 
-def test_legacy_restores_aliases_after_import_error(monkeypatch):
+def test_v024_restores_aliases_after_import_error(monkeypatch):
     import transformers.models.hunyuan_vl.image_processing_hunyuan_vl as native_image
 
     class FakeProcessor:
@@ -106,13 +81,13 @@ def test_legacy_restores_aliases_after_import_error(monkeypatch):
     monkeypatch.setattr(compat.importlib, "import_module", fail_import)
 
     with pytest.raises(ImportError, match="expected test failure"):
-        compat._import_legacy_hunyuan_vision()
+        compat._import_v024_hunyuan_vision()
 
     for module_name, previous_module in previous_modules.items():
         assert sys.modules.get(module_name) is previous_module
 
 
-def test_installer_runs_legacy_backports_in_order(monkeypatch):
+def test_installer_runs_v024_backports_in_order(monkeypatch):
     hunyuan_vision = object()
     calls: list[Any] = []
 
@@ -130,10 +105,10 @@ def test_installer_runs_legacy_backports_in_order(monkeypatch):
     def patch_loader(module: Any) -> None:
         calls.append(("loader", module))
 
-    monkeypatch.setattr(compat, "_uses_legacy_bundled_processors", lambda: True)
+    monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.24.0")
     monkeypatch.setattr(
         compat,
-        "_import_legacy_hunyuan_vision",
+        "_import_v024_hunyuan_vision",
         import_hunyuan_vision,
     )
     monkeypatch.setattr(
@@ -148,7 +123,7 @@ def test_installer_runs_legacy_backports_in_order(monkeypatch):
     )
     monkeypatch.setattr(
         compat,
-        "_patch_legacy_processor_methods",
+        "_patch_v024_processor_methods",
         patch_processor,
     )
     compat.install_hunyuan_vl_processor_compat()
@@ -182,7 +157,7 @@ def test_installer_cleans_main_registry_before_model_patch(monkeypatch):
     def patch_loader(module: Any) -> None:
         calls.append(("loader", module))
 
-    monkeypatch.setattr(compat, "_uses_legacy_bundled_processors", lambda: False)
+    monkeypatch.setattr(compat, "vllm_version_is", lambda _version: False)
     monkeypatch.setattr(
         compat,
         "_remove_stale_registry_entries",
@@ -271,7 +246,7 @@ def test_compat_processor_registers_schema_before_native_init(monkeypatch):
     ]
 
 
-def test_legacy_backports_native_processor_call_protocol(monkeypatch):
+def test_v024_backports_native_processor_call_protocol(monkeypatch):
     class FakeProcessingInfo:
         pass
 
@@ -283,7 +258,7 @@ def test_legacy_backports_native_processor_call_protocol(monkeypatch):
         HunYuanVLMultiModalProcessor=FakeMultiModalProcessor,
     )
     compat._patch_hunyuan_processor_loader(hunyuan_vision)
-    compat._patch_legacy_processor_methods(hunyuan_vision)
+    compat._patch_v024_processor_methods(hunyuan_vision)
 
     processor_args: list[tuple[Any, dict[str, Any]]] = []
 
@@ -398,15 +373,15 @@ def test_installer_preserves_native_prompt_update_protocol(monkeypatch):
     hunyuan_vision = SimpleNamespace(
         HunYuanVLMultiModalProcessor=FakeMultiModalProcessor,
     )
-    monkeypatch.setattr(compat, "_uses_legacy_bundled_processors", lambda: True)
+    monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.24.0")
     monkeypatch.setattr(
         compat,
-        "_import_legacy_hunyuan_vision",
+        "_import_v024_hunyuan_vision",
         lambda: hunyuan_vision,
     )
     monkeypatch.setattr(compat, "_remove_stale_registry_entries", lambda: True)
     monkeypatch.setattr(compat, "_patch_hunyuan_processor_loader", lambda _module: None)
-    monkeypatch.setattr(compat, "_patch_legacy_processor_methods", lambda _module: None)
+    monkeypatch.setattr(compat, "_patch_v024_processor_methods", lambda _module: None)
 
     compat.install_hunyuan_vl_processor_compat()
 

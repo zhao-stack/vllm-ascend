@@ -25,6 +25,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.recompute_cpu_offload.metadata 
     RecomputeCPUOffloadMetadata,
     RecomputeCPUOffloadWorkerMetadata,
 )
+from vllm_ascend.utils import vllm_version_is
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -88,10 +89,17 @@ class RecomputeCPUOffloadScheduler:
         pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         assert dcp_world_size == 1 and pcp_world_size == 1
         scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)
+        if vllm_version_is("0.24.0"):
+            token_budget_kwargs = {
+                "max_num_batched_tokens": vllm_config.scheduler_config.max_num_batched_tokens,
+            }
+        else:
+            token_budget_kwargs = {
+                "max_in_flight_tokens": vllm_config.max_in_flight_tokens,
+            }
         self.cpu_coordinator: KVCacheCoordinator = get_kv_cache_coordinator(
             kv_cache_config=self.cpu_kv_cache_config,
             max_model_len=vllm_config.model_config.max_model_len,
-            max_num_batched_tokens=(vllm_config.scheduler_config.max_num_batched_tokens),
             use_eagle=False,
             enable_caching=self.enable_offload_prefix_caching,
             enable_kv_cache_events=self.enable_kv_cache_events,
@@ -99,6 +107,7 @@ class RecomputeCPUOffloadScheduler:
             pcp_world_size=pcp_world_size,
             scheduler_block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
+            **token_budget_kwargs,
         )
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         self._gpu_block_pool: BlockPool | None = None

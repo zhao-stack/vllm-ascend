@@ -428,3 +428,10 @@ if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascen
     _ascend_utils.AscendDeviceType = MagicMock()
     _ascend_utils.get_ascend_device_type = MagicMock()
     sys.modules["vllm_ascend.utils"] = _ascend_utils
+
+if "vllm_ascend.core" not in sys.modules:
+    sys.modules["vllm_ascend.core"] = _make_pkg("vllm_ascend.core")
+if "vllm_ascend.core.single_type_kv_cache_manager" not in sys.modules:
+    _ascend_single_type_mod = types.ModuleType("vllm_ascend.core.single_type_kv_cache_manager")
+    _ascend_single_type_mod.CompressAttentionManager = _FakeSingleTypeKVCacheManager  # type: ignore[attr-defined]
+    sys.modules["vllm_ascend.core.single_type_kv_cache_manager"] = _ascend_single_type_mod

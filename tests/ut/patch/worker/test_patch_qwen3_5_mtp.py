@@ -3,17 +3,12 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 import torch
 from vllm.sequence import IntermediateTensors
 
 from vllm_ascend.patch.worker import patch_qwen3_5
 
 
-@pytest.mark.skipif(
-    patch_qwen3_5.Qwen3_5MultiTokenPredictor is None,
-    reason="Qwen3.5 MTP model is not available in this vLLM version.",
-)
 def test_qwen3_5_mtp_forward_uses_local_inputs_on_last_pp_rank():
     predictor = patch_qwen3_5.Qwen3_5MultiTokenPredictor.__new__(patch_qwen3_5.Qwen3_5MultiTokenPredictor)
     predictor.num_mtp_layers = 2
@@ -44,10 +39,6 @@ def test_qwen3_5_mtp_forward_uses_local_inputs_on_last_pp_rank():
     assert torch.equal(output, torch.full((2, 4), 7.0))
 
 
-@pytest.mark.skipif(
-    patch_qwen3_5.Qwen3_5MultiTokenPredictor is None,
-    reason="Qwen3.5 MTP model is not available in this vLLM version.",
-)
 def test_qwen3_5_mtp_forward_returns_intermediate_tensors_on_non_last_pp_rank():
     predictor = patch_qwen3_5.Qwen3_5MultiTokenPredictor.__new__(patch_qwen3_5.Qwen3_5MultiTokenPredictor)
     predictor.num_mtp_layers = 1

@@ -31,16 +31,13 @@ def init_speculator(
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
-    use_dspark = getattr(speculative_config, "use_dspark", None)
-    if use_dspark is not None and use_dspark():
+    if not vllm_version_is("0.24.0") and speculative_config.use_dspark():
         from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
             AscendDSparkSpeculator,
         )
 
         return AscendDSparkSpeculator(vllm_config, device)
     if speculative_config.use_dflash():
-        if vllm_version_is("0.23.0"):
-            raise NotImplementedError("DFlash speculator is not supported on vLLM 0.23.0.")
         from vllm_ascend.worker.v2.spec_decode.dflash.speculator import (
             AscendDFlashSpeculator,
         )

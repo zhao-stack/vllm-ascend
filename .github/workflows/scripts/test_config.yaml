@@ -244,6 +244,8 @@
   optional: false
   source_file_dependencies:
     - vllm_ascend/kv_offload
+    - vllm_ascend/distributed/kv_transfer/kv_pool/cpu_offload
+    - vllm_ascend/distributed/kv_transfer/kv_pool/recompute_cpu_offload
   tests:
     - tests/ut/kv_offload
     - tests/e2e/pull_request/one_card/test_cpu_offloading.py

@@ -168,9 +168,8 @@ class AscendRMSNormGated(RMSNormGated):
         norm_before_gate: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
-        # `activation` was added in vLLM #40245 (Qwen3-Next/GDN). Accept and
-        # forward it; older vllm versions did not pass this kwarg so the
-        # default keeps existing behavior.
+        # `activation` comes from vLLM #40245 (Qwen3-Next/GDN). Accept and
+        # forward it while preserving the upstream default.
         activation: str = "swish",
     ):
         """If group_size is not None, we do GroupNorm with each group having group_size elements.

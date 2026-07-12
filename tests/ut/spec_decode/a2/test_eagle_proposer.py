@@ -1517,11 +1517,6 @@ class TestEagleProposerPropose:
             "draft_model_config",
             "disable_padded_drafter_batch",
         }
-        # speculative_token_tree was removed in newer vllm (Remove tree attention #42121);
-        # only check for it when the installed version still carries the field.
-        if "speculative_token_tree" in vllm.config.SpeculativeConfig.__dataclass_fields__:
-            fields.add("speculative_token_tree")
-
         actual = set(vllm.config.SpeculativeConfig.__dataclass_fields__)
         missing = fields - actual
 
@@ -2395,10 +2390,6 @@ class TestRunMergedDraft(TestBase):
             "draft_model_config",
             "disable_padded_drafter_batch",
         }
-        # speculative_token_tree was removed in newer vllm (Remove tree attention #42121);
-        # only check for it when the installed version still carries the field.
-        if "speculative_token_tree" in vllm.config.SpeculativeConfig.__dataclass_fields__:
-            fields.add("speculative_token_tree")
         actual = set(vllm.config.SpeculativeConfig.__dataclass_fields__)
         missing = fields - actual
         assert not missing, f"Missing dataclass fields: {missing}"

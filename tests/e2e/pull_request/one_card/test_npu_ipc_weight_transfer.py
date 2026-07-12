@@ -34,6 +34,7 @@ import torch_npu  # noqa: F401  # registers the NPU backend
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from tests.e2e.conftest import RemoteOpenAIServer
+from vllm_ascend.utils import vllm_version_is
 
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
@@ -75,25 +76,13 @@ def _generate(client, model, prompts):
     return completions
 
 
-def _has_lifecycle_endpoints(server: RemoteOpenAIServer) -> bool:
-    """Probe ``/start_weight_update``; also performs the actual call when present."""
-    try:
-        response = requests.post(
-            server.url_for("start_weight_update"),
-            json={"is_checkpoint_format": True},
-            timeout=CONTROL_TIMEOUT,
-        )
-    except requests.RequestException:
-        return False
-    if response.status_code == 404:
-        return False
-    response.raise_for_status()
-    return True
-
-
 @pytest.mark.skipif(
     torch.npu.device_count() < 1,
     reason="NPU IPC weight transfer e2e test requires at least 1 NPU.",
+)
+@pytest.mark.skipif(
+    vllm_version_is("0.24.0"),
+    reason="vLLM v0.24.0 does not provide weight-transfer lifecycle endpoints.",
 )
 def test_npu_ipc_weight_transfer_updates_server_weights():
     from vllm.utils.network_utils import get_open_port
@@ -151,12 +140,7 @@ def test_npu_ipc_weight_transfer_updates_server_weights():
         _post(server, "init_weight_transfer_engine", json={"init_info": {}})
 
         _post(server, "pause")
-        # The probe performs /start_weight_update when present, so it must not
-        # be called again below. Older vLLM without the lifecycle endpoints is
-        # out of scope for this IPC test.
-        if not _has_lifecycle_endpoints(server):
-            _post(server, "resume")
-            pytest.skip("vLLM build lacks the /start_weight_update lifecycle endpoints required by NPU IPC.")
+        _post(server, "start_weight_update", json={"is_checkpoint_format": True})
 
         # trainer_send_weights POSTs to /update_weights itself; the server
         # rebuilds tensors locally and loads them before the POST returns (no

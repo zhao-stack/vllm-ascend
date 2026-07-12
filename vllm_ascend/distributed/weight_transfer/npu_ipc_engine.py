@@ -8,7 +8,6 @@ import socket
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from functools import lru_cache
-from inspect import signature
 from typing import Any
 
 import pybase64 as base64
@@ -32,8 +31,7 @@ from vllm_ascend.distributed.weight_transfer.packed_tensor import (
     packed_npu_ipc_consumer,
     packed_npu_ipc_producer,
 )
-
-_WEIGHT_TRANSFER_ENGINE_USES_VLLM_CONFIG = "vllm_config" in signature(WeightTransferEngine.__init__).parameters
+from vllm_ascend.utils import vllm_version_is
 
 
 @dataclass
@@ -120,7 +118,7 @@ class NPUIPCWeightTransferEngine(WeightTransferEngine[NPUIPCWeightTransferInitIn
     init_info_cls = NPUIPCWeightTransferInitInfo
     update_info_cls = NPUIPCWeightTransferUpdateInfo
 
-    if not _WEIGHT_TRANSFER_ENGINE_USES_VLLM_CONFIG:
+    if vllm_version_is("0.24.0"):
 
         def __init__(
             self,
@@ -170,7 +168,7 @@ class NPUIPCWeightTransferEngine(WeightTransferEngine[NPUIPCWeightTransferInitIn
         """No initialization needed for NPU IPC backend."""
         pass
 
-    if _WEIGHT_TRANSFER_ENGINE_USES_VLLM_CONFIG:
+    if not vllm_version_is("0.24.0"):
 
         def start_weight_update(self) -> None:
             """No-op for NPU IPC engine (no layerwise reloading)."""

@@ -21,7 +21,7 @@ from copy import deepcopy
 
 import torch
 from torch import nn
-from vllm.config import LoadConfig, ModelConfig, VllmConfig
+from vllm.config import LoadConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.logger import logger
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
@@ -34,12 +34,6 @@ from .load import elastic_load
 from .utils import find_free_port, is_valid_path_prefix
 
 DRAFT_PORT_OFFSET = 10000
-
-try:
-    # Older vLLM versions may not expose the current-config accessor.
-    from vllm.config import get_current_vllm_config
-except ImportError:
-    get_current_vllm_config = None
 
 
 @register_model_loader("netloader")
@@ -169,11 +163,10 @@ class ModelNetLoaderElastic(BaseModelLoader):
     def _clear_static_forward_context(vllm_config: VllmConfig) -> None:
         """Clear static layer registrations before rebuilding the model on fallback."""
         candidates = [("vllm_config", vllm_config)]
-        if get_current_vllm_config is not None:
-            try:
-                candidates.append(("current_vllm_config", get_current_vllm_config()))
-            except Exception as e:
-                logger.debug("Failed to get current vLLM config while clearing static context: %s", e)
+        try:
+            candidates.append(("current_vllm_config", get_current_vllm_config()))
+        except Exception as e:
+            logger.debug("Failed to get current vLLM config while clearing static context: %s", e)
 
         cleared_contexts = []
         seen_context_ids = set()
@@ -245,8 +238,7 @@ class ModelNetLoaderElastic(BaseModelLoader):
         else:
             target_device = torch.device(device_config.device)
 
-            _quant_config = getattr(vllm_config, "quant_config", None)
-            _quant_config = deepcopy(_quant_config) if _quant_config is not None else None
+            _quant_config = deepcopy(vllm_config.quant_config)
             model_config_backup = deepcopy(model_config)
 
             with set_default_torch_dtype(model_config.dtype):
@@ -288,8 +280,7 @@ class ModelNetLoaderElastic(BaseModelLoader):
                 if model is None:
                     logger.warning("Netloader elastic loading fails, use load format DefaultModelLoader")
 
-                    if hasattr(vllm_config, "quant_config"):
-                        vllm_config.quant_config = _quant_config
+                    vllm_config.quant_config = _quant_config
                     model_config = model_config_backup
 
                     del model

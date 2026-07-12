@@ -134,10 +134,8 @@ class AscendDflashProposer(AscendEagleProposer):
             torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * num_query_per_req
         ).to(torch.int32)
 
-        if hasattr(cad, "actual_seq_lengths_q"):
-            cad.actual_seq_lengths_q = [num_query_per_req] * batch_size
-        if hasattr(cad, "decode_token_per_req"):
-            cad.decode_token_per_req = num_query_per_req
+        cad.actual_seq_lengths_q = [num_query_per_req] * batch_size
+        cad.decode_token_per_req = num_query_per_req
 
         cad.num_actual_tokens = num_query_total
         cad.max_query_len = num_query_per_req

@@ -228,6 +228,19 @@ class TestUtils(TestBase):
             self.assertTrue(utils.vllm_version_is.__wrapped__("1.0.0"))
         with mock.patch("vllm.__version__", "1.0+empty"):
             self.assertTrue(utils.vllm_version_is.__wrapped__("1.0.0"))
+        for installed_version, expected in (
+            ("0.24.0+empty", True),
+            ("v0.24.0+vendor", True),
+            ("0.1.dev1+ge5588e49b.empty", False),
+            ("0.24.0.dev1+ge5588e49b", False),
+            ("0.24.0rc1+vendor", False),
+            ("0.24.0.post1+vendor", False),
+        ):
+            with (
+                self.subTest(installed_version=installed_version),
+                mock.patch("vllm.__version__", installed_version),
+            ):
+                self.assertIs(utils.vllm_version_is.__wrapped__("0.24.0"), expected)
         for installed_version in (
             "1.0.0.dev1+gabcdef",
             "1.0.0rc1+vendor",
@@ -240,6 +253,10 @@ class TestUtils(TestBase):
             mock.patch("vllm.__version__", "2.0.0"),
         ):
             self.assertTrue(utils.vllm_version_is.__wrapped__("1.0.0"))
+        with mock.patch("vllm.__version__", "not-a-version"), self.assertRaises(ValueError):
+            utils.vllm_version_is.__wrapped__("0.24.0")
+        with mock.patch("vllm.__version__", "0.24.0"), self.assertRaises(ValueError):
+            utils.vllm_version_is.__wrapped__("not-a-version")
         # Test caching takes effect
         utils.vllm_version_is.cache_clear()
         utils.vllm_version_is("1.0.0")

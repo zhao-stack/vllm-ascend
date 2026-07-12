@@ -41,6 +41,7 @@ from vllm_ascend.distributed.weight_transfer import npu_ipc_engine
 from vllm_ascend.distributed.weight_transfer.npu_ipc_engine import (
     NPUIPCWeightTransferEngine,
 )
+from vllm_ascend.utils import vllm_version_is
 
 _MODULE = "vllm_ascend.distributed.weight_transfer.npu_ipc_engine"
 
@@ -71,7 +72,7 @@ def test_init_accepts_model_argument():
 def test_init_passes_model_to_super():
     captured: dict = {}
 
-    if not npu_ipc_engine._WEIGHT_TRANSFER_ENGINE_USES_VLLM_CONFIG:
+    if vllm_version_is("0.24.0"):
 
         def fake_init_v0(self, config, parallel_config, model=None):
             captured["args"] = (config, parallel_config, model)

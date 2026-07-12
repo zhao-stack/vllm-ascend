@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 from collections.abc import Sequence
-from inspect import signature
 from typing import TYPE_CHECKING
 
 from vllm.utils.math_utils import cdiv
@@ -23,6 +22,8 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+from vllm_ascend.utils import vllm_version_is
 
 if TYPE_CHECKING:
     from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
@@ -287,18 +288,19 @@ def get_manager_for_kv_cache_spec(
         # and ``full_sequence_must_fit`` admission reserves the full
         # ``max_model_len`` worth of blocks per request, exhausting the pool
         # at cc>=2 on DSv4 (see vLLM issue #40863).
-        token_budget = max_in_flight_tokens if max_in_flight_tokens is not None else max_num_batched_tokens
+        token_budget = max_num_batched_tokens if vllm_version_is("0.24.0") else max_in_flight_tokens
         if token_budget is not None and max_model_len is not None:
-            admission_kwargs = {"max_model_len": max_model_len}
-            admission_parameters = signature(kv_cache_spec.max_admission_blocks_per_request).parameters
-            token_budget_key = (
-                "max_in_flight_tokens" if "max_in_flight_tokens" in admission_parameters else "max_num_batched_tokens"
-            )
-            admission_kwargs[token_budget_key] = token_budget
-            kwargs["max_admission_blocks_per_request"] = kv_cache_spec.max_admission_blocks_per_request(
-                **admission_kwargs
-            )
-    if "needs_kv_cache_zeroing" not in signature(SingleTypeKVCacheManager.__init__).parameters:
+            if vllm_version_is("0.24.0"):
+                kwargs["max_admission_blocks_per_request"] = kv_cache_spec.max_admission_blocks_per_request(
+                    max_num_batched_tokens=token_budget,
+                    max_model_len=max_model_len,
+                )
+            else:
+                kwargs["max_admission_blocks_per_request"] = kv_cache_spec.max_admission_blocks_per_request(
+                    max_in_flight_tokens=token_budget,
+                    max_model_len=max_model_len,
+                )
+    if vllm_version_is("0.24.0"):
         kwargs.pop("needs_kv_cache_zeroing", None)
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager

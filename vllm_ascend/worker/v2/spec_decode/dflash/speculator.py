@@ -13,6 +13,7 @@ from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
     DFlashSpeculator,
 )
 
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import build_attn_metadata_wrapper
 
 
@@ -27,7 +28,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         block_tables: Any,
     ) -> None:
         super().set_attn(model_state, kv_cache_config, block_tables)
-        if hasattr(self, "draft_kv_cache_group_ids"):
+        if not vllm_version_is("0.24.0"):
             self._context_slot_mappings = torch.zeros(
                 len(self.draft_kv_cache_group_ids),
                 self.max_num_tokens,
@@ -237,16 +238,18 @@ def prepare_dflash_inputs_ascend(
     max_model_len: int | None = None,
     sample_from_anchor: bool = False,
 ) -> None:
-    """Launch the Ascend kernel for both legacy and current DFlash callers."""
+    """Launch the Ascend kernel for v0.24 and main DFlash callers."""
     num_reqs = input_batch.num_reqs
     assert num_reqs > 0
     max_target_query_len = int(input_batch.num_scheduled_tokens.max())
     max_tokens_per_req = max_target_query_len + num_query_per_req
     block_size_triton = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, block_size_triton)
-    if max_model_len is None:
-        # Legacy DFlash did not clamp query positions in this kernel.
+    if vllm_version_is("0.24.0"):
+        # v0.24 DFlash did not clamp query positions in this kernel.
         max_model_len = 2**31 - 1
+    else:
+        assert max_model_len is not None
     _prepare_dflash_inputs_kernel_ascend[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,

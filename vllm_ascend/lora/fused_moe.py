@@ -186,10 +186,10 @@ class AscendFusedMoEWithLoRA(FusedMoEWithLoRA):
         # ``_moe_kernel`` is only set by the GPU modular-kernel path that we
         # deliberately skip in __init__. We instead build the per-layer
         # MoELoRAContext (now that punica_wrapper is available) and publish it
-        # on the module that ``AscendUnquantizedFusedMoEMethod.apply`` reads via
-        # ``getattr(layer, "_ascend_moe_lora_context", None)`` -- the base layer
-        # itself on 0.23.0, but ``base_layer.routed_experts`` on main (there the
-        # runner *is* the layer and it calls apply with ``layer=routed_experts``).
+        # on the routed-experts module that
+        # ``AscendUnquantizedFusedMoEMethod.apply`` reads via
+        # ``getattr(layer, "_ascend_moe_lora_context", None)``. The runner is
+        # the layer and calls apply with ``layer=routed_experts``.
         # The context holds stable references (the in-place-updated LoRA stacks,
         # adapter_enabled and the punica wrapper), so building it once here is
         # sufficient.

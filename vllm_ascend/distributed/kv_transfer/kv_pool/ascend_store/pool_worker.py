@@ -232,12 +232,9 @@ class KVPoolWorker:
     def _build_cache_coordinator(self, vllm_config: VllmConfig) -> AscendStoreCoordinator | None:
         if self.kv_cache_config is None or not self.use_hybrid:
             return None
-        speculative_config = getattr(vllm_config, "speculative_config", None)
-        use_eagle_fn = getattr(speculative_config, "use_eagle", None)
-        use_eagle = bool(use_eagle_fn()) if callable(use_eagle_fn) else False
-        retention_interval = getattr(envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
-        if not isinstance(retention_interval, int):
-            retention_interval = None
+        speculative_config = vllm_config.speculative_config
+        use_eagle = speculative_config is not None and speculative_config.use_eagle()
+        retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
         return AscendStoreCoordinator(
             self.kv_cache_config.kv_cache_groups,
             scheduler_block_size=self.cache_transfer_granularity,

@@ -8,6 +8,8 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
+from vllm_ascend.utils import vllm_version_is
+
 
 class BlockTable:
     def __init__(
@@ -29,17 +31,12 @@ class BlockTable:
         self.dcp_world_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group
         compress_ratio = 1
-        if (
-            kv_cache_group is not None
-            and hasattr(kv_cache_group, "kv_cache_spec")
-            and isinstance(kv_cache_group.kv_cache_spec, UniformTypeKVCacheSpecs)
-        ):
+        if kv_cache_group is not None and isinstance(kv_cache_group.kv_cache_spec, UniformTypeKVCacheSpecs):
             kv_cache_spec = next(iter(kv_cache_group.kv_cache_spec.kv_cache_specs.values()), None)
             if kv_cache_spec is not None and hasattr(kv_cache_spec, "compress_ratio"):
                 compress_ratio = kv_cache_spec.compress_ratio
         if (
             kv_cache_group is not None
-            and hasattr(kv_cache_group, "kv_cache_spec")
             and (self.pcp_world_size * self.dcp_world_size > 1)
             and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
         ):
@@ -50,11 +47,7 @@ class BlockTable:
         self.pin_memory = pin_memory
         self.device = device
         self.physical_block_size = block_size
-        self.is_mamba_group = (
-            kv_cache_group is not None
-            and hasattr(kv_cache_group, "kv_cache_spec")
-            and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
-        )
+        self.is_mamba_group = kv_cache_group is not None and isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
 
         # If kernel_sizes is None or [0], use physical block size (no splitting)
         if kernel_sizes is None or kernel_sizes == [0]:
@@ -164,10 +157,10 @@ class BlockTable:
                 "PAD_ID": PAD_SLOT_ID,
                 "BLOCK_SIZE": 1024,
             }
-            if "KV_CACHE_BLOCK_SIZE" in getattr(_compute_slot_mapping_kernel, "arg_names", ()):
+            if not vllm_version_is("0.24.0"):
                 # vLLM #40996 split physical KV blocks into kernel blocks in
                 # the slot-mapping kernel. Newer kernels require these
-                # constexprs; release kernels do not accept them.
+                # constexprs; the v0.24.0 kernel does not accept them.
                 kernel_kwargs.update(
                     KV_CACHE_BLOCK_SIZE=self.physical_block_size,
                     BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,

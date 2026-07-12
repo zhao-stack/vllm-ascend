@@ -10,28 +10,17 @@ rank reaches that decision independently from the same gathered snapshot --
 there is no leader. See ``docs/.../balance_schedule_refactor.md`` for the
 design.
 
-The ``schedule()`` body is a verbatim copy of the **v0.23.0** release tag's
-``Scheduler.schedule()`` (the production pin), plus exactly three balance
+The ``schedule()`` body is a verbatim copy of the pinned release tag's
+``Scheduler.schedule()``, plus exactly three balance
 deltas: (1) the disabled-path early return that delegates to ``super()``,
 (2) the ``balance_flag`` break inside the WAITING loop
 (``any-rank-at-cap => global freeze``), and (3) ``if request_queue is None:
 break`` in place of upstream's ``assert request_queue is not None`` (so a
 drained-rank schedule does not assert when balance defers admission).
 
-The **signature**, in contrast, must work across BOTH vllm versions that
-vllm-ascend CI runs simultaneously: the release tag v0.23.0 (whose engine
-calls ``schedule()`` with no args) and the main-verified commit 1f486d96
-(whose engine calls ``schedule(throttle_prefills)``). So the override carries
-``throttle_prefills`` with a default -- a deliberate superset of v0.23.0's
-``schedule(self)`` -- making it callable by both engines. On the disabled
-fast-path it then forwards ``throttle_prefills`` only when the installed
-``super().schedule`` actually accepts it, decided by introspecting the
-signature once at import (``_SUPER_SCHEDULE_HAS_THROTTLE``) rather than
-parsing a version string (a dev checkout's ``__version__`` is not a clean
-PEP 440 release and would make a ``vllm_version_is`` check raise). The body
-and the signature therefore deliberately target different things: the body
-tracks the stable release tag, the signature tracks the union of both
-engines' call shapes. See the design doc for the full rationale.
+Both supported vLLM refs accept ``throttle_prefills``. The override keeps the
+same signature and forwards the argument directly on the disabled fast path.
+See the design doc for the full rationale.
 
 The engine-core side is NOT copied: ``BalanceDPEngineCoreProc`` hooks
 ``_has_global_unfinished_reqs`` (called every iteration by upstream's
@@ -69,7 +58,6 @@ balance scheduling is enabled (conditional activation, so balance does not
 touch configs that don't use it, e.g. PD-disaggregated recompute).
 """
 
-import inspect
 import time
 
 import torch
@@ -90,19 +78,6 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
-
-# Whether the *installed* upstream ``Scheduler.schedule`` accepts the
-# ``throttle_prefills`` argument. vllm-ascend CI runs against TWO vllm
-# versions at once: the release tag v0.23.0 (``schedule(self)``, engine calls
-# ``schedule()``) and the main-verified commit 1f486d96 (``schedule(self,
-# throttle_prefills=False)``, engine calls ``schedule(throttle_prefills)``).
-# The override signature carries ``throttle_prefills`` (with a default) so it
-# is callable by BOTH engines; on the disabled path it must then forward the
-# arg only when the installed super() actually accepts it. Introspecting the
-# signature once at import (rather than parsing a version string) is robust to
-# both lanes -- including dev checkouts whose ``__version__`` is not a clean
-# PEP 440 release (which would make a ``vllm_version_is`` check raise).
-_SUPER_SCHEDULE_HAS_THROTTLE = "throttle_prefills" in inspect.signature(Scheduler.schedule).parameters
 
 
 def _balance_scheduling_enabled(vllm_config) -> bool:
@@ -175,12 +150,7 @@ class BalanceScheduler(Scheduler):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         if not self._balance_enabled:
-            # Forward throttle_prefills only when the installed super() accepts
-            # it (main-verified); v0.23.0's super() does not. See
-            # _SUPER_SCHEDULE_HAS_THROTTLE for why this is signature-based.
-            if _SUPER_SCHEDULE_HAS_THROTTLE:
-                return super().schedule(throttle_prefills)
-            return super().schedule()
+            return super().schedule(throttle_prefills)
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.

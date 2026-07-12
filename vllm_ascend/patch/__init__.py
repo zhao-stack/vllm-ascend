@@ -144,25 +144,6 @@
 #       Drop the alias once upstream registry includes it or the checkpoint
 #       standardizes architecture strings.
 #
-# ** 7. File: platform/patch_minimax_usage_accounting.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat`
-#      `vllm.reasoning.minimax_m2_reasoning_parser`
-#    Why:
-#       MiniMax-M2 chat usage accounting needs to report
-#       `completion_tokens_details.reasoning_tokens` for both streaming and
-#       non-streaming chat completions without slowing other reasoning models.
-#    How：
-#       Monkey-patch MiniMax reasoning token counters and bind usage-accounting
-#       wrappers only on MiniMax chat-serving instances.
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/pull/45701
-#       https://github.com/vllm-project/vllm/pull/45802
-#    Future Plan:
-#       Remove this patch after both upstream vLLM PRs are merged and the
-#       supported vLLM revision used by vLLM Ascend includes them through the
-#       regular main-to-main sync.
-#
 # ** 7a. File: platform/patch_glm_tool_call_streaming.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.entrypoints.openai.chat_completion.serving.OpenAIServingChat`
@@ -182,24 +163,6 @@
 #    Future Plan:
 #       Remove this patch once the supported vLLM version contains the upstream
 #       GLM tool-call final chunk fixes.
-#
-# ** 7b. File: platform/patch_glm47_tool_call_parser.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.tool_parsers.glm47_moe_tool_parser.Glm47MoeModelToolParser`
-#    Why:
-#       vLLM's GLM47 streaming parser can drop complete inline zero-argument
-#       tool calls such as `<tool_call>get_current_time</tool_call>`, while
-#       non-streaming parses the same output correctly.
-#    How：
-#       Monkey-patch GLM47 tool-call region extraction so complete inline
-#       zero-argument regions are normalized for the existing streaming name
-#       extractor without emitting partial names for incomplete regions.
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/issues/44326
-#       https://github.com/vllm-project/vllm/pull/44327
-#    Future Plan:
-#       Remove this patch once the supported vLLM version contains the upstream
-#       GLM47 inline zero-argument streaming parser fix.
 #
 # ** 10a. File: platform/patch_kv_cache_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -362,7 +325,7 @@
 #   1. `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionResponse`
 #      `vllm.entrypoints.openai.chat_completion.protocol.ChatCompletionStreamResponse`
 #    Why:
-#       vLLM v0.23.0 can serialize empty `tool_calls: []` fields for content-only
+#       Some vLLM refs can serialize empty `tool_calls: []` fields for content-only
 #       OpenAI chat responses / streaming deltas, while OpenAI-compatible SDKs
 #       expect those empty fields to be omitted so clients see `tool_calls=None`.
 #    How：
@@ -372,40 +335,6 @@
 #       https://github.com/vllm-project/vllm/pull/44105
 #    Future Plan:
 #       Remove this patch once the supported vLLM version contains PR #44105.
-#
-# ** 12. File: platform/patch_deepseek_v4_tool_call_parser.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser`
-#    Why:
-#       Upstream vLLM now includes DeepSeek V4 tokenizer/renderer/reasoning
-#       registration, but its streaming tool-call delta parsing does not guarantee
-#       incremental `arguments` emission for long argument payloads.
-#    How:
-#       Monkey-patch `DeepSeekV4ToolParser` stream parsing to emit tool-call
-#       metadata in the first delta and stream argument fragments incrementally.
-#    Related PR (if no, explain why):
-#       Upstream vLLM main behavior as of current runtime.
-#    Future Plan:
-#       Remove this patch if upstream streaming behavior is updated to satisfy the
-#       same DeepSeek DSML incrementality contract.
-#
-# ** 12a. File: platform/patch_minimax_m2_tool_call_parser.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.tool_parsers.minimax_m2_tool_parser.MinimaxM2ToolParser`
-#    Why:
-#       vLLM 0.21.0 only emits MiniMax-M2 tool-call arguments after a complete
-#       `<invoke>...</invoke>` block, so long arguments are buffered instead of
-#       streamed incrementally.
-#    How:
-#       Monkey-patch the MiniMax-M2 parser to emit the tool name once the
-#       `<invoke name=...>` header is available and then stream partial
-#       `<parameter>` values as JSON argument fragments.
-#    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/pull/40253
-#       https://github.com/vllm-project/vllm/pull/40298
-#    Future Plan:
-#       Remove this patch once the supported vLLM version contains the upstream
-#       MiniMax-M2 incremental tool-call streaming fix.
 #
 # ** 12b. File: platform/patch_structured_output.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -428,25 +357,6 @@
 #       Remove this patch once upstream vLLM either enforces backend consistency
 #       before grammar compilation or safely handles mixed-backend grammar
 #       failures without killing the engine.
-#
-# ** 13. File: platform/patch_camem_allocator.py**
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.config.model.is_cumem_allocator_available`
-#    Why:
-#       Upstream vLLM main enables and validates the CUDA/ROCm CuMem allocator
-#       when `enable_sleep_mode=True`. Ascend implements sleep mode with its own
-#       CaMem allocator, so the upstream CuMem-only availability check fails
-#       during `ModelConfig` validation before Ascend worker code can run.
-#    How:
-#       Treat Ascend's platform sleep allocator as satisfying the allocator
-#       availability check, while preserving the original vLLM CuMem check as
-#       fallback.
-#    Related PR (if no, explain why):
-#       No, this maps an upstream CUDA/ROCm allocator validation to Ascend's
-#       backend-specific CaMem implementation.
-#    Future Plan:
-#       Remove this patch if upstream exposes a platform allocator capability hook
-#       for sleep mode validation.
 #
 # ** 15. File: platform/patch_weight_transfer_engine.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

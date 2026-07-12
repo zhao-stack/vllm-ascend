@@ -607,7 +607,13 @@ def setup_ascend_local_comm_res(local_rank: int, kv_transfer_config: Any | None)
 
 
 @functools.cache
-def vllm_version_is(target_vllm_version: str):
+def vllm_version_is(target_vllm_version: str) -> bool:
+    """Return whether vLLM matches a target, ignoring only PEP 440 local metadata.
+
+    Pre-release, development, and post-release segments remain significant, so
+    source builds of a release such as ``0.24.0+empty`` match ``0.24.0`` while
+    ``0.24.0.dev1`` and ``0.24.0rc1`` do not.
+    """
     if envs_ascend.VLLM_VERSION is not None:
         vllm_version = envs_ascend.VLLM_VERSION
     else:
@@ -762,10 +768,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
         "GatedDeltaNetAttention": AscendGatedDeltaNetAttention,
         "BailingMoELinearAttention": AscendBailingMoELinearAttention,
     }
-    if vllm_version_is("0.23.0"):
-        from vllm_ascend.ops.fused_moe.fused_moe import AscendFusedMoE
-
-        REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE
 
     if vllm_config is None:
         try:
@@ -811,10 +813,6 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
                 "MRotaryEmbedding": AscendMRotaryEmbedding310,
             }
         )
-        if vllm_version_is("0.23.0"):
-            from vllm_ascend._310p.fused_moe.fused_moe import AscendFusedMoE310
-
-            REGISTERED_ASCEND_OPS["FusedMoE"] = AscendFusedMoE310
 
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)

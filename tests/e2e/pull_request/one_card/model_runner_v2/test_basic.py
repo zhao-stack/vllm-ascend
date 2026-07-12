@@ -35,11 +35,6 @@ DFLASH_MODELS = ["z-lab/Qwen3-8B-DFlash-b16"]
 DSPARK_MAIN_MODEL = ["Qwen/Qwen3-8B"]
 DSPARK_MODELS = ["deepseek-ai/dspark_qwen3_8b_block7"]
 
-pytestmark = pytest.mark.skipif(
-    vllm_version_is("0.23.0"),
-    reason="v2 model runner patches not supported on v0.23.0",
-)
-
 
 @pytest.mark.skipif(True, reason="Fix me, it's broken after CANN and trition-ascend are upgraded.")
 @pytest.mark.parametrize("model", MODELS)
