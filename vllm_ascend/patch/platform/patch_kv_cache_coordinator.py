@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM projectx
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from inspect import Parameter, signature
 from math import lcm
 
 import vllm
@@ -31,11 +32,15 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
-from vllm_ascend.utils import vllm_version_is
 
 USE_MULTI_GROUPS_KV_CACHE = True
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
+
+
+def _accepts_keyword(callable_obj: Callable[..., object], keyword: str) -> bool:
+    parameters = signature(callable_obj).parameters
+    return keyword in parameters or any(param.kind is Parameter.VAR_KEYWORD for param in parameters.values())
 
 
 def _select_kv_token_budget(
@@ -43,7 +48,7 @@ def _select_kv_token_budget(
     max_in_flight_tokens: int | None,
     max_num_batched_tokens: int | None,
 ) -> int:
-    token_budget = max_num_batched_tokens if vllm_version_is("0.23.0") else max_in_flight_tokens
+    token_budget = max_in_flight_tokens if max_in_flight_tokens is not None else max_num_batched_tokens
     return token_budget if token_budget is not None else max_model_len
 
 
@@ -130,9 +135,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
-        extra_mgr_kwargs: dict = {"scheduler_block_size": scheduler_block_size}
-        if not vllm_version_is("0.23.0"):
-            extra_mgr_kwargs["needs_kv_cache_zeroing"] = kv_cache_config.needs_kv_cache_zeroing
+        extra_mgr_kwargs: dict = {
+            "scheduler_block_size": scheduler_block_size,
+            "needs_kv_cache_zeroing": kv_cache_config.needs_kv_cache_zeroing,
+        }
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
@@ -510,10 +516,10 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
         )
-        if vllm_version_is("0.23.0"):
-            orig_kwargs["max_num_batched_tokens"] = token_budget
-        else:
+        if _accepts_keyword(_orig_get_kv_cache_coordinator, "max_in_flight_tokens"):
             orig_kwargs["max_in_flight_tokens"] = token_budget
+        else:
+            orig_kwargs["max_num_batched_tokens"] = token_budget
         orig_kwargs["scheduler_block_size"] = scheduler_block_size
         return _orig_get_kv_cache_coordinator(**orig_kwargs)
 
