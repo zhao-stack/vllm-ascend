@@ -451,6 +451,7 @@ class TestAscendUnquantizedFusedMoEMethod:
         topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
         zero_hidden = torch.full_like(hidden_states, 3.0)
         routed_hidden = torch.full_like(hidden_states, 5.0)
+        expected_hidden = routed_hidden.clone() + zero_hidden
         moe_comm_method = MagicMock()
         moe_comm_method.fused_experts.return_value = routed_hidden
         zero_experts = MagicMock(return_value=(topk_ids, topk_weights, zero_hidden))
@@ -495,7 +496,7 @@ class TestAscendUnquantizedFusedMoEMethod:
             enable_force_load_balance=True,
         )
 
-        torch.testing.assert_close(result, routed_hidden + zero_hidden)
+        torch.testing.assert_close(result, expected_hidden)
         zero_experts.assert_called_once()
         fused_input = moe_comm_method.fused_experts.call_args.kwargs["fused_experts_input"]
         assert fused_input.dynamic_eplb
