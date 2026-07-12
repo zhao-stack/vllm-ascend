@@ -81,8 +81,7 @@ class _HunYuanVLProcessorCompat(HunYuanVLProcessor):
 def _uses_legacy_bundled_processors() -> bool:
     """Return whether this vLLM ref still ships its HunyuanVL processors."""
     bundled_modules = {
-        module_name: find_spec(module_name) is not None
-        for module_name in _STALE_PROCESSOR_MODULES.values()
+        module_name: find_spec(module_name) is not None for module_name in _STALE_PROCESSOR_MODULES.values()
     }
     if len(set(bundled_modules.values())) != 1:
         raise RuntimeError(f"Inconsistent bundled HunyuanVL processor modules: {bundled_modules!r}")

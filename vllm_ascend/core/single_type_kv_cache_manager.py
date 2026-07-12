@@ -292,9 +292,7 @@ def get_manager_for_kv_cache_spec(
             admission_kwargs = {"max_model_len": max_model_len}
             admission_parameters = signature(kv_cache_spec.max_admission_blocks_per_request).parameters
             token_budget_key = (
-                "max_in_flight_tokens"
-                if "max_in_flight_tokens" in admission_parameters
-                else "max_num_batched_tokens"
+                "max_in_flight_tokens" if "max_in_flight_tokens" in admission_parameters else "max_num_batched_tokens"
             )
             admission_kwargs[token_budget_key] = token_budget
             kwargs["max_admission_blocks_per_request"] = kv_cache_spec.max_admission_blocks_per_request(
