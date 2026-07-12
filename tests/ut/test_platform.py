@@ -38,6 +38,7 @@ class TestNPUPlatform(TestBase):
         mock_vllm_config.scheduler_config = MagicMock()
         mock_vllm_config.scheduler_config.max_num_seqs = None
         mock_vllm_config.scheduler_config.policy = "fcfs"
+        mock_vllm_config.scheduler_config.async_scheduling = False
         mock_vllm_config.speculative_config = None
         mock_vllm_config.additional_config = {}
         mock_vllm_config.compilation_config.pass_config.enable_sp = False
@@ -59,6 +60,7 @@ class TestNPUPlatform(TestBase):
         mock_ascend_config.SLO_limits_for_dynamic_batch = -1
         mock_ascend_config.enable_shared_expert_dp = False
         mock_ascend_config.short_request_first_config.enabled = False
+        mock_ascend_config.eplb_config.dynamic_eplb = False
         mock_ascend_config.update_compile_ranges_split_points = MagicMock()
         return mock_ascend_config
 
@@ -226,6 +228,37 @@ class TestNPUPlatform(TestBase):
 
     def test_get_device_capability(self):
         self.assertIsNone(self.platform.get_device_capability(device_id=0))
+
+    @pytest.mark.parametrize(
+        ("dynamic_eplb", "async_scheduling", "expected_async_scheduling", "expected_warning"),
+        [
+            (True, True, False, True),
+            (True, False, False, False),
+            (False, True, True, False),
+        ],
+    )
+    def test_disable_async_scheduling_for_dynamic_eplb(
+        self,
+        dynamic_eplb,
+        async_scheduling,
+        expected_async_scheduling,
+        expected_warning,
+    ):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.scheduler_config.async_scheduling = async_scheduling
+        vllm_config.parallel_config.disable_nccl_for_dp_synchronization = async_scheduling
+        ascend_config = self.mock_vllm_ascend_config()
+        ascend_config.eplb_config.dynamic_eplb = dynamic_eplb
+
+        with patch("vllm_ascend.platform.logger.warning_once") as mock_warning:
+            self.platform._disable_async_scheduling_for_dynamic_eplb(vllm_config, ascend_config)
+
+        self.assertEqual(vllm_config.scheduler_config.async_scheduling, expected_async_scheduling)
+        self.assertEqual(
+            vllm_config.parallel_config.disable_nccl_for_dp_synchronization,
+            expected_async_scheduling,
+        )
+        self.assertEqual(mock_warning.called, expected_warning)
 
     @patch("torch.npu.get_device_name")
     def test_get_device_name(self, mock_get_device_name):

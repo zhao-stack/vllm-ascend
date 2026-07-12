@@ -444,6 +444,7 @@ class NPUPlatform(Platform):
         cls._fix_incompatible_config(vllm_config)
 
         ascend_config = init_ascend_config(vllm_config)
+        cls._disable_async_scheduling_for_dynamic_eplb(vllm_config, ascend_config)
 
         from vllm_ascend.logger import configure_ascend_file_logging
         from vllm_ascend.logger import configure_ascend_logging
@@ -1045,6 +1046,22 @@ class NPUPlatform(Platform):
             "padded_num_tokens": padded_num_tokens,
             "sinks": sinks,
         }
+
+    @staticmethod
+    def _disable_async_scheduling_for_dynamic_eplb(vllm_config: VllmConfig, ascend_config) -> None:
+        """Keep dynamic EPLB collectives synchronized across ranks."""
+        if not ascend_config.eplb_config.dynamic_eplb:
+            return
+
+        scheduler_config = vllm_config.scheduler_config
+        if scheduler_config.async_scheduling:
+            logger.warning_once(
+                "Dynamic EPLB does not support asynchronous scheduling because "
+                "its periodic collectives must run synchronously across ranks. "
+                "Disabling asynchronous scheduling."
+            )
+            scheduler_config.async_scheduling = False
+            vllm_config.parallel_config.disable_nccl_for_dp_synchronization = False
 
     @staticmethod
     def _fix_incompatible_config(vllm_config: VllmConfig) -> None:
