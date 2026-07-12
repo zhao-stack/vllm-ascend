@@ -46,7 +46,7 @@ on:
         type: boolean
         required: false
         default: false
-        description: 'Continue running the job even if tests fail'
+        description: 'Continue all selected test targets after failures, then fail the job at the end'
       enable-coverage:
         type: boolean
         required: false
@@ -252,7 +252,6 @@ jobs:
 
       - name: Run selected tests with device
         if: ${{ matrix.group.npu_type != 'cpu' }}
-        continue-on-error: ${{ inputs.continue_on_error }}
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           ENABLE_COVERAGE: ${{ inputs.enable-coverage}}
@@ -265,16 +264,20 @@ jobs:
           if [ "${{ inputs.upload_timing }}" = "true" ]; then
             TIMING_FLAG="--timing"
           fi
+          CONTINUE_FLAG=""
+          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
+            CONTINUE_FLAG="--continue-on-error"
+          fi
           .github/workflows/scripts/run_selected_tests.sh \
             "${{ matrix.group.npu_type }}" \
             "${{ matrix.group.num_npus }}" \
             "with-device" \
             ${TIMING_FLAG} \
+            ${CONTINUE_FLAG} \
             ${{ matrix.group.tests }}
 
       - name: Run selected tests without device
         if: ${{ matrix.group.npu_type == 'cpu' }}
-        continue-on-error: ${{ inputs.continue_on_error }}
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           TORCH_DEVICE_BACKEND_AUTOLOAD: 0
@@ -283,10 +286,15 @@ jobs:
           if [ "${{ inputs.enable-coverage }}" = "true" ]; then
             export ENABLE_COVERAGE=true
           fi
+          CONTINUE_FLAG=""
+          if [ "${{ inputs.continue_on_error }}" = "true" ]; then
+            CONTINUE_FLAG="--continue-on-error"
+          fi
           .github/workflows/scripts/run_selected_tests.sh \
             "${{ matrix.group.npu_type }}" \
             "${{ matrix.group.num_npus }}" \
             "without-device" \
+            ${CONTINUE_FLAG} \
             ${{ matrix.group.tests }}
 
       - name: Upload timing data
