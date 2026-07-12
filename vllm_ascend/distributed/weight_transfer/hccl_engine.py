@@ -4,6 +4,7 @@
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from inspect import signature
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -25,7 +26,8 @@ from vllm_ascend.distributed.weight_transfer.packed_tensor import (
     DEFAULT_PACKED_NUM_BUFFERS,
     packed_broadcast_consumer,
 )
-from vllm_ascend.utils import vllm_version_is
+
+_WEIGHT_TRANSFER_ENGINE_USES_VLLM_CONFIG = "vllm_config" in signature(WeightTransferEngine.__init__).parameters
 
 
 @dataclass
@@ -116,7 +118,7 @@ class HCCLWeightTransferEngine(WeightTransferEngine[HCCLWeightTransferInitInfo, 
     init_info_cls = HCCLWeightTransferInitInfo
     update_info_cls = HCCLWeightTransferUpdateInfo
 
-    if vllm_version_is("0.23.0"):
+    if not _WEIGHT_TRANSFER_ENGINE_USES_VLLM_CONFIG:
 
         def __init__(
             self,
@@ -139,7 +141,7 @@ class HCCLWeightTransferEngine(WeightTransferEngine[HCCLWeightTransferInitInfo, 
             super().__init__(config, vllm_config, device, model)
             self.model_update_group: PyHcclCommunicator | None = None  # type: ignore[no-redef]
 
-    if not vllm_version_is("0.23.0"):
+    if _WEIGHT_TRANSFER_ENGINE_USES_VLLM_CONFIG:
 
         def start_weight_update(self) -> None:
             from vllm.model_executor.model_loader.reload import (

@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+from inspect import signature
 from types import NoneType
 from typing import Any
 
@@ -698,7 +699,8 @@ class NPUWorker(WorkerBase):
                 WeightTransferEngineFactory,
             )
 
-            if vllm_version_is("0.23.0"):
+            create_engine = WeightTransferEngineFactory.create_engine
+            if "device" not in signature(create_engine).parameters:
                 self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                     self.vllm_config.weight_transfer_config,
                     self.vllm_config.parallel_config,
