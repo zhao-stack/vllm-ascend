@@ -18,6 +18,7 @@
 
 import json
 
+import pytest  # noqa: F401  # Used by coverage markers added on current main.
 import requests
 from vllm.utils.network_utils import get_open_port
 
