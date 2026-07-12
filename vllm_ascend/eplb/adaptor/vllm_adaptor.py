@@ -134,9 +134,10 @@ class VllmEplbAdaptor:
             expert_weight_names = EPLB_EXPERT_WEIGHT_NAMES[expert_weight_key]
             self.expert_weight_key_per_layer[local_idx] = expert_weight_key
             self.expert_param_per_layer[local_idx] = list()
+            routed_experts = layer.routed_experts
             for name in expert_weight_names:
                 param_key = f"{local_idx}.{name}"
-                self.param_dict[param_key] = getattr(layer, name)
+                self.param_dict[param_key] = getattr(routed_experts, name)
             for local_expert_id in range(self.num_local_experts):
                 per_expert_param = list()
                 for name in expert_weight_names:

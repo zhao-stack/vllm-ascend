@@ -8,7 +8,11 @@ from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig, FusedMoEParallelConfig
 
 from vllm_ascend.ascend_config import init_ascend_config
-from vllm_ascend.eplb.core.eplb_utils import generate_log2phy_map, init_eplb_config
+from vllm_ascend.eplb.core.eplb_utils import (
+    generate_log2phy_map,
+    get_expert_map_num_physical_experts,
+    init_eplb_config,
+)
 # isort: on
 
 
@@ -52,17 +56,42 @@ class TestAscendConfig(unittest.TestCase):
         os.environ.pop("DYNAMIC_EPLB", None)
 
     def test_init_eplb_config_with_eplb(self):
+        # vLLM allocates physical experts before constructing the Ascend runner.
+        self.moe_config.num_experts = 10
         eplb_config = init_ascend_config(self.vllm_config).eplb_config
-        _, expert_map, log2phy, redundant_experts = init_eplb_config(eplb_config, 0, self.moe_config)
+        global_expert_map, expert_map, log2phy, redundant_experts = init_eplb_config(eplb_config, 0, self.moe_config)
         gt_expert_map = torch.tensor([4, -1, -1, -1, 0, 1, 2, 3])
         gt_log2phy = torch.tensor([9, 1, 2, 3, 5, 6, 7, 8])
+        self.assertEqual(global_expert_map.shape, (2, 8))
         self.assertTrue(torch.equal(expert_map, gt_expert_map))
         self.assertTrue(torch.equal(log2phy, gt_log2phy))
         self.assertEqual(redundant_experts, 2)
 
+    def test_init_eplb_config_with_mix_placement_only(self):
+        self.vllm_config.additional_config = {"refresh": True, "mix_placement": True}
+        self.moe_config.num_experts = 10
+        self.moe_config.num_logical_experts = 9
+        eplb_config = init_ascend_config(self.vllm_config).eplb_config
+
+        global_expert_map, expert_map, log2phy, redundant_experts = init_eplb_config(
+            eplb_config,
+            0,
+            self.moe_config,
+            mix_placement=True,
+            num_shared_experts=1,
+        )
+
+        self.assertEqual(global_expert_map.shape, (2, 9))
+        self.assertEqual(torch.count_nonzero(expert_map != -1).item(), 5)
+        self.assertEqual(self.moe_config.num_logical_experts + redundant_experts, 10)
+        self.assertIsNotNone(log2phy)
+        self.assertEqual(redundant_experts, 1)
+
     def test_init_eplb_config_with_eplb_withmap(self):
         _TEST_DIR = os.path.dirname(__file__)
-        self.vllm_config.additional_config["eplb_config"]["expert_map_path"] = _TEST_DIR + "/expert_map.json"
+        expert_map_path = _TEST_DIR + "/expert_map.json"
+        self.vllm_config.additional_config["eplb_config"]["expert_map_path"] = expert_map_path
+        self.vllm_config.model_config.get_num_experts.return_value = 8
         eplb_config = init_ascend_config(self.vllm_config).eplb_config
         _, expert_map, log2phy, redundant_experts = init_eplb_config(eplb_config, 0, self.moe_config)
         gt_expert_map = torch.tensor([-1, 1, 4, -1, 2, -1, 0, 3])
@@ -70,6 +99,7 @@ class TestAscendConfig(unittest.TestCase):
         self.assertTrue(torch.equal(expert_map, gt_expert_map))
         self.assertTrue(torch.equal(log2phy, gt_log2phy))
         self.assertEqual(redundant_experts, 2)
+        self.assertEqual(get_expert_map_num_physical_experts(expert_map_path), 10)
 
     def test_generate_log2phy_map_rotates_tail_tp_rank_with_tp_size(self):
         global_expert_map = [

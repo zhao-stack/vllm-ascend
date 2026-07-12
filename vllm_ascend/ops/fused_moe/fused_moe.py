@@ -278,6 +278,22 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         return final_hidden_states
 
 
+def _configure_eplb_expert_map(moe_config, routed_experts, expert_map, num_redundant_experts):
+    """Keep vLLM weight allocation and Ascend logical mappings consistent."""
+    global_num_experts = moe_config.num_logical_experts + num_redundant_experts
+    local_num_experts = global_num_experts // moe_config.ep_size
+    moe_config.num_experts = global_num_experts
+    moe_config.num_local_experts = local_num_experts
+
+    expert_map_manager = routed_experts.expert_map_manager
+    expert_map_manager.global_num_experts = global_num_experts
+    expert_map_manager._local_num_experts = local_num_experts
+    expert_map_manager._expert_map = expert_map
+    routed_experts.global_num_experts = global_num_experts
+    routed_experts.update_expert_map_info()
+    return local_num_experts, global_num_experts
+
+
 class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     moe_counter = -1
     gate_stream: torch.npu.Stream | None = None
@@ -385,7 +401,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         eplb_config = ascend_config.eplb_config
 
         if mix_placement:
-            moe_config.num_experts += n_shared_experts
+            moe_config.num_logical_experts += n_shared_experts
 
         (
             self.global_expert_map,
@@ -402,10 +418,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         )
 
         moe_config.global_redundant_expert_num = self.global_redundant_expert_num
-        local_num_experts = (moe_config.num_experts + self.global_redundant_expert_num) // moe_config.ep_size
-        moe_config.num_local_experts = local_num_experts
-        routed_experts.expert_map_manager._local_num_experts = local_num_experts
-        routed_experts.expert_map_manager._expert_map = self._expert_map
+        local_num_experts, global_num_experts = _configure_eplb_expert_map(
+            moe_config,
+            routed_experts,
+            self._expert_map,
+            self.global_redundant_expert_num,
+        )
+        self.local_num_experts = local_num_experts
+        self.global_num_experts = global_num_experts
+        self.ep_rank = moe_config.ep_rank
+        self.ep_size = moe_config.ep_size
 
         self.dynamic_eplb = eplb_config.dynamic_eplb and (self.log2phy is not None)
         self.multi_stage = False
@@ -492,6 +514,23 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             quant_type = getattr(method, "quant_type", QuantType.NONE)
 
         return quant_type
+
+    def update_expert_map(self, new_expert_map: torch.Tensor | None = None):
+        if new_expert_map is None:
+            new_expert_map = self._expert_map
+
+        self._expert_map = new_expert_map
+        self.routed_experts.expert_map_manager._expert_map = new_expert_map
+        self.routed_experts.update_expert_map_info()
+
+    def get_log2phy_map(self):
+        return self.log2phy
+
+    def clear_moe_load(self):
+        if self.moe_load is not None:
+            self.moe_load.zero_()
+        if self.multi_stage:
+            self.load_counter.zero_()
 
     @property
     def is_internal_router(self) -> bool:

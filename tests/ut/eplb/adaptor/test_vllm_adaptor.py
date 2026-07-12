@@ -9,6 +9,12 @@ from vllm_ascend.quantization.quant_type import QuantType
 
 
 class TestVllmAdaptor(unittest.TestCase):
+    @staticmethod
+    def _attach_routed_expert_weights(layer, names):
+        layer.routed_experts = MagicMock()
+        for name in names:
+            setattr(layer.routed_experts, name, getattr(layer, name))
+
     def setUp(self):
         VllmEplbAdaptor._registered_moe_layers = []
 
@@ -23,6 +29,17 @@ class TestVllmAdaptor(unittest.TestCase):
         self.mock_layer.w2_weight_scale_list = [torch.tensor([1.0]) for _ in range(n_routed_experts)]
         self.mock_layer.w13_weight = torch.randn(n_routed_experts, 256, 128)
         self.mock_layer.w2_weight = torch.randn(n_routed_experts, 128, 256)
+        self._attach_routed_expert_weights(
+            self.mock_layer,
+            (
+                "w13_weight_list",
+                "w2_weight_list",
+                "w13_weight_scale_fp32_list",
+                "w2_weight_scale_list",
+                "w13_weight",
+                "w2_weight",
+            ),
+        )
         self.mock_layer.moe_load = torch.randn(n_routed_experts)
         self.mock_layer.global_expert_map = torch.arange(n_routed_experts * 4).reshape(n_routed_experts, 4)
         self.mock_layer.get_log2phy_map.return_value = torch.arange(4)
@@ -50,8 +67,8 @@ class TestVllmAdaptor(unittest.TestCase):
         self.model.quant_config = None
         adaptor = VllmEplbAdaptor(self.model)
         self.assertEqual(adaptor.expert_weight_key_per_layer[0], (QuantType.NONE, True))
-        self.assertIs(adaptor.expert_param_per_layer[0][0][0], self.mock_layer.w13_weight_list[0])
-        self.assertIs(adaptor.expert_param_per_layer[0][0][1], self.mock_layer.w2_weight_list[0])
+        self.assertIs(adaptor.expert_param_per_layer[0][0][0], self.mock_layer.routed_experts.w13_weight_list[0])
+        self.assertIs(adaptor.expert_param_per_layer[0][0][1], self.mock_layer.routed_experts.w2_weight_list[0])
 
     @patch("torch.empty_like", return_value=torch.zeros(16, 32))
     @patch("vllm_ascend.eplb.adaptor.vllm_adaptor.get_ascend_config")
@@ -83,6 +100,10 @@ class TestVllmAdaptor(unittest.TestCase):
         layer.w2_weight_list = [torch.randn(128, 256) for _ in range(4)]
         layer.w13_weight_scale_fp32_list = [torch.tensor([1.0]) for _ in range(4)]
         layer.w2_weight_scale_list = [torch.tensor([1.0]) for _ in range(4)]
+        self._attach_routed_expert_weights(
+            layer,
+            ("w13_weight_list", "w2_weight_list", "w13_weight_scale_fp32_list", "w2_weight_scale_list"),
+        )
         layer.moe_load = torch.randn(4)
         layer.global_expert_map = torch.arange(16).reshape(4, 4)
         layer.get_log2phy_map.return_value = torch.arange(4)
@@ -120,6 +141,17 @@ class TestVllmAdaptor(unittest.TestCase):
         w8a8_layer.w2_weight_scale_list = [torch.randn(1) for _ in range(num_local_experts)]
         w8a8_layer.fused_w1_scale_list = [torch.randn(1) for _ in range(num_local_experts)]
         w8a8_layer.fused_w2_scale_list = [torch.randn(1) for _ in range(num_local_experts)]
+        self._attach_routed_expert_weights(
+            w8a8_layer,
+            (
+                "w13_weight_list",
+                "w2_weight_list",
+                "w13_weight_scale_fp32_list",
+                "w2_weight_scale_list",
+                "fused_w1_scale_list",
+                "fused_w2_scale_list",
+            ),
+        )
         w8a8_layer.moe_load = torch.zeros(num_local_experts)
         w8a8_layer.global_expert_map = torch.arange(num_local_experts * 4).reshape(num_local_experts, 4)
         w8a8_layer.get_log2phy_map.return_value = torch.arange(4)
@@ -132,6 +164,10 @@ class TestVllmAdaptor(unittest.TestCase):
         mxfp8_layer.w2_weight = torch.randn(num_local_experts, 2, 2)
         mxfp8_layer.w13_weight_scale = torch.randn(num_local_experts, 1)
         mxfp8_layer.w2_weight_scale = torch.randn(num_local_experts, 1)
+        self._attach_routed_expert_weights(
+            mxfp8_layer,
+            ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+        )
         mxfp8_layer.moe_load = torch.zeros(num_local_experts)
         mxfp8_layer.global_expert_map = torch.arange(num_local_experts * 4).reshape(num_local_experts, 4)
         mxfp8_layer.get_log2phy_map.return_value = torch.arange(4)
@@ -171,6 +207,10 @@ class TestVllmAdaptor(unittest.TestCase):
             layer.w2_weight_list = [torch.randn(2, 2) for _ in range(num_local_experts)]
             layer.w13_weight_scale_fp32_list = [torch.randn(1) for _ in range(num_local_experts)]
             layer.w2_weight_scale_list = [torch.randn(1) for _ in range(num_local_experts)]
+            self._attach_routed_expert_weights(
+                layer,
+                ("w13_weight_list", "w2_weight_list", "w13_weight_scale_fp32_list", "w2_weight_scale_list"),
+            )
             layer.moe_load = torch.zeros(num_local_experts)
             layer.global_expert_map = torch.arange(num_local_experts * 4).reshape(num_local_experts, 4)
             layer.get_log2phy_map.return_value = torch.arange(4)

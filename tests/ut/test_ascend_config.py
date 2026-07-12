@@ -16,13 +16,14 @@
 import json
 import os
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import (
     ShortRequestFirstConfig,
+    _sync_ascend_eplb_config_to_vllm,
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
@@ -57,6 +58,80 @@ class TestAscendConfig(TestBase):
             model_arch_config=SimpleNamespace(total_num_attention_heads=total_num_attention_heads),
             get_total_num_kv_heads=lambda: total_num_kv_heads,
         )
+
+    def test_sync_ascend_eplb_config_before_model_construction(self):
+        vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                enable_eplb=False,
+                eplb_config=SimpleNamespace(num_redundant_experts=0),
+            )
+        )
+        ascend_config = SimpleNamespace(
+            mix_placement=False,
+            eplb_config=SimpleNamespace(
+                dynamic_eplb=True,
+                expert_map_path=None,
+                num_redundant_experts=2,
+            ),
+        )
+
+        _sync_ascend_eplb_config_to_vllm(vllm_config, ascend_config)
+
+        self.assertTrue(vllm_config.parallel_config.enable_eplb)
+        self.assertEqual(vllm_config.parallel_config.eplb_config.num_redundant_experts, 2)
+
+    @patch(
+        "vllm_ascend.eplb.core.eplb_utils.get_expert_map_num_physical_experts",
+        return_value=10,
+    )
+    def test_sync_static_expert_map_redundancy_before_model_construction(self, mock_physical_count):
+        model_config = SimpleNamespace(get_num_experts=MagicMock(return_value=8))
+        vllm_config = SimpleNamespace(
+            model_config=model_config,
+            parallel_config=SimpleNamespace(
+                enable_eplb=False,
+                eplb_config=SimpleNamespace(num_redundant_experts=0),
+            ),
+        )
+        eplb_config = SimpleNamespace(
+            dynamic_eplb=False,
+            expert_map_path="expert-map.json",
+            num_redundant_experts=0,
+            config={"num_redundant_experts": 0},
+        )
+        ascend_config = SimpleNamespace(mix_placement=False, eplb_config=eplb_config)
+
+        _sync_ascend_eplb_config_to_vllm(vllm_config, ascend_config)
+
+        mock_physical_count.assert_called_once_with("expert-map.json")
+        self.assertEqual(eplb_config.config["num_redundant_experts"], 2)
+        self.assertTrue(vllm_config.parallel_config.enable_eplb)
+        self.assertEqual(vllm_config.parallel_config.eplb_config.num_redundant_experts, 2)
+
+    @patch(
+        "vllm_ascend.eplb.core.eplb_utils.get_expert_map_num_physical_experts",
+        return_value=10,
+    )
+    def test_sync_static_expert_map_rejects_mismatched_redundancy(self, mock_physical_count):
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(get_num_experts=MagicMock(return_value=8)),
+            parallel_config=SimpleNamespace(
+                enable_eplb=False,
+                eplb_config=SimpleNamespace(num_redundant_experts=3),
+            ),
+        )
+        eplb_config = SimpleNamespace(
+            dynamic_eplb=False,
+            expert_map_path="expert-map.json",
+            num_redundant_experts=3,
+            config={"num_redundant_experts": 3},
+        )
+        ascend_config = SimpleNamespace(mix_placement=False, eplb_config=eplb_config)
+
+        with self.assertRaisesRegex(ValueError, "does not match the expert map"):
+            _sync_ascend_eplb_config_to_vllm(vllm_config, ascend_config)
+
+        mock_physical_count.assert_called_once_with("expert-map.json")
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

@@ -901,6 +901,56 @@ def _is_ascend_config_initialized(config: AscendConfig | None) -> bool:
     return hasattr(config, "ascend_compilation_config") and hasattr(config, "eplb_config")
 
 
+def _sync_ascend_eplb_config_to_vllm(vllm_config, ascend_config: AscendConfig) -> None:
+    """Expose Ascend EPLB allocation requirements before model construction."""
+    eplb_config = ascend_config.eplb_config
+    num_redundant_experts = int(eplb_config.num_redundant_experts)
+    if eplb_config.expert_map_path is not None:
+        from vllm_ascend.eplb.core.eplb_utils import get_expert_map_num_physical_experts
+
+        model_config = vllm_config.model_config
+        if model_config is None:
+            raise ValueError("A model config is required to infer EPLB redundancy from an expert map.")
+        num_logical_experts = model_config.get_num_experts()
+        if num_logical_experts is None or num_logical_experts <= 0:
+            raise ValueError("The model must expose a positive expert count to use an EPLB expert map.")
+        num_physical_experts = get_expert_map_num_physical_experts(eplb_config.expert_map_path)
+        inferred_redundant_experts = num_physical_experts - num_logical_experts
+        if inferred_redundant_experts < 0:
+            raise ValueError(
+                "The EPLB expert map contains fewer physical experts "
+                f"({num_physical_experts}) than the model's logical expert count ({num_logical_experts})."
+            )
+        if num_redundant_experts not in (0, inferred_redundant_experts):
+            raise ValueError(
+                "The configured EPLB redundant expert count "
+                f"({num_redundant_experts}) does not match the expert map ({inferred_redundant_experts})."
+            )
+        num_redundant_experts = inferred_redundant_experts
+        eplb_config.config["num_redundant_experts"] = num_redundant_experts
+
+    enable_eplb = (
+        eplb_config.dynamic_eplb
+        or eplb_config.expert_map_path is not None
+        or num_redundant_experts > 0
+        or ascend_config.mix_placement
+    )
+    if not enable_eplb:
+        return
+
+    parallel_config = vllm_config.parallel_config
+    if not parallel_config.enable_eplb:
+        logger.info_once("Sync Ascend EPLB config to vLLM: enable_eplb=True.")
+        parallel_config.enable_eplb = True
+
+    if parallel_config.eplb_config.num_redundant_experts != num_redundant_experts:
+        logger.info_once(
+            "Sync Ascend EPLB config to vLLM: num_redundant_experts=%s.",
+            num_redundant_experts,
+        )
+        parallel_config.eplb_config.num_redundant_experts = num_redundant_experts
+
+
 def init_ascend_config(vllm_config):
     additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
     refresh = additional_config.get("refresh", False) if additional_config else False
@@ -914,6 +964,7 @@ def init_ascend_config(vllm_config):
         return _ASCEND_CONFIG
     new_config = AscendConfig(vllm_config)
     if _is_ascend_config_initialized(new_config):
+        _sync_ascend_eplb_config_to_vllm(vllm_config, new_config)
         _ASCEND_CONFIG = new_config
     else:
         logger.warning("Ascend config instance is not fully initialized. action: skip singleton cache update. ")

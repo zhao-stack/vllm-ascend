@@ -29,6 +29,7 @@ from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
 from vllm_ascend.ops.fused_moe.fused_moe import (
     AscendMoERunner,
     AscendUnquantizedFusedMoEMethod,
+    _configure_eplb_expert_map,
 )
 
 
@@ -656,6 +657,11 @@ def test_ascend_fused_moe_factory_injects_current_runner(monkeypatch):
         "_DefaultAscendMoERunner",
         AscendMoERunner,
     )
+    monkeypatch.setattr(
+        patch_module,
+        "_ascend_eplb_overrides",
+        MagicMock(return_value=(0, False)),
+    )
     tid2eid = torch.tensor([0, 1])
 
     result = patch_module._ascend_FusedMoE(
@@ -675,3 +681,194 @@ def test_ascend_fused_moe_factory_injects_current_runner(monkeypatch):
     assert kwargs["runner_args"]["tid2eid"] is tid2eid
     assert "hash" not in kwargs
     assert "tid2eid" not in kwargs
+
+
+def test_configure_eplb_expert_map_does_not_double_count_redundancy():
+    moe_config = SimpleNamespace(
+        num_experts=10,
+        num_logical_experts=8,
+        num_local_experts=5,
+        ep_size=2,
+    )
+    manager = SimpleNamespace(
+        global_num_experts=10,
+        _local_num_experts=5,
+        _expert_map=None,
+    )
+    routed_experts = SimpleNamespace(
+        global_num_experts=8,
+        expert_map_manager=manager,
+        update_expert_map_info=MagicMock(),
+    )
+    expert_map = torch.tensor([0, 1, 2, 3, -1, -1, -1, -1])
+
+    local_num_experts, global_num_experts = _configure_eplb_expert_map(
+        moe_config,
+        routed_experts,
+        expert_map,
+        num_redundant_experts=2,
+    )
+
+    assert local_num_experts == 5
+    assert global_num_experts == 10
+    assert moe_config.num_experts == 10
+    assert manager._local_num_experts == 5
+    assert manager._expert_map is expert_map
+    assert routed_experts.global_num_experts == 10
+    routed_experts.update_expert_map_info.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("is_v024", "enable_eplb_index", "num_redundant_experts_index"),
+    [(True, 24, 25), (False, 25, 26)],
+)
+def test_ascend_fused_moe_factory_overrides_versioned_positional_eplb_args(
+    monkeypatch,
+    is_v024,
+    enable_eplb_index,
+    num_redundant_experts_index,
+):
+    patch_module = importlib.import_module("vllm_ascend.patch.platform.patch_fused_moe")
+    original_fused_moe = MagicMock(return_value="runner")
+    monkeypatch.setattr(patch_module, "_original_FusedMoE", original_fused_moe)
+    monkeypatch.setattr(
+        patch_module,
+        "_ascend_eplb_overrides",
+        MagicMock(return_value=(2, True)),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "_ascend_mix_placement_allocation",
+        MagicMock(return_value=0),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "vllm_version_is",
+        MagicMock(return_value=is_v024),
+    )
+    args = list(range(num_redundant_experts_index + 1))
+
+    assert patch_module._ascend_FusedMoE(*args) == "runner"
+
+    forwarded_args = original_fused_moe.call_args.args
+    assert forwarded_args[enable_eplb_index] is True
+    assert forwarded_args[num_redundant_experts_index] == 2
+
+
+def test_ascend_fused_moe_factory_allocates_redundant_expert_slots(monkeypatch):
+    patch_module = importlib.import_module("vllm_ascend.patch.platform.patch_fused_moe")
+
+    def allocated_local_experts(*args, **kwargs):
+        num_experts = kwargs["num_experts"]
+        num_redundant_experts = kwargs["num_redundant_experts"]
+        return (num_experts + num_redundant_experts) // 2
+
+    monkeypatch.setattr(patch_module, "_original_FusedMoE", allocated_local_experts)
+    monkeypatch.setattr(
+        patch_module,
+        "_ascend_eplb_overrides",
+        MagicMock(return_value=(2, True)),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "_ascend_mix_placement_allocation",
+        MagicMock(return_value=0),
+    )
+
+    result = patch_module._ascend_FusedMoE(num_experts=128)
+
+    assert result == 65
+
+
+@pytest.mark.parametrize(("is_v024", "n_shared_index"), [(True, 29), (False, 31)])
+def test_mix_placement_reserves_one_shared_expert_slot_per_ep_rank(monkeypatch, is_v024, n_shared_index):
+    patch_module = importlib.import_module("vllm_ascend.patch.platform.patch_fused_moe")
+    ascend_config = SimpleNamespace(
+        mix_placement=True,
+        eplb_config=SimpleNamespace(expert_map_path=None),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "get_ascend_config",
+        MagicMock(return_value=ascend_config),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "get_ep_group",
+        MagicMock(return_value=SimpleNamespace(world_size=2)),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "vllm_version_is",
+        MagicMock(return_value=is_v024),
+    )
+    args = [0] * (n_shared_index + 1)
+    args[n_shared_index] = 1
+
+    allocation = patch_module._ascend_mix_placement_allocation(tuple(args), {})
+
+    assert allocation == 2
+
+
+def test_ascend_expert_mappings_keep_logical_checkpoint_ids(monkeypatch):
+    patch_module = importlib.import_module("vllm_ascend.patch.platform.patch_fused_moe")
+    original_mapping = MagicMock(return_value="tag-mapping")
+    original_build_mapping = MagicMock(return_value="main-mapping")
+    monkeypatch.setattr(
+        patch_module,
+        "_ascend_eplb_overrides",
+        MagicMock(return_value=(2, True)),
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "_original_make_expert_params_mapping",
+        original_mapping,
+    )
+    monkeypatch.setattr(
+        patch_module,
+        "_original_build_expert_params_mapping",
+        original_build_mapping,
+    )
+
+    assert patch_module._ascend_make_expert_params_mapping(None, "gate", "down", "up", 8, 2) == "tag-mapping"
+    assert original_mapping.call_args.args[5] == 0
+
+    assert patch_module._ascend_build_expert_params_mapping("gate", "down", "up", 8, 2) == "main-mapping"
+    assert original_build_mapping.call_args.args[4] == 0
+
+    patch_module._ascend_eplb_overrides.return_value = (0, True)
+    assert patch_module._ascend_build_expert_params_mapping("gate", "down", "up", 8, 1) == "main-mapping"
+    assert original_build_mapping.call_args.args[4] == 0
+
+
+def test_ascend_moe_runner_exposes_eplb_update_protocol():
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    manager = SimpleNamespace(_expert_map=None, expert_map=torch.tensor([0, 1]))
+    runner.routed_experts = SimpleNamespace(
+        expert_map_manager=manager,
+        update_expert_map=MagicMock(),
+        update_expert_map_info=MagicMock(),
+    )
+    new_expert_map = torch.tensor([1, 0])
+
+    runner.update_expert_map(new_expert_map)
+
+    assert runner._expert_map is new_expert_map
+    assert manager._expert_map is new_expert_map
+    runner.routed_experts.update_expert_map_info.assert_called_once_with()
+
+    runner.routed_experts.update_expert_map_info.reset_mock()
+    runner.update_expert_map()
+    assert runner._expert_map is new_expert_map
+    assert manager._expert_map is new_expert_map
+    runner.routed_experts.update_expert_map.assert_not_called()
+    runner.routed_experts.update_expert_map_info.assert_called_once_with()
+
+    runner.log2phy = torch.tensor([1, 0])
+    assert runner.get_log2phy_map() is runner.log2phy
+    runner.moe_load = MagicMock()
+    runner.multi_stage = True
+    runner.load_counter = MagicMock()
+    runner.clear_moe_load()
+    runner.moe_load.zero_.assert_called_once_with()
+    runner.load_counter.zero_.assert_called_once_with()

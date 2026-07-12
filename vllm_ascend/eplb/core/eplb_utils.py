@@ -24,6 +24,20 @@ from vllm.logger import logger
 from vllm.model_executor.layers.fused_moe.expert_map_manager import determine_expert_map
 
 
+def get_expert_map_num_physical_experts(expert_map_path: str) -> int:
+    """Return the common physical expert count encoded for each MoE layer."""
+    with open(expert_map_path) as f:
+        data = json.load(f)
+    physical_counts = {
+        sum(len(device["device_expert"]) for device in layer["device_list"]) for layer in data["layer_list"]
+    }
+    if not physical_counts:
+        raise ValueError("EPLB table does not contain any MoE layers.")
+    if len(physical_counts) != 1:
+        raise ValueError("All layers in an EPLB table must use the same number of physical experts.")
+    return physical_counts.pop()
+
+
 def expert_file_to_tensor(expert_map_path, layer_id):
     with open(expert_map_path) as f:
         data = json.load(f)
@@ -63,10 +77,10 @@ def generate_global_placement(n_expert, ep_size, n_redundant, num_shared_experts
 
 def init_eplb_config(eplb_config, layer_id, moe_config, mix_placement=False, num_shared_experts=1, tp_size=None):
     expert_map_path = eplb_config.expert_map_path
-    n_experts = moe_config.num_experts
+    n_experts = moe_config.num_logical_experts
     ep_size = moe_config.ep_size
     global_placement = None
-    eplb_enable = eplb_config.dynamic_eplb
+    eplb_enable = eplb_config.dynamic_eplb or eplb_config.num_redundant_experts > 0 or mix_placement
     n_redundant = eplb_config.num_redundant_experts if eplb_enable else 0
     num_shared_experts = num_shared_experts if mix_placement else 0
 
