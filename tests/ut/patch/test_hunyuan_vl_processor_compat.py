@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -9,131 +8,125 @@ import pytest
 import vllm_ascend.patch.hunyuan_vl_processor_compat as compat
 
 
-def test_v023_imports_native_processors_without_persistent_aliases(monkeypatch):
-    import transformers.models.hunyuan_vl.image_processing_hunyuan_vl as native_image
-    import vllm.transformers_utils.processors as vllm_processors
+def test_v023_translates_bundled_image_processor_registration(monkeypatch):
+    from transformers import AutoImageProcessor
+    from vllm.transformers_utils.configs.hunyuan_vl import HunYuanVLConfig
 
-    class FakeProcessor:
+    class HunYuanVLImageProcessor:
         pass
 
-    class FakeImageProcessor:
-        pass
+    hunyuan_vision = object()
+    registrations: list[tuple[Any, Any, bool]] = []
 
-    def fake_smart_resize(*_args: Any, **_kwargs: Any) -> tuple[int, int]:
-        return (1, 1)
+    def register(
+        config_class: Any,
+        slow_image_processor_class: Any = None,
+        *,
+        exist_ok: bool = False,
+    ) -> None:
+        registrations.append(
+            (
+                config_class,
+                slow_image_processor_class,
+                exist_ok,
+            )
+        )
 
-    processor_module_name = compat._STALE_PROCESSOR_MODULES["HunYuanVLProcessor"]
-    image_module_name = compat._STALE_PROCESSOR_MODULES["HunYuanVLImageProcessor"]
-    previous_modules = {
-        processor_module_name: sys.modules.get(processor_module_name),
-        image_module_name: sys.modules.get(image_module_name),
-    }
-    previous_attributes = {
-        "hunyuan_vl": vars(vllm_processors).get("hunyuan_vl"),
-        "hunyuan_vl_image": vars(vllm_processors).get("hunyuan_vl_image"),
-    }
-    hunyuan_vision = ModuleType("vllm.model_executor.models.hunyuan_vision")
-
-    def import_hunyuan_vision(name: str) -> ModuleType:
-        assert name == hunyuan_vision.__name__
-        assert sys.modules[processor_module_name].HunYuanVLProcessor is FakeProcessor
-        assert sys.modules[image_module_name].HunYuanVLImageProcessor is FakeImageProcessor
-        assert sys.modules[image_module_name].smart_resize is fake_smart_resize
-        vars(vllm_processors)["hunyuan_vl"] = sys.modules[processor_module_name]
-        vars(vllm_processors)["hunyuan_vl_image"] = sys.modules[image_module_name]
+    def import_hunyuan_vision(name: str) -> object:
+        assert name == "vllm.model_executor.models.hunyuan_vision"
+        AutoImageProcessor.register(
+            "HunYuanVLImageProcessor",
+            HunYuanVLImageProcessor,
+        )
         return hunyuan_vision
 
-    monkeypatch.setattr(compat, "HunYuanVLProcessor", FakeProcessor)
-    monkeypatch.setattr(native_image, "HunYuanVLImageProcessor", FakeImageProcessor)
-    monkeypatch.setattr(native_image, "smart_resize", fake_smart_resize)
+    monkeypatch.setattr(AutoImageProcessor, "register", staticmethod(register))
     monkeypatch.setattr(compat.importlib, "import_module", import_hunyuan_vision)
 
     assert compat._import_v023_hunyuan_vision() is hunyuan_vision
+    assert AutoImageProcessor.register is register
+    assert registrations == [
+        (
+            HunYuanVLConfig,
+            HunYuanVLImageProcessor,
+            True,
+        )
+    ]
 
-    for module_name, previous_module in previous_modules.items():
-        assert sys.modules.get(module_name) is previous_module
-    for attribute_name, previous_attribute in previous_attributes.items():
-        assert vars(vllm_processors).get(attribute_name) is previous_attribute
 
+def test_v023_restores_register_after_unexpected_registration(monkeypatch):
+    from transformers import AutoImageProcessor
 
-def test_v023_restores_aliases_after_import_error(monkeypatch):
-    import transformers.models.hunyuan_vl.image_processing_hunyuan_vl as native_image
-
-    class FakeProcessor:
+    class UnexpectedProcessor:
         pass
 
-    class FakeImageProcessor:
-        pass
+    def register(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("The unexpected registration must not reach Transformers")
 
-    processor_module_name = compat._STALE_PROCESSOR_MODULES["HunYuanVLProcessor"]
-    image_module_name = compat._STALE_PROCESSOR_MODULES["HunYuanVLImageProcessor"]
-    previous_modules = {
-        processor_module_name: sys.modules.get(processor_module_name),
-        image_module_name: sys.modules.get(image_module_name),
-    }
+    def import_hunyuan_vision(_name: str) -> object:
+        AutoImageProcessor.register("UnexpectedProcessor", UnexpectedProcessor)
+        return object()
 
-    monkeypatch.setattr(compat, "HunYuanVLProcessor", FakeProcessor)
-    monkeypatch.setattr(native_image, "HunYuanVLImageProcessor", FakeImageProcessor)
+    monkeypatch.setattr(AutoImageProcessor, "register", staticmethod(register))
+    monkeypatch.setattr(compat.importlib, "import_module", import_hunyuan_vision)
 
-    def fail_import(_name: str) -> ModuleType:
-        raise ImportError("expected test failure")
-
-    monkeypatch.setattr(compat.importlib, "import_module", fail_import)
-
-    with pytest.raises(ImportError, match="expected test failure"):
+    with pytest.raises(RuntimeError, match="Unexpected v0.23 Hunyuan image-processor registration"):
         compat._import_v023_hunyuan_vision()
 
-    for module_name, previous_module in previous_modules.items():
-        assert sys.modules.get(module_name) is previous_module
+    assert AutoImageProcessor.register is register
 
 
-def test_installer_runs_v023_backports_in_order(monkeypatch):
-    hunyuan_vision = object()
-    calls: list[Any] = []
+def test_installer_keeps_v023_bundled_processor_protocol(monkeypatch):
+    def bundled_call_protocol(*_args: Any, **_kwargs: Any) -> str:
+        return "bundled"
 
-    def import_hunyuan_vision() -> object:
-        calls.append("import")
-        return hunyuan_vision
+    class BundledProcessor:
+        pass
 
-    def clean_registry() -> bool:
-        calls.append("registry")
-        return True
+    class FakeProcessingInfo:
+        pass
 
-    def patch_processor(module: Any) -> None:
-        calls.append(("processor", module))
+    class FakeMultiModalProcessor:
+        _call_hf_processor = bundled_call_protocol
 
-    def patch_loader(module: Any) -> None:
-        calls.append(("loader", module))
+    hunyuan_vision = SimpleNamespace(
+        HunYuanVLProcessor=BundledProcessor,
+        HunYuanVLProcessingInfo=FakeProcessingInfo,
+        HunYuanVLMultiModalProcessor=FakeMultiModalProcessor,
+    )
+
+    def fail_main_path(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("The v0.23 path must not install main's native processor patches")
 
     monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.23.0")
     monkeypatch.setattr(
         compat,
         "_import_v023_hunyuan_vision",
-        import_hunyuan_vision,
+        lambda: hunyuan_vision,
     )
-    monkeypatch.setattr(
-        compat,
-        "_remove_stale_registry_entries",
-        clean_registry,
-    )
-    monkeypatch.setattr(
-        compat,
-        "_patch_hunyuan_processor_loader",
-        patch_loader,
-    )
-    monkeypatch.setattr(
-        compat,
-        "_patch_v023_processor_methods",
-        patch_processor,
-    )
+    monkeypatch.setattr(compat, "_remove_stale_registry_entries", fail_main_path)
+
     compat.install_hunyuan_vl_processor_compat()
 
-    assert calls == [
-        "import",
-        "registry",
-        ("loader", hunyuan_vision),
-        ("processor", hunyuan_vision),
+    processor_args: list[tuple[Any, dict[str, Any]]] = []
+
+    def get_processor(processor_class: Any, **kwargs: Any) -> object:
+        processor_args.append((processor_class, kwargs))
+        return object()
+
+    processing_info = SimpleNamespace(
+        ctx=SimpleNamespace(get_hf_processor=get_processor),
+    )
+    get_hf_processor = vars(FakeProcessingInfo)["get_hf_processor"]
+    get_hf_processor(processing_info, use_fast=True, min_pixels=128)
+
+    assert processor_args == [
+        (
+            BundledProcessor,
+            {"min_pixels": 128, "backend": "pil"},
+        )
     ]
+    assert vars(FakeMultiModalProcessor)["_call_hf_processor"] is bundled_call_protocol
 
 
 def test_installer_cleans_main_registry_before_model_patch(monkeypatch):
@@ -154,8 +147,8 @@ def test_installer_cleans_main_registry_before_model_patch(monkeypatch):
         calls.append("registry")
         return True
 
-    def patch_loader(module: Any) -> None:
-        calls.append(("loader", module))
+    def patch_loader(module: Any, processor_class: Any) -> None:
+        calls.append(("loader", module, processor_class))
 
     monkeypatch.setattr(compat, "vllm_version_is", lambda _version: False)
     monkeypatch.setattr(
@@ -169,11 +162,16 @@ def test_installer_cleans_main_registry_before_model_patch(monkeypatch):
         "_patch_hunyuan_processor_loader",
         patch_loader,
     )
+
     compat.install_hunyuan_vl_processor_compat()
 
     assert calls == [
         "registry",
-        ("loader", hunyuan_vision),
+        (
+            "loader",
+            hunyuan_vision,
+            compat._HunYuanVLProcessorCompat,
+        ),
     ]
     assert FakeMultiModalProcessor._get_prompt_updates is native_get_prompt_updates
 
@@ -246,89 +244,6 @@ def test_compat_processor_registers_schema_before_native_init(monkeypatch):
     ]
 
 
-def test_v023_backports_native_processor_call_protocol(monkeypatch):
-    class FakeProcessingInfo:
-        pass
-
-    class FakeMultiModalProcessor:
-        pass
-
-    hunyuan_vision = SimpleNamespace(
-        HunYuanVLProcessingInfo=FakeProcessingInfo,
-        HunYuanVLMultiModalProcessor=FakeMultiModalProcessor,
-    )
-    compat._patch_hunyuan_processor_loader(hunyuan_vision)
-    compat._patch_v023_processor_methods(hunyuan_vision)
-
-    processor_args: list[tuple[Any, dict[str, Any]]] = []
-
-    def get_processor(processor_class: Any, **kwargs: Any) -> object:
-        processor_args.append((processor_class, kwargs))
-        return object()
-
-    processing_info = SimpleNamespace(
-        ctx=SimpleNamespace(get_hf_processor=get_processor),
-    )
-    get_hf_processor = vars(FakeProcessingInfo)["get_hf_processor"]
-
-    get_hf_processor(processing_info, use_fast=True, min_pixels=128)
-
-    assert processor_args == [
-        (
-            compat._HunYuanVLProcessorCompat,
-            {"min_pixels": 128, "backend": "pil"},
-        )
-    ]
-
-    calls: list[tuple[Any, dict[str, Any], dict[str, Any]]] = []
-    hf_processor = SimpleNamespace(
-        image_token="<image>",
-        image_start_token="<image_start>",
-        image_end_token="<image_end>",
-    )
-
-    def call_hf_processor(
-        processor: Any,
-        inputs: dict[str, Any],
-        kwargs: dict[str, Any],
-    ) -> str:
-        calls.append((processor, inputs, kwargs))
-        return "processed"
-
-    processor = SimpleNamespace(
-        info=SimpleNamespace(
-            get_hf_processor=lambda **_kwargs: hf_processor,
-            ctx=SimpleNamespace(call_hf_processor=call_hf_processor),
-        )
-    )
-    call_processor = vars(FakeMultiModalProcessor)["_call_hf_processor"]
-
-    assert (
-        call_processor(
-            processor,
-            "before<image>after",
-            {"images": [object()]},
-            {},
-            {},
-        )
-        == "processed"
-    )
-    assert calls[0][1]["text"] == ("before<image_start><image><image_end>after")
-
-    wrapped_prompt = "before<image_start><image><image_end>after"
-    assert (
-        call_processor(
-            processor,
-            wrapped_prompt,
-            {"images": [object()]},
-            {},
-            {},
-        )
-        == "processed"
-    )
-    assert calls[1][1]["text"] == wrapped_prompt
-
-
 def test_main_removes_only_stale_registry_entries(monkeypatch):
     import vllm.transformers_utils.processors as vllm_processors
 
@@ -361,28 +276,3 @@ def test_main_rejects_unexpected_registry_replacement(monkeypatch):
         compat._remove_stale_registry_entries()
 
     assert registry == {"HunYuanVLProcessor": "future.hunyuan_vl"}
-
-
-def test_installer_preserves_native_prompt_update_protocol(monkeypatch):
-    def native_get_prompt_updates(*_args: Any, **_kwargs: Any) -> str:
-        return "native"
-
-    class FakeMultiModalProcessor:
-        _get_prompt_updates = native_get_prompt_updates
-
-    hunyuan_vision = SimpleNamespace(
-        HunYuanVLMultiModalProcessor=FakeMultiModalProcessor,
-    )
-    monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.23.0")
-    monkeypatch.setattr(
-        compat,
-        "_import_v023_hunyuan_vision",
-        lambda: hunyuan_vision,
-    )
-    monkeypatch.setattr(compat, "_remove_stale_registry_entries", lambda: True)
-    monkeypatch.setattr(compat, "_patch_hunyuan_processor_loader", lambda _module: None)
-    monkeypatch.setattr(compat, "_patch_v023_processor_methods", lambda _module: None)
-
-    compat.install_hunyuan_vl_processor_compat()
-
-    assert FakeMultiModalProcessor._get_prompt_updates is native_get_prompt_updates

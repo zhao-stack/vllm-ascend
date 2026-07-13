@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import importlib
-import sys
-from collections.abc import Mapping
-from types import ModuleType
-from typing import Any, cast
+from typing import Any
 
 from transformers import HunYuanVLProcessor
 
@@ -80,59 +77,35 @@ class _HunYuanVLProcessorCompat(HunYuanVLProcessor):
 
 
 def _import_v023_hunyuan_vision() -> Any:
-    """Import v0.23's model with the native processors from vLLM PR #47872."""
-    from transformers.models.hunyuan_vl.image_processing_hunyuan_vl import (
-        HunYuanVLImageProcessor,
-        smart_resize,
-    )
+    """Import v0.23's bundled Hunyuan processor under the Transformers 5.13 registry API."""
+    from transformers import AutoImageProcessor
+    from vllm.transformers_utils.configs.hunyuan_vl import HunYuanVLConfig
 
-    aliases = {
-        _STALE_PROCESSOR_MODULES["HunYuanVLProcessor"]: {
-            "HunYuanVLProcessor": HunYuanVLProcessor,
-        },
-        _STALE_PROCESSOR_MODULES["HunYuanVLImageProcessor"]: {
-            "HunYuanVLImageProcessor": HunYuanVLImageProcessor,
-            "smart_resize": smart_resize,
-        },
-    }
-    missing = object()
-    previous_modules = {name: sys.modules.get(name, missing) for name in aliases}
-    parent_module = sys.modules.get("vllm.transformers_utils.processors")
-    previous_attributes = {
-        name.rpartition(".")[2]: (
-            vars(parent_module).get(name.rpartition(".")[2], missing) if parent_module is not None else missing
+    original_register = AutoImageProcessor.register
+
+    def register_v023_image_processor(
+        config_class: Any,
+        image_processor_class: type,
+    ) -> None:
+        expected_class_name = "HunYuanVLImageProcessor"
+        if config_class != expected_class_name or image_processor_class.__name__ != expected_class_name:
+            raise RuntimeError(
+                "Unexpected v0.23 Hunyuan image-processor registration: "
+                f"config={config_class!r}, processor={image_processor_class!r}"
+            )
+
+        original_register(
+            HunYuanVLConfig,
+            slow_image_processor_class=image_processor_class,
+            exist_ok=True,
         )
-        for name in aliases
-    }
 
-    alias_modules = {}
-    for module_name, exports in aliases.items():
-        module = ModuleType(module_name)
-        module.__package__ = module_name.rpartition(".")[0]
-        module.__dict__.update(exports)
-        module.__dict__["__all__"] = list(exports)
-        alias_modules[module_name] = module
-        sys.modules[module_name] = module
+    AutoImageProcessor.register = staticmethod(register_v023_image_processor)
 
     try:
         return importlib.import_module("vllm.model_executor.models.hunyuan_vision")
     finally:
-        for module_name, alias_module in alias_modules.items():
-            previous_module = previous_modules[module_name]
-            if previous_module is missing:
-                if sys.modules.get(module_name) is alias_module:
-                    del sys.modules[module_name]
-            else:
-                sys.modules[module_name] = cast(ModuleType, previous_module)
-
-        current_parent_module = sys.modules.get("vllm.transformers_utils.processors")
-        if current_parent_module is not None:
-            for attribute_name, previous_attribute in previous_attributes.items():
-                if previous_attribute is missing:
-                    if vars(current_parent_module).get(attribute_name) in alias_modules.values():
-                        delattr(current_parent_module, attribute_name)
-                else:
-                    setattr(current_parent_module, attribute_name, previous_attribute)
+        AutoImageProcessor.register = staticmethod(original_register)
 
 
 def _remove_stale_registry_entries() -> bool:
@@ -160,56 +133,32 @@ def _remove_stale_registry_entries() -> bool:
     return bool(entries_to_remove)
 
 
-def _patch_hunyuan_processor_loader(hunyuan_vision: Any) -> None:
-    """Use the native processor with the complete Hunyuan tokenizer schema."""
+def _patch_hunyuan_processor_loader(hunyuan_vision: Any, processor_class: Any) -> None:
+    """Select the version-specific processor with the Transformers 5.13 PIL backend."""
 
     def get_hf_processor(self: Any, **kwargs: object) -> Any:
         kwargs.pop("use_fast", None)
         kwargs.setdefault("backend", "pil")
-        return self.ctx.get_hf_processor(_HunYuanVLProcessorCompat, **kwargs)
+        return self.ctx.get_hf_processor(processor_class, **kwargs)
 
     hunyuan_vision.HunYuanVLProcessingInfo.get_hf_processor = get_hf_processor
 
 
-def _patch_v023_processor_methods(hunyuan_vision: Any) -> None:
-    """Backport the Transformers 5.13 call protocol from vLLM PR #47872."""
-
-    def call_hf_processor(
-        self: Any,
-        prompt: str,
-        mm_data: Mapping[str, object],
-        mm_kwargs: Mapping[str, object],
-        tok_kwargs: Mapping[str, object],
-    ) -> Any:
-        hf_processor = self.info.get_hf_processor(**mm_kwargs)
-        if mm_data.get("images") is not None and prompt:
-            image_token = hf_processor.image_token
-            wrapped_token = f"{hf_processor.image_start_token}{image_token}{hf_processor.image_end_token}"
-            if image_token in prompt and wrapped_token not in prompt:
-                prompt = prompt.replace(image_token, wrapped_token)
-        return self.info.ctx.call_hf_processor(
-            hf_processor,
-            dict(text=prompt, **mm_data),
-            dict(**mm_kwargs, **tok_kwargs),
-        )
-
-    hunyuan_vision.HunYuanVLMultiModalProcessor._call_hf_processor = call_hf_processor
-
-
 def install_hunyuan_vl_processor_compat() -> None:
     """Align both supported vLLM refs with Transformers 5.13 Hunyuan APIs."""
-    # Keep each target's native, image-token-only prompt replacement. The
-    # cached processor path applies it inside an existing start/image/end
-    # wrapper; using a full-wrapper replacement here would duplicate wrappers.
     if vllm_version_is("0.23.0"):
         v023_hunyuan_vision = _import_v023_hunyuan_vision()
-        _remove_stale_registry_entries()
-        _patch_hunyuan_processor_loader(v023_hunyuan_vision)
-        _patch_v023_processor_methods(v023_hunyuan_vision)
+        _patch_hunyuan_processor_loader(
+            v023_hunyuan_vision,
+            v023_hunyuan_vision.HunYuanVLProcessor,
+        )
         return
 
     if not _remove_stale_registry_entries():
         return
     from vllm.model_executor.models import hunyuan_vision as main_hunyuan_vision
 
-    _patch_hunyuan_processor_loader(main_hunyuan_vision)
+    _patch_hunyuan_processor_loader(
+        main_hunyuan_vision,
+        _HunYuanVLProcessorCompat,
+    )
