@@ -156,7 +156,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # can be a multiple of hash_block_size.
         self.hash_block_size = hash_block_size
         self.enable_partial_hash_hits = False
-        if not vllm_version_is("0.23.0"):
+        if not vllm_version_is("0.24.0"):
             self.enable_partial_hash_hits = dcp_world_size == 1 and any(
                 isinstance(group.kv_cache_spec, MambaSpec)
                 and group.kv_cache_spec.mamba_cache_mode == "align"
@@ -199,7 +199,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         first_group_id: int,
         manager_cls: type[SingleTypeKVCacheManager],
     ) -> int:
-        if vllm_version_is("0.23.0"):
+        if vllm_version_is("0.24.0"):
             return spec.block_size
         group_block_size = self.single_type_managers[first_group_id].block_size
         if (
@@ -302,7 +302,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         """
 
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if not vllm_version_is("0.23.0"):
+            if not vllm_version_is("0.24.0"):
                 return block_hashes
             target_block_size = kv_cache_spec.block_size
             if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
@@ -344,7 +344,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 use_eagle = idx in self.eagle_attn_group_indices and idx not in eagle_verified
 
                 _max_length = curr_hit_length
-                if use_eagle and (vllm_version_is("0.23.0") or not isinstance(spec, MambaSpec)):
+                if use_eagle and (vllm_version_is("0.24.0") or not isinstance(spec, MambaSpec)):
                     # Eagle needs to match one more block and then pop the last.
                     eagle_margin = self._get_eagle_margin(spec, first_group_id, manager_cls)
                     _max_length = min(curr_hit_length + eagle_margin, max_cache_hit_length)
@@ -357,12 +357,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     kv_cache_spec=spec,
                     **eagle_kwarg,
                     alignment_tokens=(
-                        self.lcm_block_size if vllm_version_is("0.23.0") else self._cache_hit_alignment_tokens
+                        self.lcm_block_size if vllm_version_is("0.24.0") else self._cache_hit_alignment_tokens
                     ),
                     dcp_world_size=self.dcp_world_size,
                     pcp_world_size=self.pcp_world_size,
                 )
-                if vllm_version_is("0.23.0"):
+                if vllm_version_is("0.24.0"):
                     hit_blocks = hit_result
                     _new_hit_length = len(hit_blocks[0]) * effective_block_size
                 else:
@@ -397,7 +397,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             effective_block_size = self._get_effective_block_size(spec)
             num_blocks = (
                 hit_length // effective_block_size
-                if vllm_version_is("0.23.0")
+                if vllm_version_is("0.24.0")
                 else cdiv(hit_length, effective_block_size)
             )
             for group_id in group_ids:
@@ -406,7 +406,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     hit_length_by_group[group_id] = hit_length
 
         cache_hit_blocks = tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group)
-        if vllm_version_is("0.23.0"):
+        if vllm_version_is("0.24.0"):
             return cache_hit_blocks, hit_length
         return cache_hit_blocks, hit_length, longest_hit_length - hit_length
 
@@ -416,7 +416,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
-            if not vllm_version_is("0.23.0"):
+            if not vllm_version_is("0.24.0"):
                 return block_hashes
             target_block_size = kv_cache_spec.block_size
             if not isinstance(kv_cache_spec, MambaSpec) and self.dcp_world_size * self.pcp_world_size > 1:
@@ -467,7 +467,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                 use_eagle = idx in self.eagle_attn_group_indices and idx not in eagle_verified
 
                 _max_length = curr_hit_length
-                if use_eagle and (vllm_version_is("0.23.0") or not isinstance(spec, MambaSpec)):
+                if use_eagle and (vllm_version_is("0.24.0") or not isinstance(spec, MambaSpec)):
                     # Eagle needs to match one more block and then pop the last.
                     eagle_margin = self._get_eagle_margin(spec, first_group_id, manager_cls)
                     _max_length = min(curr_hit_length + eagle_margin, max_cache_hit_length)
@@ -480,12 +480,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     kv_cache_spec=spec,
                     **eagle_kwarg,
                     alignment_tokens=(
-                        self.lcm_block_size if vllm_version_is("0.23.0") else self._cache_hit_alignment_tokens
+                        self.lcm_block_size if vllm_version_is("0.24.0") else self._cache_hit_alignment_tokens
                     ),
                     dcp_world_size=self.dcp_world_size,
                     pcp_world_size=self.pcp_world_size,
                 )
-                if vllm_version_is("0.23.0"):
+                if vllm_version_is("0.24.0"):
                     hit_blocks = hit_result
                     _new_hit_length = len(hit_blocks[0]) * effective_block_size
                 else:
@@ -518,7 +518,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             effective_block_size = self._get_effective_block_size(spec)
             num_blocks = (
                 hit_length // effective_block_size
-                if vllm_version_is("0.23.0")
+                if vllm_version_is("0.24.0")
                 else cdiv(hit_length, effective_block_size)
             )
             for group_id in group_ids:

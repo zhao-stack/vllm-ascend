@@ -449,7 +449,7 @@ def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:
     )
     alignment_tokens = 4096  # lcm_block_size
 
-    if vllm_version_is("0.23.0"):
+    if vllm_version_is("0.24.0"):
         mask = SlidingWindowManager.reachable_block_mask(
             start_block=0,
             end_block=256,  # 256 × 32 = 8192 tokens (2 × alignment_tokens)

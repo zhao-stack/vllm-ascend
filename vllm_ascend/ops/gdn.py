@@ -142,7 +142,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         output, _ = self.out_proj(core_attn_out)
         return output
 
-    if vllm_version_is("0.23.0"):
+    if vllm_version_is("0.24.0"):
 
         def forward(
             self,

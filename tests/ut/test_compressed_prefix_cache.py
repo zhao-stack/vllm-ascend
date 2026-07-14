@@ -72,7 +72,7 @@ def _make_compress_manager(
 
 
 def _get_hit_blocks(hit_result):
-    if vllm_version_is("0.23.0"):
+    if vllm_version_is("0.24.0"):
         return hit_result
     hit_blocks, _ = hit_result
     return hit_blocks
@@ -205,7 +205,7 @@ def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
         request_b.block_hashes,
         max_cache_hit_length=logical_block_size,
     )
-    if vllm_version_is("0.23.0"):
+    if vllm_version_is("0.24.0"):
         hit_blocks, hit_length = hit_result
     else:
         hit_blocks, hit_length, num_uncached = hit_result

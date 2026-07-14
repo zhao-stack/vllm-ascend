@@ -118,7 +118,7 @@ class CPUKVCacheManager:
             **eagle_kwarg,
             alignment_tokens=self.block_size,
         )
-        if vllm_version_is("0.23.0"):
+        if vllm_version_is("0.24.0"):
             computed_blocks = hit_result
             num_computed_tokens = len(computed_blocks[0]) * self.block_size
         else:
@@ -151,7 +151,7 @@ class CPUKVCacheManager:
             if self.req_failed_to_allocate[request_id]:
                 continue
             new_computed_blocks = self.req_to_computed_blocks[request_id]
-            if vllm_version_is("0.23.0"):
+            if vllm_version_is("0.24.0"):
                 num_local_computed_tokens = len(new_computed_blocks) * self.block_size
                 num_blocks_to_allocate = self.single_type_manager.get_num_blocks_to_allocate(
                     request_id,
@@ -176,7 +176,7 @@ class CPUKVCacheManager:
                 continue
             # Append the new computed blocks to the request blocks until now to
             # avoid the case where the new blocks cannot be allocated.
-            if vllm_version_is("0.23.0"):
+            if vllm_version_is("0.24.0"):
                 self.single_type_manager.allocate_new_computed_blocks(
                     request_id,
                     new_computed_blocks,

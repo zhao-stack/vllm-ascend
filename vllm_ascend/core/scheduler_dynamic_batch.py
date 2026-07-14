@@ -362,7 +362,7 @@ class SchedulerDynamicBatch(Scheduler):
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     computed_result = self.kv_cache_manager.get_computed_blocks(request)
-                    if vllm_version_is("0.23.0"):
+                    if vllm_version_is("0.24.0"):
                         new_computed_blocks, num_new_local_computed_tokens = cast(
                             tuple[KVCacheBlocks, int], computed_result
                         )

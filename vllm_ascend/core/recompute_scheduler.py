@@ -544,7 +544,7 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                             )
                         )
                         new_computed_blocks = self.kv_cache_manager.create_kv_cache_blocks(computed_blocks)
-                        if not vllm_version_is("0.23.0"):
+                        if not vllm_version_is("0.24.0"):
                             # Per-group lookup does not detect an uncached shared
                             # prefix, so there is no junction to pin.
                             request.shared_prefix_boundary = 0
@@ -557,7 +557,7 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                             )
                     else:
                         computed_result = self.kv_cache_manager.get_computed_blocks(request)
-                        if vllm_version_is("0.23.0"):
+                        if vllm_version_is("0.24.0"):
                             new_computed_blocks, num_new_local_computed_tokens = cast(
                                 tuple[KVCacheBlocks, int], computed_result
                             )
@@ -892,7 +892,7 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
 
     def _free_request_transfer_params(self, request: Request) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         transfer_params = self._free_request(request)
-        if vllm_version_is("0.23.0"):
+        if vllm_version_is("0.24.0"):
             return cast(dict[str, Any] | None, transfer_params), None
         return cast(
             tuple[dict[str, Any] | None, dict[str, Any] | None],
@@ -907,7 +907,7 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
         ec_transfer_params: dict[str, Any] | None,
         **kwargs: Any,
     ) -> EngineCoreOutput:
-        if vllm_version_is("0.23.0"):
+        if vllm_version_is("0.24.0"):
             return EngineCoreOutput(
                 request_id=request_id,
                 new_token_ids=new_token_ids,

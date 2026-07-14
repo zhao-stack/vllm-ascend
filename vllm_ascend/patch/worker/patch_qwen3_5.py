@@ -35,7 +35,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.utils import is_310p, vllm_version_is
 
-_IS_VLLM_RELEASE = vllm_version_is("0.23.0")
+_IS_VLLM_RELEASE = vllm_version_is("0.24.0")
 if not _IS_VLLM_RELEASE:
     from vllm.model_executor.models.qwen3_next import _all_gather_hidden_and_residual
 
@@ -91,7 +91,7 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
         output, _ = self.o_proj(attn_output)
         return output
 
-    if vllm_version_is("0.23.0"):
+    if vllm_version_is("0.24.0"):
 
         def forward(
             self,
@@ -220,7 +220,7 @@ if Qwen3_5MultiTokenPredictor is not None:
     Qwen3_5MultiTokenPredictor.forward = qwen3_5_mtp_forward
 
 
-if vllm_version_is("0.23.0"):
+if vllm_version_is("0.24.0"):
     Qwen3_5DecoderLayer.forward = AscendQwen3_5DecoderLayer.forward
 Qwen3NextAttention._forward_ascend = AscendQwen3NextAttention._forward_ascend
 Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
@@ -235,5 +235,6 @@ if is_310p():
     _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention310.get_state_dtype
 else:
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
+    _GDN_PATCH_TARGET._forward_ascend = AscendGatedDeltaNetAttention._forward_ascend
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels

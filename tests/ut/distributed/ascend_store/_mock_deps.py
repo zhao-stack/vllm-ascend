@@ -103,7 +103,7 @@ if _MOCK_VLLM_DEPS:
     for _mod_name in _vllm_mock_modules:
         if _mod_name not in sys.modules:
             sys.modules[_mod_name] = MagicMock()
-    sys.modules["vllm"].__version__ = os.getenv("VLLM_VERSION", "0.23.0")  # type: ignore[attr-defined]
+    sys.modules["vllm"].__version__ = os.getenv("VLLM_VERSION", "0.24.0")  # type: ignore[attr-defined]
 
 if _MOCK_VLLM_DEPS:
     sys.modules["vllm.utils.math_utils"].cdiv = lambda a, b: -(-a // b)  # type: ignore[attr-defined]
@@ -276,7 +276,7 @@ class _FakeSingleTypeKVCacheManager:
         pcp_world_size=1,
     ):
         computed: tuple[list[object], ...] = tuple([] for _ in kv_cache_group_ids)
-        if os.getenv("VLLM_VERSION", "0.23.0") != "0.23.0" and kv_cache_spec.block_size != block_pool.hash_block_size:
+        if os.getenv("VLLM_VERSION", "0.24.0") != "0.24.0" and kv_cache_spec.block_size != block_pool.hash_block_size:
             scale_factor = kv_cache_spec.block_size // block_pool.hash_block_size
             block_hashes = [
                 block_hashes[index + scale_factor - 1]
@@ -292,7 +292,7 @@ class _FakeSingleTypeKVCacheManager:
         if drop_eagle_block and computed and computed[0]:
             for blocks in computed:
                 blocks.pop()
-        if os.getenv("VLLM_VERSION", "0.23.0") == "0.23.0":
+        if os.getenv("VLLM_VERSION", "0.24.0") == "0.24.0":
             return computed
         return computed, len(computed[0]) * kv_cache_spec.block_size
 
@@ -438,5 +438,5 @@ if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascen
     _ascend_utils = MagicMock()
     _ascend_utils.AscendDeviceType = MagicMock()
     _ascend_utils.get_ascend_device_type = MagicMock()
-    _ascend_utils.vllm_version_is = lambda target: os.getenv("VLLM_VERSION", "0.23.0") == target
+    _ascend_utils.vllm_version_is = lambda target: os.getenv("VLLM_VERSION", "0.24.0") == target
     sys.modules["vllm_ascend.utils"] = _ascend_utils

@@ -37,7 +37,7 @@ class AscendMambaManager(MambaManager):
         pcp_world_size: int = 1,
         drop_eagle_block: bool = False,
     ) -> tuple[list[KVCacheBlock], ...] | tuple[tuple[list[KVCacheBlock], ...], int]:
-        if not vllm_version_is("0.23.0"):
+        if not vllm_version_is("0.24.0"):
             return super().find_longest_cache_hit(
                 block_hashes=block_hashes,
                 max_length=max_length,
@@ -74,7 +74,7 @@ class AscendMambaManager(MambaManager):
         num_tokens_main_model: int | None = None,
         apply_admission_cap: bool = False,
     ) -> int:
-        if vllm_version_is("0.23.0"):
+        if vllm_version_is("0.24.0"):
             num_tokens_main_model = num_local_computed_tokens
             local_hit_tokens = len(new_computed_blocks) * self.block_size
             num_new_blocks = super().get_num_blocks_to_allocate(

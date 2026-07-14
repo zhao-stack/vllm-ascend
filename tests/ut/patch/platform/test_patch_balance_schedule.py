@@ -9,10 +9,10 @@ engine on NPU and live under e2e/nightly.
 
 What is guarded here (everything reachable from CPU UT):
 
-* the ``schedule`` override signature stays callable by BOTH vllm versions CI
-  runs (v0.23.0 calls ``schedule()``; 1f486d96 calls ``schedule(throttle_prefills)``)
-  and carries every parameter the installed ``schedule`` exposes -- NOT an
-  exact-match to the installed signature, which differs per lane;
+* the ``schedule`` override signature stays callable by BOTH vLLM versions CI
+  runs (v0.24.0 and verified main both call
+  ``schedule(throttle_prefills=False)``) and carries every parameter the
+  installed ``schedule`` exposes;
 * the ``BalanceScheduler.__init__`` signature stays drop-in compatible with
   upstream's ``Scheduler.__init__`` (upstream constructs ``Scheduler(...)``
   with kwargs, which after the swap constructs our subclass);
@@ -22,13 +22,12 @@ What is guarded here (everything reachable from CPU UT):
 * the module-level class swaps actually took effect;
 * the upstream Scheduler/DPEngineCoreProc methods the patch calls/super-calls
   still exist;
-* the 3 balance deltas and #47782 compatibility delta remain present in
+* the 3 balance deltas and 3 #47782 protocol bridges remain present in
   ``schedule()`` (intent lock);
 * the copied ``schedule()`` body stays a verbatim copy of the ``schedule()``
   at vllm-ascend's pinned vLLM release tag (read from
   ``.github/vllm-release-tag.commit`` -- the same file CI uses), modulo exactly
-  those 3 balance deltas plus the #47782 pair/triple unpack. Reading the tag
-  from the pin file means a pin advance
+  those six deltas. Reading the tag from the pin file means a pin advance
   auto-flips this guard to the new tag until the copy is re-synced.
 
 What is NOT guarded here (structurally unreachable without a real engine):
@@ -87,13 +86,13 @@ from vllm_ascend.patch.platform.patch_balance_schedule import (  # noqa: E402
 
 
 def _schedule_body_ast(source: str) -> str:
-    """Canonical AST dump of a ``schedule`` method body with the 4 maintained
+    """Canonical AST dump of a ``schedule`` method body with the 6 maintained
     deltas stripped, so the remainder can be compared verbatim against the
     pinned release tag's ``schedule()``. AST-based on purpose: it is blind to
     comments and whitespace, so the only differences that surface are real code
     drift (not the escape-quoting of a comment or reformatting).
 
-    The 4 deltas removed:
+    The 6 deltas removed:
       * delta 1 -- the disabled-path early return (``if not
         self._balance_enabled: ... super().schedule(...)``);
       * delta 2 -- the ``balance_flag`` gate (``max(t.item() for t in
@@ -105,6 +104,10 @@ def _schedule_body_ast(source: str) -> str:
       * delta 4 -- vLLM #47782 changed ``get_computed_blocks`` from a pair to
         a triple on main. The release assignment and the explicit dual-version
         unpack are both stripped before comparing the rest of the copy.
+      * delta 5 -- main resets the shared-prefix boundary after a v0.24
+        per-group hybrid lookup.
+      * delta 6 -- v0.24 and main use different Mamba split protocols; retain
+        the v0.24 branch for comparison with the pinned tag.
     """
     tree = ast.parse(textwrap.dedent(source))
 
@@ -126,6 +129,10 @@ def _schedule_body_ast(source: str) -> str:
             dump = ast.dump(node)
             if "vllm_version_is" in dump and "computed_result" in dump:
                 return None
+            if "vllm_version_is" in dump and "shared_prefix_boundary" in dump:
+                return None
+            if "vllm_version_is" in dump and "num_uncached_common_prefix_tokens" in dump:
+                return [self.visit(stmt) for stmt in node.body]
             return self.generic_visit(node)
 
     tree = _ProtocolDeltaNormalizer().visit(tree)
@@ -211,28 +218,15 @@ def _pinned_release_schedule_source() -> tuple[str, str] | None:
 
 
 def test_schedule_signature_covers_both_engine_versions():
-    """vllm-ascend CI runs against TWO vllm versions at once: the release tag
-    v0.23.0 (whose engine calls ``schedule()`` with no args) and the
-    main-verified commit 1f486d96 (whose engine calls
-    ``schedule(throttle_prefills)``). A single override signature must be
-    callable by BOTH engines, so it carries ``throttle_prefills`` with a
-    default -- a deliberate superset of v0.23.0's ``schedule(self)``.
-
-    Asserting exact equality with the *installed* signature would be wrong:
-    on the v0.23.0 lane the installed signature is ``schedule(self)`` while
-    ours is ``schedule(self, throttle_prefills=False)``, so an equality check
-    can only ever pass on ONE of the two lanes. Instead we assert the two
-    things that actually matter on both lanes:
-
-    * both engines' call shapes bind cleanly to our signature (callable); and
-    * our signature carries every parameter the installed ``schedule`` exposes
-      (so an upstream parameter addition is caught here regardless of lane)."""
+    """The v0.24.0 and verified-main engines both pass
+    ``throttle_prefills``. Keep the default for direct callers and ensure an
+    upstream parameter addition remains visible to this override."""
     sig = inspect.signature(BalanceScheduler.schedule)
     # The engine invokes schedule() on an instance, so ``self`` is implicitly
     # bound; strip it before simulating the engine's call shapes, otherwise
     # sig.bind() complains about the missing ``self`` argument.
     sig = sig.replace(parameters=[p for p in sig.parameters.values() if p.name != "self"])
-    # v0.23.0 engine call shape, then 1f486d96 engine call shape.
+    # Default direct call shape, then the engine call shape.
     sig.bind()
     sig.bind(throttle_prefills=True)
 
@@ -246,7 +240,7 @@ def test_schedule_signature_covers_both_engine_versions():
 
 
 # ---------------------------------------------------------------------------
-# 1b. the 4 maintained deltas remain present in schedule() (intent lock)
+# 1b. the 6 maintained deltas remain present in schedule() (intent lock)
 # ---------------------------------------------------------------------------
 
 
@@ -257,13 +251,9 @@ def test_balance_deltas_present_in_schedule():
     src = inspect.getsource(BalanceScheduler.schedule)
 
     # delta 1: disabled-path early return delegates to super().schedule().
-    # Whether throttle_prefills is forwarded is decided by signature
-    # introspection (_SUPER_SCHEDULE_HAS_THROTTLE), NOT a version string, so
-    # the disabled path works on BOTH the v0.23.0 and 1f486d96 CI lanes.
     assert "if not self._balance_enabled:" in src
-    assert "_SUPER_SCHEDULE_HAS_THROTTLE" in src
     assert "super().schedule(throttle_prefills)" in src
-    assert "super().schedule()" in src
+    assert "_SUPER_SCHEDULE_HAS_THROTTLE" not in src
 
     # delta 2: the balance_flag admission gate (leader-at-cap => global freeze).
     assert "max(t.item() for t in self.balance_queue)" in src
@@ -272,11 +262,13 @@ def test_balance_deltas_present_in_schedule():
     # delta 3: `if request_queue is None: break` replaces upstream's assert.
     assert "if request_queue is None:" in src
 
-    # delta 4: v0.23.0 returns a pair; main returns a triple carrying the
-    # request's shared-prefix retention boundary.
+    # deltas 4-6: v0.24 remains on the old pair/Mamba protocol while main
+    # carries a shared-prefix boundary in the newer protocol.
     assert "computed_result = self.kv_cache_manager.get_computed_blocks(request)" in src
-    assert 'vllm_version_is("0.23.0")' in src
+    assert 'vllm_version_is("0.24.0")' in src
+    assert 'vllm_version_is("0.23.0")' not in src
     assert "request.shared_prefix_boundary" in src
+    assert "num_uncached_common_prefix_tokens" in src
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +279,7 @@ def test_balance_deltas_present_in_schedule():
 def test_schedule_body_matches_pinned_release_tag():
     """The copied ``schedule()`` body must stay a verbatim copy of the
     ``schedule()`` at vllm-ascend's pinned vLLM release tag, modulo exactly the
-    4 maintained deltas.
+    6 maintained deltas.
 
     The tag is read dynamically from ``.github/vllm-release-tag.commit`` -- the
     same file CI uses to pick the tag, NOT a hardcoded string or a design doc
@@ -310,11 +302,12 @@ def test_schedule_body_matches_pinned_release_tag():
     theirs = _schedule_body_ast(pinned_src)
     assert ours == theirs, (
         f"BalanceScheduler.schedule body drifted from the pinned release tag "
-        f"({tag}) beyond the 3 balance deltas and #47782 compatibility "
-        f"delta. Re-sync the copy against "
+        f"({tag}) beyond the 3 balance deltas and 3 #47782 protocol bridges. "
+        f"Re-sync the copy against "
         f"{tag} and re-apply only: (1) disabled-path early return, "
         f"(2) balance_flag gate, (3) if request_queue is None: break, "
-        f"(4) #47782 pair/triple get_computed_blocks unpack."
+        f"(4) #47782 pair/triple get_computed_blocks unpack, "
+        f"(5) hybrid shared-prefix reset, (6) Mamba split protocol bridge."
     )
 
 
