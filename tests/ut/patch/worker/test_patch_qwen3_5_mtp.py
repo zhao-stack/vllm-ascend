@@ -5,9 +5,65 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
+from vllm.model_executor.models.qwen3_next import Qwen3NextAttention, Qwen3NextDecoderLayer
 from vllm.sequence import IntermediateTensors
 
+from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
 from vllm_ascend.patch.worker import patch_qwen3_5
+from vllm_ascend.utils import vllm_version_is
+
+
+def test_ascend_gdn_forward_uses_active_vllm_output_protocol():
+    hidden_states = torch.zeros(2, 3)
+    projected = torch.ones(2, 3)
+    forward_impl = MagicMock(return_value=projected)
+    layer = SimpleNamespace(_forward_ascend=forward_impl)
+
+    if vllm_version_is("0.23.0"):
+        output = torch.zeros(4, 3)
+        result = AscendGatedDeltaNetAttention.forward(layer, hidden_states, output)
+
+        assert result is None
+        assert torch.equal(output[:2], projected)
+        assert torch.equal(output[2:], torch.zeros(2, 3))
+    else:
+        result = AscendGatedDeltaNetAttention.forward(layer, hidden_states)
+
+        assert result is projected
+
+    forward_impl.assert_called_once_with(hidden_states)
+    if not patch_qwen3_5.is_310p():
+        assert patch_qwen3_5._GDN_PATCH_TARGET.forward is AscendGatedDeltaNetAttention.forward
+
+
+def test_ascend_qwen_attention_uses_active_vllm_output_protocol():
+    positions = torch.arange(2)
+    hidden_states = torch.zeros(2, 3)
+    projected = torch.ones(2, 3)
+    forward_impl = MagicMock(return_value=projected)
+    layer = SimpleNamespace(_forward_ascend=forward_impl)
+
+    if vllm_version_is("0.23.0"):
+        output = torch.zeros_like(projected)
+        result = patch_qwen3_5.AscendQwen3NextAttention.forward(layer, positions, output, hidden_states)
+
+        assert result is None
+        assert torch.equal(output, projected)
+    else:
+        result = patch_qwen3_5.AscendQwen3NextAttention.forward(layer, positions, hidden_states)
+
+        assert result is projected
+
+    forward_impl.assert_called_once_with(positions, hidden_states)
+    assert Qwen3NextAttention.forward is patch_qwen3_5.AscendQwen3NextAttention.forward
+
+
+def test_qwen3_5_decoder_patch_tracks_active_vllm_protocol():
+    if vllm_version_is("0.23.0"):
+        assert Qwen3_5DecoderLayer.forward is patch_qwen3_5.AscendQwen3_5DecoderLayer.forward
+    else:
+        assert Qwen3_5DecoderLayer.forward is Qwen3NextDecoderLayer.forward
 
 
 @pytest.mark.skipif(

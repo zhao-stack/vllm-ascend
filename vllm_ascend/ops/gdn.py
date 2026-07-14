@@ -34,6 +34,7 @@ from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
+from vllm_ascend.utils import vllm_version_is
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
@@ -64,11 +65,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return AscendGDNAttentionBackend
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
-    ):
+    def _forward_ascend(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with three parts:
         1. Input projection
@@ -142,7 +139,23 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        output, _ = self.out_proj(core_attn_out)
+        return output
+
+    if vllm_version_is("0.23.0"):
+
+        def forward(
+            self,
+            hidden_states: torch.Tensor,
+            output: torch.Tensor,
+        ) -> None:
+            projected = self._forward_ascend(hidden_states)
+            output[: projected.shape[0]] = projected
+
+    else:
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:  # type: ignore[misc]
+            return self._forward_ascend(hidden_states)
 
     def _forward_core(
         self,
