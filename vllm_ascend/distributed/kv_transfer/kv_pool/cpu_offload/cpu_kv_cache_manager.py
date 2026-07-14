@@ -86,6 +86,9 @@ class CPUKVCacheManager:
         self.req_to_block_hashes: defaultdict[str, list[BlockHash]] = defaultdict(list)
         # Record blocks touched in get_matched_num_and_touch().
         self.req_to_computed_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
+        # Preserve the exact hit length returned by newer managers. It can be
+        # finer-grained than len(blocks) * block_size.
+        self.req_to_num_computed_tokens: defaultdict[str, int] = defaultdict(int)
         # Record the request that failed to allocate.
         self.req_failed_to_allocate: defaultdict[str, bool] = defaultdict(bool)
         self.req_to_num_tokens: defaultdict[str, int] = defaultdict(int)
@@ -106,7 +109,7 @@ class CPUKVCacheManager:
             self.req_to_block_hashes[request_id] = block_hashes
         max_cache_hit_length = request.num_tokens - 1
         eagle_kwarg = {"drop_eagle_block": self.use_eagle}
-        computed_blocks = self.single_type_manager.find_longest_cache_hit(
+        hit_result = self.single_type_manager.find_longest_cache_hit(
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
@@ -115,8 +118,13 @@ class CPUKVCacheManager:
             **eagle_kwarg,
             alignment_tokens=self.block_size,
         )
-        num_computed_tokens = len(computed_blocks[0]) * self.block_size
+        if vllm_version_is("0.23.0"):
+            computed_blocks = hit_result
+            num_computed_tokens = len(computed_blocks[0]) * self.block_size
+        else:
+            computed_blocks, num_computed_tokens = hit_result
         self.req_to_computed_blocks[request_id] = computed_blocks[0]
+        self.req_to_num_computed_tokens[request_id] = num_computed_tokens
         # We should touch these blocks in the concurrent scenarios.
         self.block_pool.touch(computed_blocks)
 
@@ -133,6 +141,7 @@ class CPUKVCacheManager:
         if computed_blocks:
             self.single_type_manager.block_pool.free_blocks(reversed(computed_blocks))
             self.req_to_computed_blocks.pop(request_id, None)
+        self.req_to_num_computed_tokens.pop(request_id, None)
 
     def allocate_slots(self, req_to_num_tokens: dict[str, int], unallocated_req_ids: set[str]) -> dict[str, list[int]]:
         for request_id in unallocated_req_ids:
@@ -142,26 +151,45 @@ class CPUKVCacheManager:
             if self.req_failed_to_allocate[request_id]:
                 continue
             new_computed_blocks = self.req_to_computed_blocks[request_id]
-            num_local_computed_tokens = len(new_computed_blocks) * self.block_size
-            num_blocks_to_allocate = self.single_type_manager.get_num_blocks_to_allocate(
-                request_id=request_id,
-                num_tokens=num_tokens,
-                new_computed_blocks=new_computed_blocks,
-                total_computed_tokens=num_local_computed_tokens,
-                num_tokens_main_model=num_tokens,
-            )
+            if vllm_version_is("0.23.0"):
+                num_local_computed_tokens = len(new_computed_blocks) * self.block_size
+                num_blocks_to_allocate = self.single_type_manager.get_num_blocks_to_allocate(
+                    request_id,
+                    num_tokens,
+                    new_computed_blocks,
+                    num_local_computed_tokens,
+                    num_tokens,
+                )
+            else:
+                num_local_computed_tokens = self.req_to_num_computed_tokens[request_id]
+                num_blocks_to_allocate = self.single_type_manager.get_num_blocks_to_allocate(
+                    request_id=request_id,
+                    num_tokens=num_tokens,
+                    new_computed_blocks=new_computed_blocks,
+                    total_computed_tokens=num_local_computed_tokens,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_tokens_main_model=num_tokens,
+                )
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 self._release_ahead_touch(request_id)
                 self.req_failed_to_allocate[request_id] = True
                 continue
             # Append the new computed blocks to the request blocks until now to
             # avoid the case where the new blocks cannot be allocated.
-            self.single_type_manager.allocate_new_computed_blocks(
-                request_id,
-                new_computed_blocks,
-                num_local_computed_tokens=num_local_computed_tokens,
-                num_external_computed_tokens=0,
-            )
+            if vllm_version_is("0.23.0"):
+                self.single_type_manager.allocate_new_computed_blocks(
+                    request_id,
+                    new_computed_blocks,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=0,
+                )
+            else:
+                self.single_type_manager.add_local_computed_blocks(
+                    request_id,
+                    new_computed_blocks,
+                    num_local_computed_tokens=num_local_computed_tokens,
+                    num_external_computed_tokens=0,
+                )
             # Allocate new blocks but do not cache now.
             new_blocks = self.single_type_manager.allocate_new_blocks(
                 request_id,
@@ -171,6 +199,7 @@ class CPUKVCacheManager:
             self.req_to_num_tokens[request_id] = num_tokens
             # No need to release ref_cnt because we use officially.
             self.req_to_computed_blocks.pop(request_id, None)
+            self.req_to_num_computed_tokens.pop(request_id, None)
             req_to_new_blocks[request_id] = [block.block_id for block in new_computed_blocks + new_blocks]
         return req_to_new_blocks
 
@@ -199,5 +228,6 @@ class CPUKVCacheManager:
         self.single_type_manager.free(request_id)
         self.req_to_block_hashes.pop(request_id, None)
         self.req_to_computed_blocks.pop(request_id, None)
+        self.req_to_num_computed_tokens.pop(request_id, None)
         self.req_failed_to_allocate.pop(request_id, None)
         self.req_to_num_tokens.pop(request_id, None)

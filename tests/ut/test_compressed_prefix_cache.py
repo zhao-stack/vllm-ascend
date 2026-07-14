@@ -22,6 +22,7 @@ from vllm.v1.request import Request
 
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import AscendHybridKVCacheCoordinator
+from vllm_ascend.utils import vllm_version_is
 
 pytestmark = pytest.mark.cpu_test
 
@@ -70,6 +71,13 @@ def _make_compress_manager(
     return spec, block_pool, manager
 
 
+def _get_hit_blocks(hit_result):
+    if vllm_version_is("0.23.0"):
+        return hit_result
+    hit_blocks, _ = hit_result
+    return hit_blocks
+
+
 def test_compressed_prefix_cache_uses_logical_block_hash() -> None:
     block_size = 128
     compress_ratio = 4
@@ -98,14 +106,16 @@ def test_compressed_prefix_cache_uses_logical_block_hash() -> None:
     )[0]
     assert cached_hash == expected_hash
 
-    hit_blocks = CompressAttentionManager.find_longest_cache_hit(
-        block_hashes=request_b.block_hashes,
-        max_length=logical_block_size,
-        kv_cache_group_ids=[0],
-        block_pool=block_pool,
-        kv_cache_spec=spec,
-        drop_eagle_block=False,
-        alignment_tokens=logical_block_size,
+    hit_blocks = _get_hit_blocks(
+        CompressAttentionManager.find_longest_cache_hit(
+            block_hashes=request_b.block_hashes,
+            max_length=logical_block_size,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=False,
+            alignment_tokens=logical_block_size,
+        )
     )[0]
 
     assert hit_blocks == []
@@ -125,14 +135,16 @@ def test_compressed_prefix_cache_hits_identical_logical_block() -> None:
     )
     manager.cache_blocks(request, num_tokens=logical_block_size)
 
-    hit_blocks = CompressAttentionManager.find_longest_cache_hit(
-        block_hashes=request.block_hashes,
-        max_length=logical_block_size,
-        kv_cache_group_ids=[0],
-        block_pool=block_pool,
-        kv_cache_spec=spec,
-        drop_eagle_block=False,
-        alignment_tokens=logical_block_size,
+    hit_blocks = _get_hit_blocks(
+        CompressAttentionManager.find_longest_cache_hit(
+            block_hashes=request.block_hashes,
+            max_length=logical_block_size,
+            kv_cache_group_ids=[0],
+            block_pool=block_pool,
+            kv_cache_spec=spec,
+            drop_eagle_block=False,
+            alignment_tokens=logical_block_size,
+        )
     )[0]
 
     assert hit_blocks == manager.req_to_blocks[request.request_id]

@@ -103,6 +103,7 @@ if _MOCK_VLLM_DEPS:
     for _mod_name in _vllm_mock_modules:
         if _mod_name not in sys.modules:
             sys.modules[_mod_name] = MagicMock()
+    sys.modules["vllm"].__version__ = os.getenv("VLLM_VERSION", "0.23.0")  # type: ignore[attr-defined]
 
 if _MOCK_VLLM_DEPS:
     sys.modules["vllm.utils.math_utils"].cdiv = lambda a, b: -(-a // b)  # type: ignore[attr-defined]
@@ -274,6 +275,12 @@ class _FakeSingleTypeKVCacheManager:
         pcp_world_size=1,
     ):
         computed: tuple[list[object], ...] = tuple([] for _ in kv_cache_group_ids)
+        if os.getenv("VLLM_VERSION", "0.23.0") != "0.23.0" and kv_cache_spec.block_size != block_pool.hash_block_size:
+            scale_factor = kv_cache_spec.block_size // block_pool.hash_block_size
+            block_hashes = [
+                block_hashes[index + scale_factor - 1]
+                for index in range(0, len(block_hashes) // scale_factor * scale_factor, scale_factor)
+            ]
         max_blocks = max_length // kv_cache_spec.block_size
         for block_hash in list(block_hashes)[:max_blocks]:
             cached = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
@@ -284,7 +291,9 @@ class _FakeSingleTypeKVCacheManager:
         if drop_eagle_block and computed and computed[0]:
             for blocks in computed:
                 blocks.pop()
-        return computed
+        if os.getenv("VLLM_VERSION", "0.23.0") == "0.23.0":
+            return computed
+        return computed, len(computed[0]) * kv_cache_spec.block_size
 
 
 class _FakeSlidingWindowManager(_FakeSingleTypeKVCacheManager):
@@ -427,4 +436,5 @@ if "vllm_ascend.utils" not in sys.modules or not hasattr(sys.modules["vllm_ascen
     _ascend_utils = MagicMock()
     _ascend_utils.AscendDeviceType = MagicMock()
     _ascend_utils.get_ascend_device_type = MagicMock()
+    _ascend_utils.vllm_version_is = lambda target: os.getenv("VLLM_VERSION", "0.23.0") == target
     sys.modules["vllm_ascend.utils"] = _ascend_utils

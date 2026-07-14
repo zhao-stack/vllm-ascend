@@ -51,6 +51,7 @@ from vllm_ascend.distributed.utils import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
 )
+from vllm_ascend.utils import vllm_version_is
 
 backend_map = {
     "mooncake": {
@@ -117,7 +118,11 @@ class KVPoolWorker:
         self.original_block_size = self._infer_group_block_sizes(vllm_config, kv_cache_config)
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
-        requested_hash_block_size = vllm_config.cache_config.hash_block_size
+        requested_hash_block_size = (
+            vllm_config.cache_config.hash_block_size
+            if vllm_version_is("0.23.0")
+            else vllm_config.cache_config.prefix_match_unit
+        )
         if not isinstance(requested_hash_block_size, int):
             requested_hash_block_size = None
         self.hash_block_size = (
@@ -1352,7 +1357,7 @@ class KVPoolWorker:
         _, hit_length = self.cache_coordinator.find_longest_cache_hit(
             block_hashes,
             token_len,
-            ExternalCachedBlockPool(exists),
+            ExternalCachedBlockPool(self.hash_block_size, exists),
             apply_eagle=False,
         )
         logger.debug(

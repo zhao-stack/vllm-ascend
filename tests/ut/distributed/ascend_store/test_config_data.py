@@ -32,6 +32,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     RequestTracker,
     get_block_hashes,
 )
+from vllm_ascend.utils import vllm_version_is
 
 _GROUPED_BLOCK_HASH_DOMAIN = b"vllm-ascend-grouped-block-hash-v1\0"
 _GROUPED_BLOCK_HASH_LENGTH_PREFIX_BYTES = 4
@@ -177,15 +178,19 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         result = list(self.db.process_tokens(32, hashes))
         self.assertEqual(len(result), 2)
 
-    def test_process_tokens_rehashes_grouped_hashes(self):
+    def test_process_tokens_uses_versioned_group_hashes(self):
         db = ChunkedTokenDatabase([self.meta], block_size=[16], partitions=None, hash_block_size=8)
         result = list(db.process_tokens(32, ["a", "b", "c", "d"]))
         self.assertEqual(len(result), 2)
-        self.assertEqual(result[0][2].chunk_hash, _expected_grouped_hash("a", "b").hex())
-        self.assertEqual(len(result[0][2].chunk_hash), 64)
+        expected = _expected_grouped_hash("a", "b").hex() if vllm_version_is("0.23.0") else "b"
+        self.assertEqual(result[0][2].chunk_hash, expected)
 
-    def test_get_block_hashes_rehashes_grouped_str_hashes(self):
+    def test_get_block_hashes_uses_versioned_str_hash_protocol(self):
         result = get_block_hashes(["a", "b", "c", "d"], group_block_size=32, hash_block_size=16)
+        if not vllm_version_is("0.23.0"):
+            self.assertEqual(result, ["b", "d"])
+            self.assertNotEqual(result[0], _expected_grouped_hash("a", "b"))
+            return
         self.assertEqual(
             result,
             [
@@ -194,8 +199,12 @@ class TestChunkedTokenDatabase(unittest.TestCase):
             ],
         )
 
-    def test_get_block_hashes_rehashes_grouped_bytes_hashes(self):
+    def test_get_block_hashes_uses_versioned_bytes_hash_protocol(self):
         result = get_block_hashes([b"a", b"b", b"c", b"d"], group_block_size=32, hash_block_size=16)
+        if not vllm_version_is("0.23.0"):
+            self.assertEqual(result, [b"b", b"d"])
+            self.assertNotEqual(result[0], _expected_grouped_hash(b"a", b"b"))
+            return
         self.assertEqual(
             result,
             [
