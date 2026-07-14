@@ -21,7 +21,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
-from typing import cast
+from typing import Any, cast
 
 from vllm.config import SchedulerConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
@@ -890,6 +890,36 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
+    def _free_request_transfer_params(self, request: Request) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        transfer_params = self._free_request(request)
+        if vllm_version_is("0.23.0"):
+            return cast(dict[str, Any] | None, transfer_params), None
+        return cast(
+            tuple[dict[str, Any] | None, dict[str, Any] | None],
+            transfer_params,
+        )
+
+    @staticmethod
+    def _make_engine_core_output(
+        *,
+        request_id: str,
+        new_token_ids: list[int],
+        ec_transfer_params: dict[str, Any] | None,
+        **kwargs: Any,
+    ) -> EngineCoreOutput:
+        if vllm_version_is("0.23.0"):
+            return EngineCoreOutput(
+                request_id=request_id,
+                new_token_ids=new_token_ids,
+                **kwargs,
+            )
+        return EngineCoreOutput(
+            request_id=request_id,
+            new_token_ids=new_token_ids,
+            ec_transfer_params=ec_transfer_params,
+            **kwargs,
+        )
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1014,6 +1044,7 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             kv_transfer_params = None
+            ec_transfer_params = None
             status_before_stop = request.status
             num_output_tokens_before = len(request._output_token_ids)
 
@@ -1073,7 +1104,7 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if finished:
-                    kv_transfer_params = self._free_request(request)
+                    kv_transfer_params, ec_transfer_params = self._free_request_transfer_params(request)
 
                 if status_before_stop == RequestStatus.RUNNING:
                     stopped_running_reqs.add(request)
@@ -1089,25 +1120,25 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+            if new_token_ids or pooler_output is not None or kv_transfer_params or ec_transfer_params or stopped:
                 # Add EngineCoreOutput for this Request.
-                outputs[request.client_index].append(
-                    EngineCoreOutput(
-                        request_id=req_id,
-                        new_token_ids=new_token_ids,
-                        finish_reason=finish_reason,
-                        new_logprobs=new_logprobs,
-                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
-                        stop_reason=request.stop_reason,
-                        events=request.take_events(),
-                        prefill_stats=request.take_prefill_stats(),
-                        kv_transfer_params=kv_transfer_params,
-                        trace_headers=request.trace_headers,
-                        routed_experts=routed_experts,
-                        num_nans_in_logits=request.num_nans_in_logits,
-                    )
+                engine_core_output = self._make_engine_core_output(
+                    request_id=req_id,
+                    new_token_ids=new_token_ids,
+                    finish_reason=finish_reason,
+                    new_logprobs=new_logprobs,
+                    new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                    pooling_output=pooler_output,
+                    stop_reason=request.stop_reason,
+                    events=request.take_events(),
+                    prefill_stats=request.take_prefill_stats(),
+                    kv_transfer_params=kv_transfer_params,
+                    ec_transfer_params=ec_transfer_params,
+                    trace_headers=request.trace_headers,
+                    routed_experts=routed_experts,
+                    num_nans_in_logits=request.num_nans_in_logits,
                 )
+                outputs[request.client_index].append(engine_core_output)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
