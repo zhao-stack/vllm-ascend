@@ -21,6 +21,7 @@ from __future__ import annotations
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
+from typing import cast
 
 from vllm.config import SchedulerConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import ECConnectorMetadata
@@ -52,6 +53,7 @@ from vllm.v1.utils import ConstantList, record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.short_request_first_scheduler import ShortRequestFirstSchedulerMixin
+from vllm_ascend.utils import vllm_version_is
 
 
 @dataclass
@@ -542,6 +544,10 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                             )
                         )
                         new_computed_blocks = self.kv_cache_manager.create_kv_cache_blocks(computed_blocks)
+                        if not vllm_version_is("0.23.0"):
+                            # Per-group lookup does not detect an uncached shared
+                            # prefix, so there is no junction to pin.
+                            request.shared_prefix_boundary = 0
                         if self.kv_cache_manager.log_stats:
                             assert self.kv_cache_manager.prefix_cache_stats is not None
                             self.kv_cache_manager.prefix_cache_stats.record(
@@ -550,9 +556,17 @@ class RecomputeScheduler(ShortRequestFirstSchedulerMixin, Scheduler):
                                 preempted=request.num_preemptions > 0,
                             )
                     else:
-                        new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(
-                            request
-                        )
+                        computed_result = self.kv_cache_manager.get_computed_blocks(request)
+                        if vllm_version_is("0.23.0"):
+                            new_computed_blocks, num_new_local_computed_tokens = cast(
+                                tuple[KVCacheBlocks, int], computed_result
+                            )
+                        else:
+                            (
+                                new_computed_blocks,
+                                num_new_local_computed_tokens,
+                                request.shared_prefix_boundary,
+                            ) = cast(tuple[KVCacheBlocks, int, int], computed_result)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:

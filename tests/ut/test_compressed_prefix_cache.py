@@ -201,10 +201,15 @@ def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
         )
         manager.cache_blocks(request_a, num_tokens=logical_block_size)
 
-    hit_blocks, hit_length = coordinator.find_longest_cache_hit(
+    hit_result = coordinator.find_longest_cache_hit(
         request_b.block_hashes,
         max_cache_hit_length=logical_block_size,
     )
+    if vllm_version_is("0.23.0"):
+        hit_blocks, hit_length = hit_result
+    else:
+        hit_blocks, hit_length, num_uncached = hit_result
+        assert num_uncached == block_size
 
     assert hit_length == 0
     assert hit_blocks == ([], [])

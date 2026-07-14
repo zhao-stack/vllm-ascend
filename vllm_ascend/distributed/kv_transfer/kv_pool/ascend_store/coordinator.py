@@ -4,7 +4,6 @@ from dataclasses import replace
 from importlib import import_module
 from typing import Any, cast
 
-from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import BlockHash, BlockHashList, KVCacheBlock
@@ -388,26 +387,33 @@ def _find_longest_cache_hit(
 
 def _reachable_block_mask(
     manager_cls: type[SingleTypeKVCacheManager],
-    **kwargs: Any,
+    *,
+    start_block: int,
+    end_block: int,
+    alignment_tokens: int,
+    kv_cache_spec: KVCacheSpec,
+    use_eagle: bool,
+    retention_interval: int | None,
+    num_prompt_tokens: int | None,
 ) -> list[bool] | None:
-    reachable_block_mask = getattr(manager_cls, "reachable_block_mask", None)
-    if reachable_block_mask is None:
-        return None
-    try:
-        return reachable_block_mask(**kwargs)
-    except TypeError as exc:
-        if "retention_interval" not in str(exc) and "num_prompt_tokens" not in str(exc):
-            logger.debug("KV cache manager does not support reachable_block_mask kwargs: %s", exc)
-            return reachable_block_mask(
-                start_block=kwargs["start_block"],
-                end_block=kwargs["end_block"],
-                alignment_tokens=kwargs["alignment_tokens"],
-                kv_cache_spec=kwargs["kv_cache_spec"],
-                use_eagle=kwargs["use_eagle"],
-            )
-        kwargs.pop("retention_interval", None)
-        kwargs.pop("num_prompt_tokens", None)
-        return reachable_block_mask(**kwargs)
+    common_kwargs = dict(
+        start_block=start_block,
+        end_block=end_block,
+        alignment_tokens=alignment_tokens,
+        kv_cache_spec=kv_cache_spec,
+        use_eagle=use_eagle,
+        retention_interval=retention_interval,
+    )
+    if vllm_version_is("0.23.0"):
+        return manager_cls.reachable_block_mask(
+            **common_kwargs,
+            num_prompt_tokens=num_prompt_tokens,
+        )
+    reachable_boundaries = () if num_prompt_tokens is None else (num_prompt_tokens - 1,)
+    return manager_cls.reachable_block_mask(
+        **common_kwargs,
+        reachable_boundaries=reachable_boundaries,
+    )
 
 
 def _cache_family_granularity(block_size: int, cache_family: str | None) -> int:

@@ -16,6 +16,7 @@
 #
 import os
 import time
+from typing import cast
 
 import pandas as pd
 from vllm.config import VllmConfig
@@ -30,6 +31,8 @@ from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
+
+from vllm_ascend.utils import vllm_version_is
 
 
 class BudgetRefiner:
@@ -358,9 +361,17 @@ class SchedulerDynamicBatch(Scheduler):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(
-                        request
-                    )
+                    computed_result = self.kv_cache_manager.get_computed_blocks(request)
+                    if vllm_version_is("0.23.0"):
+                        new_computed_blocks, num_new_local_computed_tokens = cast(
+                            tuple[KVCacheBlocks, int], computed_result
+                        )
+                    else:
+                        (
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            request.shared_prefix_boundary,
+                        ) = cast(tuple[KVCacheBlocks, int, int], computed_result)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:

@@ -30,6 +30,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     _ascend_resolve_kv_cache_block_sizes,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
+from vllm_ascend.utils import vllm_version_is
 
 
 def _make_hybrid_kv_cache_config(
@@ -448,15 +449,26 @@ def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:
     )
     alignment_tokens = 4096  # lcm_block_size
 
-    mask = SlidingWindowManager.reachable_block_mask(
-        start_block=0,
-        end_block=256,  # 256 × 32 = 8192 tokens (2 × alignment_tokens)
-        alignment_tokens=alignment_tokens,
-        kv_cache_spec=spec,
-        use_eagle=False,
-        retention_interval=None,
-        num_prompt_tokens=None,
-    )
+    if vllm_version_is("0.23.0"):
+        mask = SlidingWindowManager.reachable_block_mask(
+            start_block=0,
+            end_block=256,  # 256 × 32 = 8192 tokens (2 × alignment_tokens)
+            alignment_tokens=alignment_tokens,
+            kv_cache_spec=spec,
+            use_eagle=False,
+            retention_interval=None,
+            num_prompt_tokens=None,
+        )
+    else:
+        mask = SlidingWindowManager.reachable_block_mask(
+            start_block=0,
+            end_block=256,
+            alignment_tokens=alignment_tokens,
+            kv_cache_spec=spec,
+            use_eagle=False,
+            retention_interval=None,
+            reachable_boundaries=(),
+        )
 
     # Must produce a sparse mask, not None.
     assert mask is not None, "should produce sparse mask with lcm alignment"

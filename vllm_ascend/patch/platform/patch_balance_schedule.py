@@ -11,12 +11,14 @@ there is no leader. See ``docs/.../balance_schedule_refactor.md`` for the
 design.
 
 The ``schedule()`` body is a verbatim copy of the **v0.23.0** release tag's
-``Scheduler.schedule()`` (the production pin), plus exactly three balance
+``Scheduler.schedule()`` (the production pin), plus exactly four maintained
 deltas: (1) the disabled-path early return that delegates to ``super()``,
 (2) the ``balance_flag`` break inside the WAITING loop
 (``any-rank-at-cap => global freeze``), and (3) ``if request_queue is None:
 break`` in place of upstream's ``assert request_queue is not None`` (so a
-drained-rank schedule does not assert when balance defers admission).
+drained-rank schedule does not assert when balance defers admission), plus
+(4) the explicit v0.23.0 pair / main triple unpack for
+``get_computed_blocks`` introduced by vLLM #47782.
 
 The **signature**, in contrast, must work across BOTH vllm versions that
 vllm-ascend CI runs simultaneously: the release tag v0.23.0 (whose engine
@@ -71,6 +73,7 @@ touch configs that don't use it, e.g. PD-disaggregated recompute).
 
 import inspect
 import time
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -90,6 +93,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+
+from vllm_ascend.utils import vllm_version_is
 
 # Whether the *installed* upstream ``Scheduler.schedule`` accepts the
 # ``throttle_prefills`` argument. vllm-ascend CI runs against TWO vllm
@@ -448,9 +453,17 @@ class BalanceScheduler(Scheduler):
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
-                    new_computed_blocks, num_new_local_computed_tokens = self.kv_cache_manager.get_computed_blocks(
-                        request
-                    )
+                    computed_result = self.kv_cache_manager.get_computed_blocks(request)
+                    if vllm_version_is("0.23.0"):
+                        new_computed_blocks, num_new_local_computed_tokens = cast(
+                            tuple[KVCacheBlocks, int], computed_result
+                        )
+                    else:
+                        (
+                            new_computed_blocks,
+                            num_new_local_computed_tokens,
+                            request.shared_prefix_boundary,
+                        ) = cast(tuple[KVCacheBlocks, int, int], computed_result)
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:

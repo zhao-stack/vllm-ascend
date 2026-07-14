@@ -22,11 +22,13 @@ What is guarded here (everything reachable from CPU UT):
 * the module-level class swaps actually took effect;
 * the upstream Scheduler/DPEngineCoreProc methods the patch calls/super-calls
   still exist;
-* the 3 balance deltas remain present in ``schedule()`` (intent lock);
+* the 3 balance deltas and #47782 compatibility delta remain present in
+  ``schedule()`` (intent lock);
 * the copied ``schedule()`` body stays a verbatim copy of the ``schedule()``
   at vllm-ascend's pinned vLLM release tag (read from
   ``.github/vllm-release-tag.commit`` -- the same file CI uses), modulo exactly
-  those 3 deltas. Reading the tag from the pin file means a pin advance
+  those 3 balance deltas plus the #47782 pair/triple unpack. Reading the tag
+  from the pin file means a pin advance
   auto-flips this guard to the new tag until the copy is re-synced.
 
 What is NOT guarded here (structurally unreachable without a real engine):
@@ -85,13 +87,13 @@ from vllm_ascend.patch.platform.patch_balance_schedule import (  # noqa: E402
 
 
 def _schedule_body_ast(source: str) -> str:
-    """Canonical AST dump of a ``schedule`` method body with the 3 balance
+    """Canonical AST dump of a ``schedule`` method body with the 4 maintained
     deltas stripped, so the remainder can be compared verbatim against the
     pinned release tag's ``schedule()``. AST-based on purpose: it is blind to
     comments and whitespace, so the only differences that surface are real code
     drift (not the escape-quoting of a comment or reformatting).
 
-    The 3 deltas removed:
+    The 4 deltas removed:
       * delta 1 -- the disabled-path early return (``if not
         self._balance_enabled: ... super().schedule(...)``);
       * delta 2 -- the ``balance_flag`` gate (``max(t.item() for t in
@@ -100,8 +102,34 @@ def _schedule_body_ast(source: str) -> str:
         copy as ``if request_queue is None: break`` and in upstream as
         ``assert request_queue is not None``. Both are stripped so the two
         bodies align.
+      * delta 4 -- vLLM #47782 changed ``get_computed_blocks`` from a pair to
+        a triple on main. The release assignment and the explicit dual-version
+        unpack are both stripped before comparing the rest of the copy.
     """
     tree = ast.parse(textwrap.dedent(source))
+
+    class _ProtocolDeltaNormalizer(ast.NodeTransformer):
+        @staticmethod
+        def _is_get_computed_blocks_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get_computed_blocks"
+            )
+
+        def visit_Assign(self, node: ast.Assign):
+            if self._is_get_computed_blocks_call(node.value):
+                return None
+            return self.generic_visit(node)
+
+        def visit_If(self, node: ast.If):
+            dump = ast.dump(node)
+            if "vllm_version_is" in dump and "computed_result" in dump:
+                return None
+            return self.generic_visit(node)
+
+    tree = _ProtocolDeltaNormalizer().visit(tree)
+    ast.fix_missing_locations(tree)
     func = next(
         (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "schedule"),
         None,
@@ -218,13 +246,13 @@ def test_schedule_signature_covers_both_engine_versions():
 
 
 # ---------------------------------------------------------------------------
-# 1b. the 3 balance deltas remain present in schedule() (intent lock)
+# 1b. the 4 maintained deltas remain present in schedule() (intent lock)
 # ---------------------------------------------------------------------------
 
 
 def test_balance_deltas_present_in_schedule():
     """The whole point of copying schedule() is to inject the balance logic.
-    If a future re-sync against the pinned tag drops any of the 3 deltas,
+    If a future re-sync against the pinned tag drops any maintained delta,
     balance silently stops working -- this locks their presence in the source."""
     src = inspect.getsource(BalanceScheduler.schedule)
 
@@ -244,6 +272,12 @@ def test_balance_deltas_present_in_schedule():
     # delta 3: `if request_queue is None: break` replaces upstream's assert.
     assert "if request_queue is None:" in src
 
+    # delta 4: v0.23.0 returns a pair; main returns a triple carrying the
+    # request's shared-prefix retention boundary.
+    assert "computed_result = self.kv_cache_manager.get_computed_blocks(request)" in src
+    assert 'vllm_version_is("0.23.0")' in src
+    assert "request.shared_prefix_boundary" in src
+
 
 # ---------------------------------------------------------------------------
 # 1c. copied schedule() body stays verbatim with the pinned release tag
@@ -253,7 +287,7 @@ def test_balance_deltas_present_in_schedule():
 def test_schedule_body_matches_pinned_release_tag():
     """The copied ``schedule()`` body must stay a verbatim copy of the
     ``schedule()`` at vllm-ascend's pinned vLLM release tag, modulo exactly the
-    3 balance deltas.
+    4 maintained deltas.
 
     The tag is read dynamically from ``.github/vllm-release-tag.commit`` -- the
     same file CI uses to pick the tag, NOT a hardcoded string or a design doc
@@ -276,9 +310,11 @@ def test_schedule_body_matches_pinned_release_tag():
     theirs = _schedule_body_ast(pinned_src)
     assert ours == theirs, (
         f"BalanceScheduler.schedule body drifted from the pinned release tag "
-        f"({tag}) beyond the 3 balance deltas. Re-sync the copy against "
+        f"({tag}) beyond the 3 balance deltas and #47782 compatibility "
+        f"delta. Re-sync the copy against "
         f"{tag} and re-apply only: (1) disabled-path early return, "
-        f"(2) balance_flag gate, (3) if request_queue is None: break."
+        f"(2) balance_flag gate, (3) if request_queue is None: break, "
+        f"(4) #47782 pair/triple get_computed_blocks unpack."
     )
 
 

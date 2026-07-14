@@ -282,7 +282,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
 
@@ -405,10 +405,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
                     del blks[num_blocks:]
                     hit_length_by_group[group_id] = hit_length
 
-        if not vllm_version_is("0.23.0"):
-            self.num_uncached_common_prefix_tokens = longest_hit_length - hit_length
-
-        return tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group), hit_length
+        cache_hit_blocks = tuple(blocks if blocks is not None else [] for blocks in hit_blocks_by_group)
+        if vllm_version_is("0.23.0"):
+            return cache_hit_blocks, hit_length
+        return cache_hit_blocks, hit_length, longest_hit_length - hit_length
 
     def find_longest_cache_hit_per_group(
         self,
