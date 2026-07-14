@@ -87,7 +87,7 @@ def test_v023_restores_aliases_after_import_error(monkeypatch):
         assert sys.modules.get(module_name) is previous_module
 
 
-def test_installer_runs_v023_backports_in_order(monkeypatch):
+def test_installer_runs_release_backports_in_order(monkeypatch):
     hunyuan_vision = object()
     calls: list[Any] = []
 
@@ -105,7 +105,7 @@ def test_installer_runs_v023_backports_in_order(monkeypatch):
     def patch_loader(module: Any) -> None:
         calls.append(("loader", module))
 
-    monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.23.0")
+    monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.24.0")
     monkeypatch.setattr(
         compat,
         "_import_v023_hunyuan_vision",
@@ -374,7 +374,7 @@ def test_installer_preserves_native_prompt_update_protocol(monkeypatch):
     hunyuan_vision = SimpleNamespace(
         HunYuanVLMultiModalProcessor=FakeMultiModalProcessor,
     )
-    monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.23.0")
+    monkeypatch.setattr(compat, "vllm_version_is", lambda version: version == "0.24.0")
     monkeypatch.setattr(
         compat,
         "_import_v023_hunyuan_vision",
