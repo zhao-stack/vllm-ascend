@@ -136,7 +136,8 @@ def test_installer_runs_v023_backports_in_order(monkeypatch):
     ]
 
 
-def test_installer_cleans_main_registry_before_model_patch(monkeypatch):
+@pytest.mark.parametrize("removed_stale_entry", [True, False])
+def test_installer_patches_main_loader_after_registry_cleanup(monkeypatch, removed_stale_entry):
     import vllm.model_executor.models as vllm_models
 
     def native_get_prompt_updates(*_args: Any, **_kwargs: Any) -> str:
@@ -152,7 +153,7 @@ def test_installer_cleans_main_registry_before_model_patch(monkeypatch):
 
     def clean_registry() -> bool:
         calls.append("registry")
-        return True
+        return removed_stale_entry
 
     def patch_loader(module: Any) -> None:
         calls.append(("loader", module))
