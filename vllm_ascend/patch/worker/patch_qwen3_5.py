@@ -222,6 +222,7 @@ if Qwen3_5MultiTokenPredictor is not None:
 
 if vllm_version_is("0.23.0"):
     Qwen3_5DecoderLayer.forward = AscendQwen3_5DecoderLayer.forward
+Qwen3NextAttention._forward_ascend = AscendQwen3NextAttention._forward_ascend
 Qwen3NextAttention.forward = AscendQwen3NextAttention.forward
 _GDN_PATCH_TARGET._split_ba_for_tp = AscendGatedDeltaNetAttention._split_ba_for_tp
 _GDN_PATCH_TARGET.get_state_shape = AscendGatedDeltaNetAttention.get_state_shape

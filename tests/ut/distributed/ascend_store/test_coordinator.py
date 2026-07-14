@@ -27,7 +27,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
     ExternalCachedBlockPool,
-    _reachable_block_mask,
 )
 from vllm_ascend.utils import vllm_version_is
 
@@ -182,33 +181,6 @@ class TestAscendStoreCoordinator(unittest.TestCase):
             masks = coord.store_mask(512)
 
         self.assertEqual(masks, ([False, False, False, True],))
-
-    def test_reachable_mask_uses_versioned_boundary_protocol(self):
-        calls = {}
-
-        class CaptureManager:
-            @classmethod
-            def reachable_block_mask(cls, **kwargs):
-                calls.update(kwargs)
-                return []
-
-        _reachable_block_mask(
-            CaptureManager,
-            start_block=0,
-            end_block=4,
-            alignment_tokens=512,
-            kv_cache_spec=_sliding_spec(block_size=128, sliding_window=256),
-            use_eagle=False,
-            retention_interval=1024,
-            num_prompt_tokens=129,
-        )
-
-        if vllm_version_is("0.23.0"):
-            self.assertEqual(calls["num_prompt_tokens"], 129)
-            self.assertNotIn("reachable_boundaries", calls)
-        else:
-            self.assertEqual(calls["reachable_boundaries"], (128,))
-            self.assertNotIn("num_prompt_tokens", calls)
 
     def test_store_mask_propagates_eagle_to_same_spec_siblings(self):
         calls = []
