@@ -2211,6 +2211,60 @@ setattr(Target, selected_name, replacement)
     assert not findings
 
 
+def test_direct_member_hasattr_does_not_require_complete_external_mro(
+    tmp_path: Path,
+) -> None:
+    vllm_root = tmp_path / "vllm-repo"
+    ascend_root = tmp_path / "ascend-repo"
+    _write(vllm_root, "vllm/__init__.py", "")
+    _write(
+        vllm_root,
+        "vllm/base.py",
+        """
+from external_package import ExternalBase
+
+
+class Target(ExternalBase):
+    def run(self):
+        pass
+""",
+    )
+    _write(ascend_root, "vllm_ascend/__init__.py", "")
+    _write(
+        ascend_root,
+        "vllm_ascend/plugin.py",
+        """
+from vllm.base import Target
+
+
+selected_name = None
+if hasattr(Target, "run"):
+    selected_name = "run"
+
+
+def replacement(self):
+    pass
+
+
+if selected_name is not None:
+    setattr(Target, selected_name, replacement)
+""",
+    )
+
+    relations, findings = generator.InterfaceBoundaryGenerator(
+        vllm_root,
+        ascend_root,
+    ).generate()
+
+    patches = [relation for relation in relations if relation.relation == "monkey_patch"]
+    assert len(patches) == 1
+    assert patches[0].upstream_file == "vllm/base.py"
+    assert patches[0].upstream_owner == "Target"
+    assert patches[0].upstream_name == "run"
+    assert patches[0].downstream_name == "replacement"
+    assert not findings
+
+
 def test_exact_try_import_and_non_none_guard_restore_patch_target(
     tmp_path: Path,
 ) -> None:

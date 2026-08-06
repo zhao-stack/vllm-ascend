@@ -6887,6 +6887,16 @@ class InterfaceBoundaryGenerator:
         owner_info = self.upstream.find_class(owner)
         if owner_info is None:
             return False
+        direct_alternatives = self._final_bindings(
+            self._canonical_reference(f"{owner_info.qualified_name}.{member}")
+        )
+        if direct_alternatives and all(
+            alternative.kind != "unbound" for alternative in direct_alternatives
+        ):
+            # A member bound directly on the target class wins before Python
+            # consults any parent.  This fact remains exact even when an
+            # external base prevents us from completing the rest of the MRO.
+            return True
         mro_result = self._linearized_mro(owner_info.qualified_name)
         if not mro_result.complete:
             return False
