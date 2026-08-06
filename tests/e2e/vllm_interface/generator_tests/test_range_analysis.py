@@ -4,7 +4,11 @@ import json
 import subprocess
 from pathlib import Path
 
-from tools.vllm_interface_contracts.range_analysis import analyze_range, write_reports
+from tools.vllm_interface_contracts.range_analysis import (
+    analyze_range,
+    discover_imports,
+    write_reports,
+)
 
 
 def _write(root: Path, relative: str, source: str) -> None:
@@ -125,3 +129,17 @@ def test_report_writer_separates_introduced_csv(tmp_path: Path) -> None:
     assert payload["metadata"]["vllm_old_sha"] == roots[2]
     assert "introduced_break" in introduced_csv
     assert "preexisting" not in introduced_csv
+
+
+def test_import_discovery_orders_module_and_symbol_references(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "vllm_ascend/imports.py",
+        "import vllm\nfrom vllm import config\nvalue = vllm.config.ModelConfig\n",
+    )
+    references = discover_imports(tmp_path)
+    assert [(item.module, item.symbol) for item in references] == [
+        ("vllm", None),
+        ("vllm", "config"),
+        ("vllm.config.ModelConfig", None),
+    ]

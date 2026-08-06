@@ -519,7 +519,11 @@ def discover_imports(ascend_root: Path) -> list[ImportReference]:
         visitor.visit(tree)
         references.extend(visitor.references)
     unique = {(item.module, item.symbol, item.file, item.line): item for item in references}
-    return [unique[key] for key in sorted(unique)]
+    ordered = sorted(
+        unique,
+        key=lambda item: (item[0], item[1] or "", item[2], item[3]),
+    )
+    return [unique[key] for key in ordered]
 
 
 def _top_level_symbol(snapshot: GitSnapshot, file_name: str, name: str) -> SourceEndpoint:
