@@ -19,6 +19,20 @@ with `ast`; it does not import `torch_npu`, initialize an NPU, download a model,
 
 ## Source-based mapping generator (POC)
 
+The implementation lives in the reusable `tools.vllm_interface_contracts` package.  The historical
+`generate_interface_boundaries.py` path remains a compatibility entry point, so existing local commands and CI jobs do
+not need to change.  New callers should use the package CLI:
+
+```bash
+python -m tools.vllm_interface_contracts generate --help
+python -m tools.vllm_interface_contracts analyze-range --help
+python -m tools.vllm_interface_contracts validate --help
+```
+
+The main2main skill is intentionally only an adapter around this package.  It validates the requested SHAs, selects
+`new`, `legacy`, or `compare` mode, reuses an exact-input cache, and renders the Chinese report.  AST indexing, MRO,
+override, monkey-patch, import, and signature decisions are owned by this package alone.
+
 For a Chinese explanation of why the generator grew from its early version to more than 10,000 lines, including the
 problem solved by every version from v0.3 to v0.36, see `接口映射生成器代码演进说明.md`.
 For the architecture audit, completed refactor, and byte-for-byte accuracy evidence, see
@@ -91,3 +105,23 @@ change from being counted as a missing downstream dependency.
 `audit_interface_boundary_coverage.py` independently enumerates source candidate sites and checks that each has exactly
 one disposition in the generated mapping. It can follow direct downstream helpers with call-site module arguments, but
 does not enter vLLM or external helper bodies and reinterpret their normal field assignments as downstream patches.
+
+## Exact upstream range analysis
+
+`analyze-range` generates downstream dependencies from the requested vllm-ascend baseline, checks each dependency
+against exact old and new vLLM commits, and writes JSON, JSONL-derived CSV, and Markdown reports.  The vLLM checkout must
+be at the requested new SHA; old files are read directly from Git, so the command never imports vLLM or requires an NPU.
+
+```bash
+python -m tools.vllm_interface_contracts analyze-range \
+  --vllm-root /path/to/vllm-at-new-sha \
+  --ascend-root /path/to/vllm-ascend-baseline \
+  --old <old-sha> \
+  --new <new-sha> \
+  --expect-ascend-sha <ascend-sha> \
+  --output-dir /path/to/report-dir
+```
+
+Findings are separated into `introduced_break`, `compatibility_warning`, `preexisting`, `fixed`, and
+`analysis_unresolved`.  Unchanged verified relationships are omitted from the upgrade report.  By default the command
+only warns and exits successfully; `--fail-on introduced` is available for a future blocking CI, but is not the default.
