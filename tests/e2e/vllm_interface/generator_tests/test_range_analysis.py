@@ -143,3 +143,40 @@ def test_import_discovery_orders_module_and_symbol_references(tmp_path: Path) ->
         ("vllm", "config"),
         ("vllm.config.ModelConfig", None),
     ]
+
+
+def test_import_detector_ignores_symbol_missing_at_both_endpoints(tmp_path: Path) -> None:
+    vllm_root = tmp_path / "vllm"
+    ascend_root = tmp_path / "vllm-ascend"
+    vllm_root.mkdir()
+    ascend_root.mkdir()
+    _git(vllm_root, "init")
+    _git(ascend_root, "init")
+    _write(vllm_root, "vllm/__init__.py", "")
+    old_sha = _commit(vllm_root, "old")
+    _write(vllm_root, "vllm/marker.py", "VALUE = 1\n")
+    new_sha = _commit(vllm_root, "new")
+    _write(ascend_root, "vllm_ascend/__init__.py", "")
+    _write(ascend_root, "vllm_ascend/consumer.py", "from vllm import never_existed\n")
+    ascend_sha = _commit(ascend_root, "baseline")
+    report = _run(vllm_root, ascend_root, old_sha, new_sha, ascend_sha)
+    assert not [item for item in report["findings"] if item["relation"] == "direct_import"]
+
+
+def test_import_detector_resolves_from_package_import_as_submodule(tmp_path: Path) -> None:
+    vllm_root = tmp_path / "vllm"
+    ascend_root = tmp_path / "vllm-ascend"
+    vllm_root.mkdir()
+    ascend_root.mkdir()
+    _git(vllm_root, "init")
+    _git(ascend_root, "init")
+    _write(vllm_root, "vllm/__init__.py", "")
+    _write(vllm_root, "vllm/config.py", "VALUE = 1\n")
+    old_sha = _commit(vllm_root, "old")
+    _write(vllm_root, "vllm/config.py", "VALUE = 2\n")
+    new_sha = _commit(vllm_root, "new")
+    _write(ascend_root, "vllm_ascend/__init__.py", "")
+    _write(ascend_root, "vllm_ascend/consumer.py", "from vllm import config\n")
+    ascend_sha = _commit(ascend_root, "baseline")
+    report = _run(vllm_root, ascend_root, old_sha, new_sha, ascend_sha)
+    assert not [item for item in report["findings"] if item["relation"] == "direct_import"]

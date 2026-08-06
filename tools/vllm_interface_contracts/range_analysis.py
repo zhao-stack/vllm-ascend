@@ -566,8 +566,17 @@ def _import_findings(
                     break
         if old_file is None:
             continue
-        moved_file = old_to_new.get(old_file)
+        imported_submodule: str | None = None
         if symbol and "." not in symbol:
+            imported_submodule = old_snapshot.resolve_module(f"{reference.module}.{symbol}")
+            if imported_submodule is not None:
+                old_file = imported_submodule
+                new_file = new_snapshot.resolve_module(f"{reference.module}.{symbol}")
+        moved_file = old_to_new.get(old_file)
+        if imported_submodule is not None:
+            old_endpoint = SourceEndpoint(file=old_file, owner=None, name=None)
+            new_endpoint = SourceEndpoint(file=new_file, owner=None, name=None)
+        elif symbol and "." not in symbol:
             old_endpoint = _top_level_symbol(old_snapshot, old_file, symbol)
             new_endpoint = (
                 _top_level_symbol(new_snapshot, new_file, symbol)
@@ -577,6 +586,10 @@ def _import_findings(
         else:
             old_endpoint = SourceEndpoint(file=old_file, owner=None, name=symbol)
             new_endpoint = SourceEndpoint(file=new_file, owner=None, name=symbol)
+        # An import can only be attributed to this upgrade when its exact old
+        # module or exported symbol was proven to resolve at the old endpoint.
+        if old_endpoint.file is None:
+            continue
         if new_endpoint.file is not None:
             continue
         relocated = moved_file is not None and moved_file in new_snapshot.files
