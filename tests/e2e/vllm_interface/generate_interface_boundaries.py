@@ -19,13 +19,7 @@ from tools.vllm_interface_contracts import generator as _implementation  # noqa:
 
 # Preserve the complete legacy module surface, including private helpers used
 # by the focused regression suite.  New callers should import the tools package.
-globals().update(
-    {
-        name: getattr(_implementation, name)
-        for name in dir(_implementation)
-        if not name.startswith("__")
-    }
-)
+globals().update({name: getattr(_implementation, name) for name in dir(_implementation) if not name.startswith("__")})
 
 
 class _CompatibilityModule(types.ModuleType):
