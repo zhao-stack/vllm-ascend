@@ -362,7 +362,7 @@ def _relation_finding(
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
     new_to_old: dict[str, str],
-) -> RangeFinding:
+) -> RangeFinding | None:
     old_file = new_to_old.get(relation.upstream_file, relation.upstream_file)
     old_endpoint = old_snapshot.endpoint(old_file, relation.upstream_owner, relation.upstream_name)
     new_endpoint = new_snapshot.endpoint(
@@ -397,6 +397,11 @@ def _relation_finding(
         or old_endpoint.signature != new_endpoint.signature
         or old_endpoint.descriptor != new_endpoint.descriptor
     )
+    # The range report is a delta report. A proven relationship whose exact
+    # upstream contract did not change is useful inventory, but it is not a
+    # range risk and must not inflate unresolved or historical counts.
+    if not contract_changed:
+        return None
     classification = _classify(old_state, new_state, contract_changed)
     gates = {
         "relationship_verified": True,
@@ -672,9 +677,10 @@ def analyze_range(
     old_to_new, new_to_old = _rename_maps(vllm_root, old_sha, new_sha)
 
     findings = [
-        _relation_finding(relation, old_snapshot, new_snapshot, new_to_old)
+        finding
         for relation in relations
         if relation.upstream_package == "vllm"
+        if (finding := _relation_finding(relation, old_snapshot, new_snapshot, new_to_old)) is not None
     ]
     findings.extend(_import_findings(ascend_root, old_snapshot, new_snapshot, old_to_new))
 
@@ -685,16 +691,42 @@ def analyze_range(
         new_endpoint = new_snapshot.expression_endpoint(candidate.target_expression)
         old_endpoint = old_endpoint or SourceEndpoint(None, None, candidate.target_expression)
         new_endpoint = new_endpoint or SourceEndpoint(None, None, candidate.target_expression)
-        old_state = CompatibilityState(old_endpoint.file is not None, None, candidate.reason)
-        new_state = CompatibilityState(new_endpoint.file is not None, None, candidate.reason)
+        old_exists = old_endpoint.file is not None and (old_endpoint.name is None or old_endpoint.line is not None)
+        new_exists = new_endpoint.file is not None and (new_endpoint.name is None or new_endpoint.line is not None)
+        verified_removal = (
+            old_exists and not new_exists and candidate.status == "risk" and not candidate.generator_issue
+        )
+        classification = "introduced_break" if verified_removal else "analysis_unresolved"
+        old_state = CompatibilityState(
+            old_exists,
+            True if verified_removal else None,
+            "upstream target exists at old" if verified_removal else candidate.reason,
+        )
+        new_state = CompatibilityState(
+            new_exists,
+            False if verified_removal else None,
+            "upstream target was removed at new" if verified_removal else candidate.reason,
+        )
+        gates = {
+            "relationship_verified": not candidate.generator_issue,
+            "contract_changed": verified_removal,
+            "runtime_reachable": verified_removal,
+            "version_lane_matches": True,
+        }
         findings.append(
             RangeFinding(
                 finding_id=_finding_id(candidate.as_dict(), old_sha, new_sha),
-                classification="analysis_unresolved",
+                classification=classification,
                 relation=candidate.relation,
-                priority="P2",
-                action="review",
-                confidence="low" if candidate.generator_issue else "medium",
+                priority=(
+                    "P0"
+                    if verified_removal and candidate.relation == "monkey_patch"
+                    else "P1"
+                    if verified_removal
+                    else "P2"
+                ),
+                action="modify" if verified_removal else "review",
+                confidence=("high" if verified_removal else "low" if candidate.generator_issue else "medium"),
                 upstream_old=old_endpoint,
                 upstream_new=new_endpoint,
                 downstream=SourceEndpoint(
@@ -705,15 +737,21 @@ def analyze_range(
                 ),
                 old_state=old_state,
                 new_state=new_state,
-                change=candidate.reason,
+                change=(
+                    "upstream target existed at old and was removed at new" if verified_removal else candidate.reason
+                ),
                 evidence=[candidate.as_dict()["evidence"]],
-                gates={
-                    "relationship_verified": not candidate.generator_issue,
-                    "contract_changed": False,
-                    "runtime_reachable": False,
-                    "version_lane_matches": True,
-                },
-                suggestion="静态证据不足，先人工确认目标绑定或补充分析规则，不要直接修改下游代码。",
+                gates=gates,
+                suggestion=(
+                    _suggestion(
+                        candidate.relation,
+                        classification,
+                        old_endpoint,
+                        new_endpoint,
+                    )
+                    if verified_removal
+                    else "静态证据不足，先人工确认目标绑定或补充分析规则，不要直接修改下游代码。"
+                ),
                 source="generator_finding",
             )
         )

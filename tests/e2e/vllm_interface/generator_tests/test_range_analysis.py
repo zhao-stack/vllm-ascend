@@ -180,3 +180,39 @@ def test_import_detector_resolves_from_package_import_as_submodule(tmp_path: Pat
     ascend_sha = _commit(ascend_root, "baseline")
     report = _run(vllm_root, ascend_root, old_sha, new_sha, ascend_sha)
     assert not [item for item in report["findings"] if item["relation"] == "direct_import"]
+
+
+def test_unchanged_verified_relationship_is_not_a_range_finding(tmp_path: Path) -> None:
+    roots = _repositories(
+        tmp_path,
+        old_method="def run(self, value): return value",
+        new_method="def run(self, value): return value + 1",
+    )
+    report = _run(*roots)
+    assert not [item for item in report["findings"] if item["source"] == "dynamic_relation_graph"]
+
+
+def test_removed_verified_patch_target_is_introduced_break(tmp_path: Path) -> None:
+    vllm_root = tmp_path / "vllm"
+    ascend_root = tmp_path / "vllm-ascend"
+    vllm_root.mkdir()
+    ascend_root.mkdir()
+    _git(vllm_root, "init")
+    _git(ascend_root, "init")
+    _write(vllm_root, "vllm/__init__.py", "")
+    _write(vllm_root, "vllm/base.py", "class Base:\n    def run(self, value): return value\n")
+    old_sha = _commit(vllm_root, "old")
+    _write(vllm_root, "vllm/base.py", "class Base:\n    pass\n")
+    new_sha = _commit(vllm_root, "new")
+    _write(ascend_root, "vllm_ascend/__init__.py", "")
+    _write(
+        ascend_root,
+        "vllm_ascend/patch.py",
+        "from vllm.base import Base\n\ndef run(self, value): return value\n\nBase.run = run\n",
+    )
+    ascend_sha = _commit(ascend_root, "baseline")
+    report = _run(vllm_root, ascend_root, old_sha, new_sha, ascend_sha)
+    patches = [item for item in report["findings"] if item["relation"] == "monkey_patch"]
+    assert len(patches) == 1
+    assert patches[0]["classification"] == "introduced_break"
+    assert all(patches[0]["gates"].values())
