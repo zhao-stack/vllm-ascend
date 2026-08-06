@@ -9796,7 +9796,7 @@ def _verified_external_sources(
     return actual_shas
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vllm-root", type=Path, required=True)
     parser.add_argument("--ascend-root", type=Path, required=True)
@@ -9818,7 +9818,7 @@ def main() -> None:
         default=[],
         metavar="PACKAGE=SHA",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     vllm_sha = _git_head(args.vllm_root)
     ascend_sha = _git_head(args.ascend_root)
