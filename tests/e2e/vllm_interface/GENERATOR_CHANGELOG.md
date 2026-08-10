@@ -4,6 +4,62 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v1.2.0 - scenario execution plans
+
+- Scope: the generator remains `0.36.0` with JSONL schema 6. The range report
+  advances to schema 3 and records fixed execution-plan version 1, capability
+  states, and phase timings.
+- `main2main` plan: preserves the full exact-contract pipeline and the existing
+  report filenames. Patch, override, inheritance, direct import, direct call,
+  return protocol, and generator findings remain enabled.
+- `vllm-interface` plan: runs inheritance/MRO only as an override prerequisite,
+  analyzes override and exact downstream-call contracts, and skips monkey-patch
+  collection, direct-import comparison, and generator-finding conversion.
+- PR output: emits only actionable `introduced_break` override/direct-call
+  findings. Historical, unresolved, inheritance-only, patch, and import items
+  are absent from the PR-facing JSON, CSV, and Markdown.
+- Architecture boundary: both plans reuse the same AST, MRO, signature, return,
+  and comparison implementations. The plans only select engine phases; no
+  source-analysis logic was copied into CLI or skill code.
+
+## range analyzer v1.1.1 - exact calls and return protocols
+
+- Scope: the generator remains `0.36.0`, schema 6, with the same patch,
+  override, and inheritance relation payloads.  The range report advances to
+  schema 2; direct-call dependencies are contract-analysis-only and shared by
+  `analyze-range` and `validate`, but do not enter schema-6 relations.  They
+  therefore do not alter the fixed 972-relation JSONL golden or the independent
+  patch auditor.
+- Downstream-call change: resolve exact vLLM module functions, constructors,
+  descriptors, and annotated/constructed instances.  Re-resolve those vLLM
+  receiver members at old and new through a unique single-inheritance chain.
+  For downstream `self`/`super`, first prove one effective owner from the pinned
+  vllm-ascend MRO, then validate that same owner in both snapshots; owner moves
+  fail closed.  Bind each concrete callsite argument shape against old and new
+  independently.  Literal star expansions are exact; dynamic `*args`/`**kwargs`
+  fail closed.
+- Return change: infer conservative value, awaitable, iterator, and context
+  protocols from exact annotations and normal return paths.  Check concrete
+  downstream return consumption separately from conservative structural
+  covariance for patch/override return substitution.  Raise-only stubs are
+  `bottom`, not implicit `None`; unknown or conflicting contracts remain
+  unresolved.
+- Report change: every finding records `contract_kind` and `direction`.
+  Parameter and return breaks for the same relation have distinct IDs.  CSV
+  columns are fixed across heterogeneous finding types.
+- Safety boundary: no runtime imports or NPU execution.  Calls that cannot be
+  uniquely resolved are omitted at discovery; ambiguous old/new endpoints and
+  constrained return contracts are reported unresolved.  Unused, forwarded,
+  or escaping results produce no return-use finding.  None of those cases
+  produces `modify`.
+- Correctness hardening in `1.1.1`: module and function rebinding is resolved at
+  the concrete callsite; syntax-neutral calls are typed independently in the
+  old and new snapshots; missing members, runtime-signature transforms, and
+  newly introduced override/patch contracts are classified explicitly.  A
+  dependency's deduplication identity includes source column plus call/return
+  shape; a range finding ID includes contract kind, file, line, column, target,
+  and the two SHAs.
+
 ## post-v0.36 architecture refactor - centralize state and separate schema reporting
 
 - State/cleanup implementation: `17e60d5a8`; schema/report extraction:

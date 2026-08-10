@@ -14,6 +14,10 @@ class SourceEndpoint:
     line: int | None = None
     signature: list[object] | None = field(default=None, compare=False)
     descriptor: str | None = None
+    symbol_kind: str | None = None
+    signature_status: str | None = None
+    analysis_fingerprint: str | None = field(default=None, compare=False)
+    return_contract: dict[str, Any] | None = field(default=None, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -47,6 +51,9 @@ class RangeFinding:
     gates: dict[str, bool]
     suggestion: str
     source: str = "dynamic_relation_graph"
+    contract_kind: str = "call_arguments"
+    direction: str = "upstream_contract_to_downstream_implementation"
+    details: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -70,4 +77,7 @@ class RangeFinding:
             "gates": self.gates,
             "suggestion": self.suggestion,
             "source": self.source,
+            "contract_kind": self.contract_kind,
+            "direction": self.direction,
+            "details": self.details,
         }

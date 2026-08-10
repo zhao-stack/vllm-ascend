@@ -41,6 +41,7 @@ import hashlib
 import inspect
 import json
 import subprocess
+import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -48,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from tools.vllm_interface_contracts import schema as _boundary_schema
+from tools.vllm_interface_contracts.analysis_plans import MAIN2MAIN_PLAN, AnalysisPlan
 
 SCHEMA_VERSION = 6
 GENERATOR_VERSION = "0.36.0"
@@ -4058,12 +4060,46 @@ class InterfaceBoundaryGenerator:
         self._private_helper_definitions: dict[str, PrivateHelperDefinition] = {}
         self._private_helper_exports: dict[str, str] = {}
         self._private_helper_node_identities: dict[int, str] = {}
+        self.phase_timings: dict[str, float | None] = {}
 
-    def generate(self) -> tuple[list[Relation], list[CandidateFinding]]:
-        self._collect_inheritance()
-        self._collect_verified_overrides()
-        self._collect_monkey_patches()
-        self._reclassify_missing_patch_members()
+    def generate(
+        self,
+        plan: AnalysisPlan = MAIN2MAIN_PLAN,
+    ) -> tuple[list[Relation], list[CandidateFinding]]:
+        """Generate the relations required by one reviewed analysis plan."""
+
+        if plan.collect_overrides and not plan.collect_inheritance:
+            raise ValueError("override collection requires inheritance/MRO discovery")
+        self.relations = []
+        self.findings = []
+        self.phase_timings = {
+            "inheritance_mro": None,
+            "override": None,
+            "monkey_patch": None,
+        }
+        if plan.collect_inheritance:
+            phase_started = time.perf_counter()
+            self._collect_inheritance()
+            self.phase_timings["inheritance_mro"] = round(
+                time.perf_counter() - phase_started,
+                6,
+            )
+        if plan.collect_overrides:
+            phase_started = time.perf_counter()
+            self._collect_verified_overrides()
+            self.phase_timings["override"] = round(
+                time.perf_counter() - phase_started,
+                6,
+            )
+        if plan.collect_monkey_patches:
+            phase_started = time.perf_counter()
+            self._collect_monkey_patches()
+            self._reclassify_missing_patch_members()
+            self.phase_timings["monkey_patch"] = round(
+                time.perf_counter() - phase_started,
+                6,
+            )
+        phase_started = time.perf_counter()
         grouped: dict[tuple[str, ...], list[Relation]] = defaultdict(list)
         for relation in self.relations:
             grouped[relation.exact_key()].append(relation)
@@ -4225,6 +4261,10 @@ class InterfaceBoundaryGenerator:
                 relation.evidence_guards,
                 relation.reason,
             ),
+        )
+        self.phase_timings["relation_finalization"] = round(
+            time.perf_counter() - phase_started,
+            6,
         )
         return self.relations, self.findings
 

@@ -12,19 +12,43 @@ import copy
 import csv
 import hashlib
 import json
+import os
 import subprocess
+import sys
+import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from tools.vllm_interface_contracts.analysis_plans import (
+    MAIN2MAIN_SCENARIO,
+    AnalysisPlan,
+    resolve_analysis_plan,
+)
+from tools.vllm_interface_contracts.call_contracts import (
+    DirectCallDependency,
+    DirectCallDetector,
+    ReturnContract,
+    ReturnShape,
+    bind_call_shape,
+    infer_return_contract,
+    replacement_return_compatible,
+    return_contract_from_dict,
+    return_use_compatible,
+)
 from tools.vllm_interface_contracts.generator import (
     GENERATOR_VERSION,
     InterfaceBoundaryGenerator,
     Relation,
+    SignatureContract,
     _accepts_signature_contract,
+    _expression_name,
+    _import_binding_reference,
     _jsonable_signature,
+    _scope_final_bindings,
+    _tag_guard_names,
 )
 from tools.vllm_interface_contracts.models import (
     CompatibilityState,
@@ -32,8 +56,8 @@ from tools.vllm_interface_contracts.models import (
     SourceEndpoint,
 )
 
-RANGE_SCHEMA_VERSION = 1
-RANGE_ANALYZER_VERSION = "1.0.0"
+RANGE_SCHEMA_VERSION = 3
+RANGE_ANALYZER_VERSION = "1.2.0"
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -41,6 +65,20 @@ CLASSIFICATIONS = (
     "fixed",
     "analysis_unresolved",
 )
+
+
+def _diagnostic_timing(
+    label: str,
+    started: float,
+    timings: dict[str, float | None] | None = None,
+) -> float:
+    now = time.perf_counter()
+    elapsed = round(now - started, 6)
+    if timings is not None:
+        timings[label] = elapsed
+    if os.environ.get("VLLM_INTERFACE_TIMINGS") == "1":
+        print(f"[vllm-interface] {label}: {elapsed:.3f}s", file=sys.stderr, flush=True)
+    return now
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -99,14 +137,46 @@ def _decorator_name(node: ast.expr) -> str:
     return ""
 
 
-def _descriptor(node: ast.AST) -> str | None:
+def _descriptor(node: ast.AST, resolver: Any | None = None) -> str | None:
     if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return None
-    names = {_decorator_name(item).rsplit(".", 1)[-1] for item in node.decorator_list}
+    names = {
+        (resolver(raw) if resolver is not None and (raw := _decorator_name(item)) else _decorator_name(item))
+        for item in node.decorator_list
+    }
     for candidate in ("property", "classmethod", "staticmethod"):
-        if candidate in names:
+        if f"builtins.{candidate}" in names or (resolver is None and candidate in names):
             return candidate
+    if any((name or "").rsplit(".", 1)[-1] in {"property", "classmethod", "staticmethod"} for name in names):
+        return "unknown"
     return "ordinary"
+
+
+def _signature_status(
+    node: ast.AST | None,
+    resolver: Any | None = None,
+) -> str | None:
+    if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+        return None
+    known = {
+        "abc.abstractmethod",
+        "contextlib.asynccontextmanager",
+        "contextlib.contextmanager",
+        "typing.override",
+        "typing_extensions.override",
+    }
+    builtin_descriptors = {"builtins.classmethod", "builtins.property", "builtins.staticmethod"}
+    for item in node.decorator_list:
+        raw = _decorator_name(item)
+        resolved = resolver(raw) if resolver is not None and raw else raw
+        if (
+            resolved in builtin_descriptors
+            or (resolver is None and raw in {"classmethod", "property", "staticmethod"})
+            or resolved in known
+        ):
+            continue
+        return "unknown"
+    return "exact"
 
 
 def _class_nodes(tree: ast.Module) -> Iterator[tuple[tuple[str, ...], ast.ClassDef]]:
@@ -128,27 +198,77 @@ def _owner_node(tree: ast.Module, owner: str | None) -> ast.ClassDef | None:
     return matches[0] if len(matches) == 1 else None
 
 
-def _named_node(tree: ast.Module, owner: str | None, name: str) -> ast.AST | None:
+@dataclass(frozen=True)
+class _NamedBinding:
+    node: ast.AST | None
+    status: str
+    fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
+class _QualifiedBinding:
+    file: str
+    owner: str | None
+    name: str
+    node: ast.AST | None
+    status: str
+    fingerprint: str | None = None
+
+
+def _body_named_binding(body: list[ast.stmt], name: str) -> _NamedBinding:
+    """Return one final runtime namespace binding, or fail closed.
+
+    The shared scope-flow interpreter handles overload stubs followed by a
+    concrete implementation, conditional definitions, rebinding, and delete.
+    A path-dependent final binding is ``unknown`` rather than ``missing``.
+    """
+
+    alternatives = _scope_final_bindings(body, _tag_guard_names(body)).get(name, ())
+    if not alternatives:
+        return _NamedBinding(None, "missing")
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            [
+                {
+                    "kind": binding.kind,
+                    "node": (ast.dump(binding.node, include_attributes=False) if binding.node is not None else None),
+                }
+                for binding in alternatives
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    if len(alternatives) != 1:
+        return _NamedBinding(None, "unknown", fingerprint)
+    binding = alternatives[0]
+    if binding.kind == "unbound":
+        return _NamedBinding(None, "missing", fingerprint)
+    if binding.kind in {"function", "class"} and binding.node is not None:
+        return _NamedBinding(binding.node, "exact", fingerprint)
+    if binding.kind in {"alias", "value"}:
+        return _NamedBinding(binding.node, "non_callable", fingerprint)
+    return _NamedBinding(None, "unknown", fingerprint)
+
+
+def _named_binding(tree: ast.Module, owner: str | None, name: str) -> _NamedBinding:
     if owner:
         class_node = _owner_node(tree, owner)
         if class_node is None:
-            return None
-        return next(
-            (
-                item
-                for item in class_node.body
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and item.name == name
-            ),
-            None,
-        )
-    return next(
-        (
-            item
-            for item in tree.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and item.name == name
-        ),
-        None,
-    )
+            return _NamedBinding(None, "missing")
+        return _body_named_binding(class_node.body, name)
+    return _body_named_binding(tree.body, name)
+
+
+def _named_node(tree: ast.Module, owner: str | None, name: str) -> ast.AST | None:
+    binding = _named_binding(tree, owner, name)
+    return binding.node if binding.status == "exact" else None
+
+
+def _node_fingerprint(node: ast.AST | None) -> str | None:
+    if node is None:
+        return None
+    return hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
 
 
 def _definition_fingerprint(node: ast.AST | None) -> str | None:
@@ -160,6 +280,123 @@ def _definition_fingerprint(node: ast.AST | None) -> str | None:
     return hashlib.sha256(ast.dump(normalized, include_attributes=False).encode()).hexdigest()
 
 
+def _file_module(file_name: str) -> tuple[str, bool]:
+    normalized = file_name.replace("\\", "/")
+    stem = normalized[:-3] if normalized.endswith(".py") else normalized
+    parts = stem.split("/")
+    is_package = parts[-1] == "__init__"
+    if is_package:
+        parts.pop()
+    return ".".join(parts), is_package
+
+
+def _bound_signature(
+    signature: list[object] | None,
+    *,
+    descriptor: str | None,
+    access_kind: str,
+) -> list[object] | None:
+    if signature is None:
+        return None
+    result = copy.deepcopy(signature)
+    binds_receiver = access_kind in {"constructor", "instance"} or (
+        access_kind == "class_attribute" and descriptor == "classmethod"
+    )
+    if not binds_receiver or descriptor == "staticmethod":
+        return result
+    if descriptor not in {"classmethod", "ordinary", None} and access_kind != "constructor":
+        return None
+    positional_only = result[1]
+    positional_or_keyword = result[2]
+    if positional_only:
+        positional_only.pop(0)
+    elif positional_or_keyword:
+        positional_or_keyword.pop(0)
+    elif result[3] is None:
+        return None
+    return result
+
+
+def _relation_symbol_presence(endpoint: SourceEndpoint) -> bool | None:
+    """Return proven symbol presence without conflating ambiguity with deletion."""
+
+    if endpoint.file is None or endpoint.symbol_kind == "missing":
+        return False
+    if endpoint.symbol_kind in {None, "unknown"}:
+        return None
+    return True
+
+
+def _snapshot_signature_contract(endpoint: SourceEndpoint) -> SignatureContract | None:
+    """Build the provable runtime-signature view available from one Git snapshot."""
+
+    if endpoint.symbol_kind != "callable":
+        return None
+    status = endpoint.signature_status or "unknown"
+    runtime_signature = endpoint.signature if status == "exact" else None
+    binding_descriptor = "ordinary" if endpoint.descriptor == "property" else endpoint.descriptor
+    bound_signature = (
+        _bound_signature(
+            runtime_signature,
+            descriptor=binding_descriptor,
+            access_kind="instance" if endpoint.owner is not None else "module",
+        )
+        if runtime_signature is not None
+        else None
+    )
+    if status == "exact" and bound_signature is None:
+        status = "unknown"
+    return SignatureContract(
+        definition_signature=endpoint.signature,
+        runtime_entry_signature=runtime_signature,
+        reported_signature=runtime_signature,
+        bound_call_signature=bound_signature,
+        protocol="property_access" if endpoint.descriptor == "property" else "python_call",
+        status=status,
+        provenance=("git_snapshot",),
+    )
+
+
+def _signature_contract_semantics(contract: SignatureContract | None) -> object:
+    if contract is None:
+        return None
+    return (
+        contract.definition_signature,
+        contract.runtime_entry_signature,
+        contract.reported_signature,
+        contract.bound_call_signature,
+        contract.forwarded_targets,
+        contract.protocol,
+        contract.status,
+    )
+
+
+def _runtime_signature_changed(
+    old: SourceEndpoint,
+    new: SourceEndpoint,
+) -> bool:
+    """Compare runtime contracts when both snapshot definitions are exact."""
+
+    if old.signature_status != new.signature_status:
+        return True
+    if old.signature_status != "exact" or new.signature_status != "exact":
+        return False
+    old_contract = _snapshot_signature_contract(old)
+    new_contract = _snapshot_signature_contract(new)
+    return _signature_contract_semantics(old_contract) != _signature_contract_semantics(new_contract)
+
+
+def _ambiguous_binding_changed(old: SourceEndpoint, new: SourceEndpoint) -> bool:
+    if old.analysis_fingerprint == new.analysis_fingerprint:
+        return False
+    return (
+        old.symbol_kind in {None, "unknown"}
+        or new.symbol_kind in {None, "unknown"}
+        or old.signature_status == "unknown"
+        or new.signature_status == "unknown"
+    )
+
+
 class GitSnapshot:
     def __init__(self, root: Path, revision: str):
         self.root = root
@@ -167,6 +404,7 @@ class GitSnapshot:
         self._files: set[str] | None = None
         self._source: dict[str, str | None] = {}
         self._trees: dict[str, ast.Module | None] = {}
+        self._bindings: dict[str, dict[str, str]] = {}
 
     @property
     def files(self) -> set[str]:
@@ -205,16 +443,445 @@ class GitSnapshot:
     def resolve_module(self, module: str) -> str | None:
         return next((candidate for candidate in _module_file(module) if candidate in self.files), None)
 
+    def _module_bindings(self, file_name: str) -> dict[str, str]:
+        normalized = file_name.replace("\\", "/")
+        if normalized in self._bindings:
+            return self._bindings[normalized]
+        tree = self.tree(normalized)
+        module, is_package = _file_module(normalized)
+        bindings: dict[str, str] = {}
+        pending: dict[str, str] = {}
+        if tree is not None:
+            final = _scope_final_bindings(tree.body, _tag_guard_names(tree.body))
+            for name, alternatives in final.items():
+                if len(alternatives) != 1:
+                    continue
+                binding = alternatives[0]
+                node = binding.node
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    reference = _import_binding_reference(
+                        node,
+                        name,
+                        module=module,
+                        is_package=is_package,
+                    )
+                    if reference is not None:
+                        bindings[name] = reference
+                elif binding.kind in {"class", "function"} and isinstance(
+                    node,
+                    (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef),
+                ):
+                    if node.name != name:
+                        bindings[name] = f"{module}.{node.name}"
+                elif binding.kind == "alias" and isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    value = node.value
+                    reference = _expression_name(value)
+                    if reference is not None:
+                        pending[name] = reference
+
+            changed = True
+            while changed:
+                changed = False
+                for name, reference in pending.items():
+                    if name in bindings:
+                        continue
+                    root, separator, remainder = reference.partition(".")
+                    if root in bindings:
+                        bindings[name] = f"{bindings[root]}.{remainder}" if separator else bindings[root]
+                        changed = True
+                    elif reference.startswith("vllm."):
+                        bindings[name] = reference
+                        changed = True
+                    elif _body_named_binding(tree.body, root).status == "exact":
+                        bindings[name] = f"{module}.{reference}"
+                        changed = True
+        self._bindings[normalized] = bindings
+        return bindings
+
+    def _resolve_qualified_node(
+        self,
+        expression: str,
+        seen: frozenset[str] = frozenset(),
+    ) -> _QualifiedBinding | None:
+        if expression in seen or not expression.startswith("vllm"):
+            return None
+        parts = expression.split(".")
+        for split in range(len(parts), 0, -1):
+            module = ".".join(parts[:split])
+            file_name = self.resolve_module(module)
+            if file_name is None:
+                continue
+            suffix = parts[split:]
+            if not suffix:
+                return None
+            bindings = self._module_bindings(file_name)
+            if suffix[0] in bindings:
+                target = ".".join([bindings[suffix[0]], *suffix[1:]])
+                if not target.startswith("vllm."):
+                    target = f"{module}.{target}"
+                return self._resolve_qualified_node(target, frozenset((*seen, expression)))
+            owner = ".".join(suffix[:-1]) or None
+            tree = self.tree(file_name)
+            if tree is None:
+                return _QualifiedBinding(file_name, owner, suffix[-1], None, "unknown")
+            binding = _named_binding(tree, owner, suffix[-1])
+            return _QualifiedBinding(
+                file_name,
+                owner,
+                suffix[-1],
+                binding.node,
+                binding.status,
+                binding.fingerprint,
+            )
+        return None
+
+    def _base_reference(self, file_name: str, node: ast.expr) -> str | None:
+        expression_node = node.value if isinstance(node, ast.Subscript) else node
+        expression = _expression_name(expression_node)
+        if expression is None:
+            return None
+        if expression in {"object", "builtins.object"}:
+            return "builtins.object"
+        return self._return_resolver(file_name)(expression)
+
+    def _effective_member(
+        self,
+        receiver_type: str,
+        member: str,
+        seen: frozenset[str] = frozenset(),
+    ) -> _QualifiedBinding | None:
+        """Resolve a member through a provable single-inheritance chain.
+
+        Multiple inheritance requires a complete C3 index.  The range layer
+        deliberately returns ``unknown`` for that case instead of borrowing
+        the checked-out new endpoint's owner or guessing a DFS order.
+        """
+
+        if receiver_type in seen:
+            return _QualifiedBinding("", None, member, None, "unknown")
+        resolved = self._resolve_qualified_node(receiver_type)
+        if resolved is None:
+            return None
+        if resolved.status != "exact":
+            return _QualifiedBinding(
+                resolved.file,
+                resolved.owner,
+                member,
+                None,
+                resolved.status,
+                resolved.fingerprint,
+            )
+        if not isinstance(resolved.node, ast.ClassDef):
+            return _QualifiedBinding(
+                resolved.file,
+                resolved.owner,
+                member,
+                resolved.node,
+                "non_callable",
+                resolved.fingerprint,
+            )
+        class_node = resolved.node
+        actual_owner = ".".join(item for item in (resolved.owner, class_node.name) if item)
+        if class_node.decorator_list:
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                None,
+                "unknown",
+                _node_fingerprint(class_node),
+            )
+        direct = _body_named_binding(class_node.body, member)
+        if direct.status != "missing":
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                direct.node,
+                direct.status,
+                direct.fingerprint,
+            )
+        if not class_node.bases:
+            return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
+        if len(class_node.bases) != 1:
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                None,
+                "unknown",
+                _node_fingerprint(class_node),
+            )
+        base = self._base_reference(resolved.file, class_node.bases[0])
+        if base == "builtins.object":
+            return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
+        if base is None or not base.startswith("vllm."):
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                None,
+                "unknown",
+                _node_fingerprint(class_node),
+            )
+        return self._effective_member(base, member, frozenset((*seen, receiver_type)))
+
+    def _constructor_class_safe(
+        self,
+        class_reference: str,
+        seen: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Prove that no class in a single-inheritance chain changes ``type.__call__``."""
+
+        if class_reference in seen:
+            return False
+        resolved = self._resolve_qualified_node(class_reference)
+        if resolved is None or resolved.status != "exact" or not isinstance(resolved.node, ast.ClassDef):
+            return False
+        node = resolved.node
+        if node.decorator_list or node.keywords:
+            return False
+        if not node.bases:
+            return True
+        if len(node.bases) != 1:
+            return False
+        base = self._base_reference(resolved.file, node.bases[0])
+        if base == "builtins.object":
+            return True
+        if base is None or not base.startswith("vllm."):
+            return False
+        return self._constructor_class_safe(base, frozenset((*seen, class_reference)))
+
+    def _return_resolver(self, file_name: str) -> Any:
+        module, _ = _file_module(file_name)
+        bindings = self._module_bindings(file_name)
+
+        def resolve(expression: str) -> str | None:
+            root, separator, remainder = expression.partition(".")
+            if root in bindings:
+                return f"{bindings[root]}.{remainder}" if separator else bindings[root]
+            if expression.startswith("vllm."):
+                return expression
+            if (
+                expression in {"classmethod", "property", "staticmethod"}
+                and (tree := self.tree(file_name)) is not None
+                and _body_named_binding(tree.body, expression).status == "missing"
+            ):
+                return f"builtins.{expression}"
+            return f"{module}.{expression}"
+
+        return resolve
+
     def endpoint(self, file_name: str, owner: str | None, name: str) -> SourceEndpoint:
         tree = self.tree(file_name)
-        node = _named_node(tree, owner, name) if tree is not None else None
+        binding = _named_binding(tree, owner, name) if tree is not None else _NamedBinding(None, "unknown")
+        node = binding.node if binding.status == "exact" else None
+        return_contract = infer_return_contract(
+            node,
+            resolver=self._return_resolver(file_name),
+        )
+        if binding.status == "exact":
+            symbol_kind = (
+                "callable"
+                if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+                else "class"
+                if isinstance(node, ast.ClassDef)
+                else "unknown"
+            )
+        elif binding.status == "non_callable":
+            symbol_kind = "non_callable"
+        else:
+            symbol_kind = binding.status
         return SourceEndpoint(
             file=file_name if file_name in self.files else None,
             owner=owner,
             name=name,
             line=getattr(node, "lineno", None),
             signature=_jsonable_signature(node),
-            descriptor=_descriptor(node) if node is not None else None,
+            descriptor=_descriptor(node, self._return_resolver(file_name)) if node is not None else None,
+            symbol_kind=symbol_kind,
+            signature_status=(
+                "unknown" if binding.status == "unknown" else _signature_status(node, self._return_resolver(file_name))
+            ),
+            analysis_fingerprint=binding.fingerprint,
+            return_contract=return_contract.as_dict() if return_contract is not None else None,
+        )
+
+    def call_endpoint(
+        self,
+        expression: str,
+        access_kind: str,
+        *,
+        receiver_type: str | None = None,
+        member: str | None = None,
+    ) -> SourceEndpoint:
+        effective_access_kind = access_kind
+        resolved: _QualifiedBinding | None = None
+        if access_kind == "instance" and receiver_type is not None and member is not None:
+            if receiver_type.startswith("vllm."):
+                resolved = self._effective_member(receiver_type, member)
+            else:
+                # ``self``/``super`` receiver classes live downstream and are
+                # not present in this upstream snapshot.  The detector's
+                # exact effective owner is safe while it still exists at this
+                # endpoint; if it moved or disappeared, report unknown rather
+                # than treating the new-side owner as an old-side deletion.
+                candidate = self._resolve_qualified_node(expression)
+                if candidate is None or candidate.status != "exact":
+                    return SourceEndpoint(
+                        file=None,
+                        owner=None,
+                        name=member,
+                        symbol_kind="unknown",
+                        signature_status="unknown",
+                    )
+                resolved = candidate
+        elif access_kind == "direct" and member is not None and expression.endswith(f".{member}"):
+            receiver = expression[: -(len(member) + 1)]
+            receiver_binding = self._resolve_qualified_node(receiver)
+            if (
+                receiver_binding is not None
+                and receiver_binding.status == "exact"
+                and isinstance(receiver_binding.node, ast.ClassDef)
+            ):
+                resolved = self._effective_member(receiver, member)
+                effective_access_kind = "class_attribute"
+        if resolved is None:
+            resolved = self._resolve_qualified_node(expression)
+        if resolved is None:
+            return SourceEndpoint(None, None, expression, symbol_kind="missing")
+        file_name, owner, name, node = (
+            resolved.file,
+            resolved.owner,
+            resolved.name,
+            resolved.node,
+        )
+        if resolved.status in {"missing", "unknown"}:
+            return SourceEndpoint(
+                file=file_name or None,
+                owner=owner,
+                name=name,
+                symbol_kind=resolved.status,
+                signature_status="unknown" if resolved.status == "unknown" else None,
+                analysis_fingerprint=resolved.fingerprint,
+            )
+        if resolved.status == "non_callable":
+            return SourceEndpoint(
+                file=file_name,
+                owner=owner,
+                name=name,
+                line=getattr(node, "lineno", None),
+                symbol_kind="non_callable",
+                analysis_fingerprint=resolved.fingerprint,
+            )
+        if isinstance(node, ast.ClassDef):
+            initializer_binding = self._effective_member(expression, "__init__")
+            new_binding = self._effective_member(expression, "__new__")
+            constructor_fingerprint = hashlib.sha256(
+                json.dumps(
+                    [
+                        resolved.fingerprint,
+                        initializer_binding.fingerprint if initializer_binding is not None else None,
+                        new_binding.fingerprint if new_binding is not None else None,
+                    ],
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            constructor_unknown = (
+                bool(node.decorator_list)
+                or bool(node.keywords)
+                or not self._constructor_class_safe(expression)
+                or initializer_binding is None
+                or initializer_binding.status in {"non_callable", "unknown"}
+                or new_binding is None
+                or new_binding.status != "missing"
+            )
+            initializer = (
+                initializer_binding.node
+                if initializer_binding is not None and initializer_binding.status == "exact"
+                else None
+            )
+            if (
+                initializer is None
+                and initializer_binding is not None
+                and initializer_binding.status == "missing"
+                and not constructor_unknown
+            ):
+                initializer = ast.parse("def __init__(self): pass").body[0]
+            signature = _bound_signature(
+                _jsonable_signature(initializer),
+                descriptor="ordinary",
+                access_kind="constructor",
+            )
+            contract = ReturnContract(
+                protocol="value",
+                variants=(
+                    # Constructor calls expose the created object, not
+                    # ``__init__``'s mandatory None return.
+                    ReturnShape("object", type_ref=expression),
+                ),
+                status="exact",
+                provenance=("class_constructor",),
+            )
+            return SourceEndpoint(
+                file=file_name,
+                owner=owner,
+                name=name,
+                line=node.lineno,
+                signature=signature,
+                descriptor=None,
+                symbol_kind="constructor",
+                signature_status=(
+                    "unknown"
+                    if constructor_unknown or initializer is None
+                    else _signature_status(
+                        initializer,
+                        self._return_resolver(initializer_binding.file)
+                        if initializer_binding is not None and initializer_binding.file
+                        else None,
+                    )
+                ),
+                analysis_fingerprint=constructor_fingerprint,
+                return_contract=(
+                    ReturnContract(
+                        protocol=contract.protocol,
+                        variants=contract.variants,
+                        status="unknown",
+                        provenance=(*contract.provenance, "unknown_constructor_protocol"),
+                    ).as_dict()
+                    if constructor_unknown
+                    else contract.as_dict()
+                ),
+            )
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            return SourceEndpoint(
+                file=file_name,
+                owner=owner,
+                name=name,
+                line=getattr(node, "lineno", None),
+                symbol_kind="non_callable",
+                analysis_fingerprint=resolved.fingerprint,
+            )
+        descriptor = _descriptor(node, self._return_resolver(file_name))
+        if access_kind == "direct":
+            effective_access_kind = "class_attribute" if owner is not None else "module"
+        signature = _bound_signature(
+            _jsonable_signature(node),
+            descriptor=descriptor,
+            access_kind=effective_access_kind,
+        )
+        contract = infer_return_contract(node, resolver=self._return_resolver(file_name))
+        return SourceEndpoint(
+            file=file_name,
+            owner=owner,
+            name=name,
+            line=node.lineno,
+            signature=signature,
+            descriptor=descriptor,
+            symbol_kind="callable",
+            signature_status=_signature_status(node, self._return_resolver(file_name)),
+            analysis_fingerprint=resolved.fingerprint,
+            return_contract=contract.as_dict() if contract is not None else None,
         )
 
     def expression_endpoint(self, expression: str) -> SourceEndpoint | None:
@@ -245,7 +912,10 @@ class GitSnapshot:
         tree = self.tree(file_name)
         if tree is None:
             return None
-        body = _owner_node(tree, owner).body if owner and _owner_node(tree, owner) is not None else tree.body
+        owner_node = _owner_node(tree, owner) if owner else None
+        if owner and owner_node is None:
+            return None
+        body = owner_node.body if owner_node is not None else tree.body
         matches = [
             item
             for item in body
@@ -262,7 +932,15 @@ class GitSnapshot:
             name=node.name,
             line=node.lineno,
             signature=_jsonable_signature(node),
-            descriptor=_descriptor(node),
+            descriptor=_descriptor(node, self._return_resolver(file_name)),
+            symbol_kind="callable",
+            signature_status=_signature_status(node, self._return_resolver(file_name)),
+            analysis_fingerprint=_node_fingerprint(node),
+            return_contract=(
+                contract.as_dict()
+                if (contract := infer_return_contract(node, resolver=self._return_resolver(file_name))) is not None
+                else None
+            ),
         )
 
 
@@ -279,14 +957,60 @@ def _rename_maps(root: Path, old: str, new: str) -> tuple[dict[str, str], dict[s
     return old_to_new, new_to_old
 
 
-def _state(upstream: SourceEndpoint, downstream_signature: list[object] | None, relation: str) -> CompatibilityState:
-    if upstream.file is None or upstream.name is None:
+def _state(
+    upstream: SourceEndpoint,
+    downstream_signature: list[object] | None,
+    relation: str,
+    installed_descriptor: str | None = None,
+    upstream_contract: SignatureContract | None = None,
+) -> CompatibilityState:
+    presence = _relation_symbol_presence(upstream)
+    if presence is False:
         return CompatibilityState(False, False, "upstream target does not exist")
+    if presence is None:
+        return CompatibilityState(None, None, "upstream target binding could not be proven")
     if relation == "inheritance":
-        return CompatibilityState(True, True, "upstream base class exists")
-    if upstream.signature is None or downstream_signature is None:
+        return (
+            CompatibilityState(True, True, "upstream base class exists")
+            if upstream.symbol_kind == "class"
+            else CompatibilityState(True, False, "upstream base target is no longer a class")
+        )
+    if upstream.symbol_kind != "callable":
+        return CompatibilityState(True, False, "upstream target is no longer callable")
+    if (
+        upstream.owner is not None
+        and upstream.descriptor is not None
+        and installed_descriptor is not None
+        and upstream.descriptor != installed_descriptor
+    ):
+        return CompatibilityState(
+            True,
+            False,
+            "installed descriptor does not preserve the upstream access protocol",
+        )
+    if upstream_contract is not None:
+        if upstream_contract.status != "exact":
+            return CompatibilityState(
+                True,
+                None,
+                "upstream runtime signature transform could not be proven",
+            )
+        upstream_signature = upstream_contract.bound_call_signature
+    else:
+        if upstream.signature_status == "unknown":
+            return CompatibilityState(
+                True,
+                None,
+                "upstream runtime signature transform could not be proven",
+            )
+        upstream_signature = _bound_signature(
+            upstream.signature,
+            descriptor=upstream.descriptor,
+            access_kind="instance" if upstream.owner is not None else "module",
+        )
+    if upstream_signature is None or downstream_signature is None:
         return CompatibilityState(True, None, "callable signature could not be compared")
-    compatible = _accepts_signature_contract(upstream.signature, downstream_signature)
+    compatible = _accepts_signature_contract(upstream_signature, downstream_signature)
     return CompatibilityState(
         True,
         compatible,
@@ -298,11 +1022,67 @@ def _state(upstream: SourceEndpoint, downstream_signature: list[object] | None, 
     )
 
 
+def _direct_call_state(upstream: SourceEndpoint, dependency: DirectCallDependency) -> CompatibilityState:
+    if upstream.symbol_kind in {None, "unknown"}:
+        return CompatibilityState(None, None, "upstream call target binding could not be proven")
+    if upstream.file is None or upstream.symbol_kind == "missing":
+        return CompatibilityState(False, False, "upstream call target does not exist")
+    if upstream.symbol_kind not in {"callable", "constructor"}:
+        return CompatibilityState(True, False, "upstream target is no longer callable")
+    if upstream.signature_status == "unknown":
+        return CompatibilityState(True, None, "upstream runtime signature transform could not be proven")
+    compatible, reason = bind_call_shape(upstream.signature, dependency.call_shape)
+    return CompatibilityState(True, compatible, reason)
+
+
+def _replacement_return_state(
+    upstream: SourceEndpoint,
+    downstream: SourceEndpoint,
+) -> CompatibilityState:
+    presence = _relation_symbol_presence(upstream)
+    if presence is False:
+        return CompatibilityState(False, False, "upstream target does not exist")
+    if presence is None:
+        return CompatibilityState(None, None, "upstream target binding could not be proven")
+    if upstream.symbol_kind != "callable":
+        return CompatibilityState(True, False, "upstream target is no longer callable")
+    compatible, reason = replacement_return_compatible(
+        return_contract_from_dict(upstream.return_contract),
+        return_contract_from_dict(downstream.return_contract),
+    )
+    return CompatibilityState(True, compatible, reason)
+
+
+def _return_use_state(
+    upstream: SourceEndpoint,
+    dependency: DirectCallDependency,
+) -> CompatibilityState:
+    if upstream.symbol_kind in {None, "unknown"}:
+        return CompatibilityState(None, None, "upstream call target binding could not be proven")
+    if upstream.file is None or upstream.symbol_kind == "missing":
+        return CompatibilityState(False, False, "upstream call target does not exist")
+    if upstream.symbol_kind not in {"callable", "constructor"}:
+        return CompatibilityState(True, False, "upstream target is no longer callable")
+    compatible, reason = return_use_compatible(
+        return_contract_from_dict(upstream.return_contract),
+        dependency.return_use,
+    )
+    return CompatibilityState(True, compatible, reason)
+
+
 def _classify(
     old_state: CompatibilityState,
     new_state: CompatibilityState,
     contract_changed: bool,
+    *,
+    newly_introduced_contract: bool = False,
 ) -> str:
+    if newly_introduced_contract:
+        if new_state.compatible is False:
+            return "introduced_break"
+        if new_state.compatible is True:
+            return "compatibility_warning"
+        return "analysis_unresolved"
     if old_state.compatible is True and new_state.compatible is False:
         return "introduced_break"
     if old_state.compatible is False and new_state.compatible is True:
@@ -311,23 +1091,40 @@ def _classify(
         return "preexisting"
     if contract_changed and old_state.compatible is True and new_state.compatible is True:
         return "compatibility_warning"
-    if old_state.exists is False and new_state.compatible is False:
-        return "introduced_break"
     return "analysis_unresolved"
 
 
-def _change_text(old: SourceEndpoint, new: SourceEndpoint) -> str:
+def _change_text(
+    old: SourceEndpoint,
+    new: SourceEndpoint,
+    contract_kind: str = "call_arguments",
+    *,
+    runtime_signature_changed: bool = False,
+) -> str:
     if old.file is None and new.file is not None:
         return "upstream target was added"
     if old.file is not None and new.file is None:
         return "upstream target was removed"
+    if old.symbol_kind == "missing" and new.symbol_kind != "missing":
+        return "upstream symbol was added"
+    if old.symbol_kind != "missing" and new.symbol_kind == "missing":
+        return "upstream symbol was removed"
+    if old.symbol_kind != new.symbol_kind:
+        return f"upstream symbol binding changed: {old.symbol_kind} -> {new.symbol_kind}"
     if old.file != new.file:
         return f"upstream target moved: {old.file} -> {new.file}"
     if old.name != new.name:
         return f"upstream callable renamed: {old.name} -> {new.name}"
     if old.descriptor != new.descriptor:
         return f"descriptor changed: {old.descriptor} -> {new.descriptor}"
-    if old.signature != new.signature:
+    if runtime_signature_changed:
+        return "callable runtime signature contract changed"
+    if _ambiguous_binding_changed(old, new):
+        return "ambiguous callable binding changed and requires review"
+    if contract_kind == "return_usage" or contract_kind == "replacement_return":
+        if old.return_contract != new.return_contract:
+            return "callable return contract changed"
+    elif old.signature != new.signature:
         return "callable parameter contract changed"
     return "no exact callable contract delta"
 
@@ -349,6 +1146,8 @@ def _suggestion(relation: str, classification: str, old: SourceEndpoint, new: So
         return "核对新基类路径和 MRO；不要在继承链不完整时猜测替代类。"
     if relation == "direct_import":
         return "更新 import 模块或符号路径，并补充导入边界测试。"
+    if relation == "direct_call":
+        return "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。"
     return "根据上下游精确契约差异调整依赖，并补充接口级回归测试。"
 
 
@@ -357,12 +1156,12 @@ def _finding_id(*parts: object) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _relation_finding(
+def _relation_endpoints(
     relation: Relation,
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
     new_to_old: dict[str, str],
-) -> RangeFinding | None:
+) -> tuple[SourceEndpoint, SourceEndpoint]:
     old_file = new_to_old.get(relation.upstream_file, relation.upstream_file)
     old_endpoint = old_snapshot.endpoint(old_file, relation.upstream_owner, relation.upstream_name)
     new_endpoint = new_snapshot.endpoint(
@@ -370,7 +1169,7 @@ def _relation_finding(
         relation.upstream_owner,
         relation.upstream_name,
     )
-    if new_endpoint.file is None:
+    if _relation_symbol_presence(new_endpoint) is False:
         old_tree = old_snapshot.tree(old_file)
         old_node = _named_node(old_tree, relation.upstream_owner, relation.upstream_name) if old_tree else None
         renamed = new_snapshot.unique_rename(
@@ -381,61 +1180,221 @@ def _relation_finding(
         )
         if renamed is not None:
             new_endpoint = renamed
+    return old_endpoint, new_endpoint
+
+
+def _relation_downstream_endpoint(
+    relation: Relation,
+    engine: InterfaceBoundaryGenerator,
+) -> SourceEndpoint:
+    module, _ = _file_module(relation.downstream_file)
+    qualified_name = ".".join(item for item in (module, relation.downstream_owner, relation.downstream_name) if item)
+    callable_info = engine.downstream.find_callable(qualified_name)
+    node = callable_info.node if callable_info is not None else None
+
+    def resolve(expression: str) -> str | None:
+        return engine.downstream.resolve_reference(module, expression)
+
+    return_contract = infer_return_contract(
+        node,
+        resolver=resolve,
+        forward_name=relation.upstream_name if relation.relation == "override" else None,
+    )
+    installed_contract = relation.installed_signature_contract
+    if return_contract is not None and installed_contract is not None and installed_contract.status != "exact":
+        return_contract = ReturnContract(
+            protocol=return_contract.protocol,
+            variants=return_contract.variants,
+            status="unknown",
+            provenance=(*return_contract.provenance, "unknown_runtime_wrapper"),
+        )
+    installed_signature = (
+        installed_contract.bound_call_signature
+        if installed_contract is not None and installed_contract.status == "exact"
+        else None
+    )
+    if installed_contract is None:
+        installed_signature = _bound_signature(
+            relation.downstream_signature,
+            descriptor=relation.installed_descriptor_kind,
+            access_kind="instance" if relation.upstream_owner is not None else "module",
+        )
     downstream = SourceEndpoint(
         file=relation.downstream_file,
         owner=relation.downstream_owner,
         name=relation.downstream_name,
         line=relation.evidence_line,
-        signature=relation.downstream_signature,
-        descriptor=relation.downstream_descriptor_kind,
+        signature=installed_signature,
+        descriptor=relation.installed_descriptor_kind,
+        symbol_kind="callable",
+        signature_status=(installed_contract.status if installed_contract is not None else "exact"),
+        return_contract=return_contract.as_dict() if return_contract is not None else None,
     )
-    old_state = _state(old_endpoint, relation.downstream_signature, relation.relation)
-    new_state = _state(new_endpoint, relation.downstream_signature, relation.relation)
+    return downstream
+
+
+def _finding_action(classification: str, gates: dict[str, bool]) -> str:
+    if classification == "introduced_break" and all(gates.values()):
+        return "modify"
+    return "dismiss" if classification in {"preexisting", "fixed"} else "review"
+
+
+def _relation_findings(
+    relation: Relation,
+    engine: InterfaceBoundaryGenerator,
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+    new_to_old: dict[str, str],
+) -> list[RangeFinding]:
+    old_endpoint, new_endpoint = _relation_endpoints(
+        relation,
+        old_snapshot,
+        new_snapshot,
+        new_to_old,
+    )
+    downstream = _relation_downstream_endpoint(relation, engine)
+    old_exists = _relation_symbol_presence(old_endpoint)
+    new_exists = _relation_symbol_presence(new_endpoint)
+    runtime_signature_changed = _runtime_signature_changed(
+        old_endpoint,
+        new_endpoint,
+    )
     contract_changed = (
-        old_endpoint.file != new_endpoint.file
+        old_exists != new_exists
+        or old_endpoint.file != new_endpoint.file
         or old_endpoint.name != new_endpoint.name
         or old_endpoint.signature != new_endpoint.signature
         or old_endpoint.descriptor != new_endpoint.descriptor
-    )
-    # The range report is a delta report. A proven relationship whose exact
-    # upstream contract did not change is useful inventory, but it is not a
-    # range risk and must not inflate unresolved or historical counts.
-    if not contract_changed:
-        return None
-    classification = _classify(old_state, new_state, contract_changed)
-    gates = {
-        "relationship_verified": True,
-        "contract_changed": contract_changed,
-        "runtime_reachable": True,
-        "version_lane_matches": True,
-    }
-    action = (
-        "modify"
-        if classification == "introduced_break" and all(gates.values())
-        else ("dismiss" if classification in {"preexisting", "fixed"} else "review")
+        or old_endpoint.signature_status != new_endpoint.signature_status
+        or _ambiguous_binding_changed(old_endpoint, new_endpoint)
+        or runtime_signature_changed
     )
     evidence = [item.as_dict() for item in relation.evidence] or [
         {"file": relation.evidence_file, "line": relation.evidence_line}
     ]
-    return RangeFinding(
-        finding_id=_finding_id(relation.exact_key(), old_snapshot.revision, new_snapshot.revision),
-        classification=classification,
-        relation=relation.relation,
-        priority="P0"
-        if relation.relation == "monkey_patch" and action == "modify"
-        else ("P1" if action == "modify" else "P2"),
-        action=action,
-        confidence="high" if classification != "analysis_unresolved" else "medium",
-        upstream_old=old_endpoint,
-        upstream_new=new_endpoint,
-        downstream=downstream,
-        old_state=old_state,
-        new_state=new_state,
-        change=_change_text(old_endpoint, new_endpoint),
-        evidence=evidence,
-        gates=gates,
-        suggestion=_suggestion(relation.relation, classification, old_endpoint, new_endpoint),
+    findings: list[RangeFinding] = []
+    if contract_changed:
+        contract_kind = "base_presence" if relation.relation == "inheritance" else "call_arguments"
+        old_state = _state(
+            old_endpoint,
+            downstream.signature,
+            relation.relation,
+            downstream.descriptor,
+        )
+        new_state = _state(
+            new_endpoint,
+            downstream.signature,
+            relation.relation,
+            downstream.descriptor,
+            _snapshot_signature_contract(new_endpoint),
+        )
+        classification = _classify(
+            old_state,
+            new_state,
+            contract_changed,
+            newly_introduced_contract=(
+                relation.relation in {"monkey_patch", "override"} and old_exists is False and new_exists is True
+            ),
+        )
+        gates = {
+            "relationship_verified": True,
+            "contract_changed": contract_changed,
+            "runtime_reachable": True,
+            "version_lane_matches": True,
+        }
+        action = _finding_action(classification, gates)
+        findings.append(
+            RangeFinding(
+                finding_id=_finding_id(
+                    relation.exact_key(),
+                    contract_kind,
+                    old_snapshot.revision,
+                    new_snapshot.revision,
+                ),
+                classification=classification,
+                relation=relation.relation,
+                priority=(
+                    "P0"
+                    if relation.relation == "monkey_patch" and action == "modify"
+                    else ("P1" if action == "modify" else "P2")
+                ),
+                action=action,
+                confidence="high" if classification != "analysis_unresolved" else "medium",
+                upstream_old=old_endpoint,
+                upstream_new=new_endpoint,
+                downstream=downstream,
+                old_state=old_state,
+                new_state=new_state,
+                change=_change_text(
+                    old_endpoint,
+                    new_endpoint,
+                    runtime_signature_changed=runtime_signature_changed,
+                ),
+                evidence=evidence,
+                gates=gates,
+                suggestion=_suggestion(relation.relation, classification, old_endpoint, new_endpoint),
+                contract_kind=contract_kind,
+                direction="upstream_contract_to_downstream_implementation",
+                details={
+                    "installed_signature": downstream.signature,
+                    "installed_descriptor": downstream.descriptor,
+                },
+            )
+        )
+
+    return_changed = new_exists is True and (
+        old_exists is not True or old_endpoint.return_contract != new_endpoint.return_contract
     )
+    if relation.relation in {"monkey_patch", "override"} and return_changed:
+        old_state = _replacement_return_state(old_endpoint, downstream)
+        new_state = _replacement_return_state(new_endpoint, downstream)
+        classification = _classify(
+            old_state,
+            new_state,
+            return_changed,
+            newly_introduced_contract=old_exists is False and new_exists is True,
+        )
+        gates = {
+            "relationship_verified": True,
+            "contract_changed": return_changed,
+            "runtime_reachable": True,
+            "version_lane_matches": True,
+        }
+        action = _finding_action(classification, gates)
+        findings.append(
+            RangeFinding(
+                finding_id=_finding_id(
+                    relation.exact_key(),
+                    "replacement_return",
+                    old_snapshot.revision,
+                    new_snapshot.revision,
+                ),
+                classification=classification,
+                relation=relation.relation,
+                priority="P0"
+                if relation.relation == "monkey_patch" and action == "modify"
+                else ("P1" if action == "modify" else "P2"),
+                action=action,
+                confidence="high" if classification != "analysis_unresolved" else "medium",
+                upstream_old=old_endpoint,
+                upstream_new=new_endpoint,
+                downstream=downstream,
+                old_state=old_state,
+                new_state=new_state,
+                change=_change_text(old_endpoint, new_endpoint, "replacement_return"),
+                evidence=evidence,
+                gates=gates,
+                suggestion="同步 patch/override 的返回协议，使其满足上游新接口约定，并补充返回值回归测试。",
+                contract_kind="replacement_return",
+                direction="upstream_contract_to_downstream_implementation",
+                details={
+                    "upstream_old_return": old_endpoint.return_contract,
+                    "upstream_new_return": new_endpoint.return_contract,
+                    "downstream_return": downstream.return_contract,
+                },
+            )
+        )
+    return findings
 
 
 @dataclass(frozen=True)
@@ -637,9 +1596,279 @@ def _import_findings(
                 gates=gates,
                 suggestion=_suggestion("direct_import", "introduced_break", old_endpoint, new_endpoint),
                 source="direct_import_detector",
+                contract_kind="symbol_presence",
+                direction="downstream_import_to_upstream",
             )
         )
     return findings
+
+
+def _direct_call_findings(
+    dependencies: Iterable[DirectCallDependency],
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+) -> tuple[list[RangeFinding], list[DirectCallDependency]]:
+    findings: list[RangeFinding] = []
+    exact_dependencies: list[DirectCallDependency] = []
+    for dependency in dependencies:
+        old_endpoint = old_snapshot.call_endpoint(
+            dependency.target,
+            dependency.access_kind,
+            receiver_type=dependency.receiver_type,
+            member=dependency.member,
+        )
+        new_endpoint = new_snapshot.call_endpoint(
+            dependency.target,
+            dependency.access_kind,
+            receiver_type=dependency.receiver_type,
+            member=dependency.member,
+        )
+        callable_kinds = {"callable", "constructor"}
+        exact_dependencies.append(dependency)
+        downstream = SourceEndpoint(
+            file=dependency.file,
+            owner=dependency.owner,
+            name=dependency.callee,
+            line=dependency.line,
+            symbol_kind="callsite",
+        )
+        parameter_changed = (
+            old_endpoint.file != new_endpoint.file
+            or old_endpoint.owner != new_endpoint.owner
+            or old_endpoint.name != new_endpoint.name
+            or old_endpoint.signature != new_endpoint.signature
+            or old_endpoint.descriptor != new_endpoint.descriptor
+            or old_endpoint.symbol_kind != new_endpoint.symbol_kind
+            or old_endpoint.signature_status != new_endpoint.signature_status
+            or _ambiguous_binding_changed(old_endpoint, new_endpoint)
+        )
+        if parameter_changed:
+            contract_kind = (
+                "call_target_presence"
+                if old_endpoint.symbol_kind not in callable_kinds or new_endpoint.symbol_kind not in callable_kinds
+                else "call_arguments"
+            )
+            old_state = _direct_call_state(old_endpoint, dependency)
+            new_state = _direct_call_state(new_endpoint, dependency)
+            classification = _classify(old_state, new_state, parameter_changed)
+            gates = {
+                "relationship_verified": True,
+                "contract_changed": parameter_changed,
+                "runtime_reachable": True,
+                "version_lane_matches": True,
+            }
+            action = _finding_action(classification, gates)
+            findings.append(
+                RangeFinding(
+                    finding_id=_finding_id(
+                        "direct_call",
+                        contract_kind,
+                        dependency.file,
+                        dependency.line,
+                        dependency.column,
+                        dependency.target,
+                        old_snapshot.revision,
+                        new_snapshot.revision,
+                    ),
+                    classification=classification,
+                    relation="direct_call",
+                    priority="P1" if action == "modify" else "P2",
+                    action=action,
+                    confidence="high" if classification != "analysis_unresolved" else "medium",
+                    upstream_old=old_endpoint,
+                    upstream_new=new_endpoint,
+                    downstream=downstream,
+                    old_state=old_state,
+                    new_state=new_state,
+                    change=_change_text(
+                        old_endpoint,
+                        new_endpoint,
+                        runtime_signature_changed=(old_endpoint.signature_status != new_endpoint.signature_status),
+                    ),
+                    evidence=[dependency.as_dict()],
+                    gates=gates,
+                    suggestion=_suggestion("direct_call", classification, old_endpoint, new_endpoint),
+                    source="direct_call_detector",
+                    contract_kind=contract_kind,
+                    direction="downstream_call_to_upstream",
+                    details={
+                        "target": dependency.target,
+                        "access_kind": dependency.access_kind,
+                        "receiver_type": dependency.receiver_type,
+                        "member": dependency.member,
+                        "call_shape": dependency.call_shape.as_dict(),
+                        "scope": dependency.scope,
+                    },
+                )
+            )
+
+        return_changed = (
+            old_endpoint.owner != new_endpoint.owner
+            or old_endpoint.name != new_endpoint.name
+            or old_endpoint.return_contract != new_endpoint.return_contract
+        )
+        if (
+            old_endpoint.symbol_kind not in callable_kinds
+            or new_endpoint.symbol_kind not in callable_kinds
+            or not dependency.return_use.constrains_return
+            or not return_changed
+        ):
+            continue
+        old_state = _return_use_state(old_endpoint, dependency)
+        new_state = _return_use_state(new_endpoint, dependency)
+        classification = _classify(old_state, new_state, return_changed)
+        gates = {
+            "relationship_verified": True,
+            "contract_changed": return_changed,
+            "runtime_reachable": True,
+            "version_lane_matches": True,
+        }
+        action = _finding_action(classification, gates)
+        findings.append(
+            RangeFinding(
+                finding_id=_finding_id(
+                    "direct_call",
+                    "return_usage",
+                    dependency.file,
+                    dependency.line,
+                    dependency.column,
+                    dependency.target,
+                    old_snapshot.revision,
+                    new_snapshot.revision,
+                ),
+                classification=classification,
+                relation="direct_call",
+                priority="P1" if action == "modify" else "P2",
+                action=action,
+                confidence="high" if classification != "analysis_unresolved" else "medium",
+                upstream_old=old_endpoint,
+                upstream_new=new_endpoint,
+                downstream=downstream,
+                old_state=old_state,
+                new_state=new_state,
+                change=_change_text(old_endpoint, new_endpoint, "return_usage"),
+                evidence=[dependency.as_dict()],
+                gates=gates,
+                suggestion="同步下游对上游返回值的解包、下标或协议使用，并补充该调用点回归测试。",
+                source="direct_call_detector",
+                contract_kind="return_usage",
+                direction="downstream_call_to_upstream",
+                details={
+                    "target": dependency.target,
+                    "return_use": dependency.return_use.as_dict(),
+                    "upstream_old_return": old_endpoint.return_contract,
+                    "upstream_new_return": new_endpoint.return_contract,
+                    "scope": dependency.scope,
+                },
+            )
+        )
+    return findings, exact_dependencies
+
+
+def validate_current_contracts(
+    engine: InterfaceBoundaryGenerator,
+    relations: Iterable[Relation],
+    snapshot: GitSnapshot,
+    plan: AnalysisPlan | None = None,
+) -> tuple[list[DirectCallDependency], list[dict[str, Any]]]:
+    """Validate exact call/return contracts for one checked-out source pair."""
+
+    plan = plan or resolve_analysis_plan()
+    discovered_dependencies = (
+        DirectCallDetector(engine).discover() if plan.analyze_direct_calls else []
+    )
+    dependencies: list[DirectCallDependency] = []
+    findings: list[dict[str, Any]] = []
+    for dependency in discovered_dependencies:
+        upstream = snapshot.call_endpoint(
+            dependency.target,
+            dependency.access_kind,
+            receiver_type=dependency.receiver_type,
+            member=dependency.member,
+        )
+        dependencies.append(dependency)
+        argument_state = _direct_call_state(upstream, dependency)
+        if argument_state.compatible is not True:
+            findings.append(
+                {
+                    "relation": "direct_call",
+                    "contract_kind": "call_arguments",
+                    "status": "risk" if argument_state.compatible is False else "review",
+                    "upstream": upstream.as_dict(),
+                    "downstream": {
+                        "file": dependency.file,
+                        "owner": dependency.owner,
+                        "name": dependency.callee,
+                        "line": dependency.line,
+                    },
+                    "reason": argument_state.reason,
+                    "evidence": dependency.as_dict(),
+                }
+            )
+        if dependency.return_use.constrains_return:
+            return_state = _return_use_state(upstream, dependency)
+            if return_state.compatible is not True:
+                findings.append(
+                    {
+                        "relation": "direct_call",
+                        "contract_kind": "return_usage",
+                        "status": "risk" if return_state.compatible is False else "review",
+                        "upstream": upstream.as_dict(),
+                        "downstream": {
+                            "file": dependency.file,
+                            "owner": dependency.owner,
+                            "name": dependency.callee,
+                            "line": dependency.line,
+                        },
+                        "reason": return_state.reason,
+                        "evidence": dependency.as_dict(),
+                    }
+                )
+
+    for relation in relations:
+        if (
+            relation.upstream_package != "vllm"
+            or relation.relation not in {"monkey_patch", "override"}
+            or relation.relation not in plan.relation_types
+        ):
+            continue
+        upstream = snapshot.endpoint(
+            relation.upstream_file,
+            relation.upstream_owner,
+            relation.upstream_name,
+        )
+        downstream = _relation_downstream_endpoint(relation, engine)
+        upstream_contract = return_contract_from_dict(upstream.return_contract)
+        downstream_contract = return_contract_from_dict(downstream.return_contract)
+        if upstream_contract is None or downstream_contract is None or upstream_contract.status == "bottom":
+            continue
+        state = _replacement_return_state(upstream, downstream)
+        if state.compatible is True:
+            continue
+        findings.append(
+            {
+                "relation": relation.relation,
+                "contract_kind": "replacement_return",
+                "status": "risk" if state.compatible is False else "review",
+                "upstream": upstream.as_dict(),
+                "downstream": downstream.as_dict(),
+                "reason": state.reason,
+                "evidence": [item.as_dict() for item in relation.evidence]
+                or [{"file": relation.evidence_file, "line": relation.evidence_line}],
+            }
+        )
+
+    ordered = sorted(
+        findings,
+        key=lambda item: (
+            item["status"],
+            item["relation"],
+            item["contract_kind"],
+            item["downstream"]["file"] or "",
+            item["downstream"]["line"] or 0,
+        ),
+    )
+    return dependencies, ordered
 
 
 def analyze_range(
@@ -652,9 +1881,16 @@ def analyze_range(
     external_roots: dict[str, Path] | None = None,
     external_shas: dict[str, str] | None = None,
     profile: str = "exact-contracts",
+    scenario: str = MAIN2MAIN_SCENARIO,
 ) -> dict[str, Any]:
+    analysis_started = time.perf_counter()
+    phase_started = time.perf_counter()
+    timings: dict[str, float | None] = {}
+    plan = resolve_analysis_plan(scenario)
     if profile not in {"exact-contracts", "expanded"}:
         raise ValueError(f"unsupported profile: {profile}")
+    if scenario != MAIN2MAIN_SCENARIO and profile != "exact-contracts":
+        raise ValueError("vllm-interface scenario supports only the exact-contracts profile")
     old_sha, new_sha = verify_range(vllm_root, old, new)
     verify_head("vLLM new", vllm_root, new_sha)
     ascend_sha = verify_head("vllm-ascend", ascend_root, expect_ascend_sha)
@@ -664,6 +1900,7 @@ def analyze_range(
         raise ValueError("external roots and SHAs must name the same packages")
     for package, root in external_roots.items():
         verify_head(f"external {package}", root, external_shas[package])
+    phase_started = _diagnostic_timing("input_verification", phase_started, timings)
 
     generator = InterfaceBoundaryGenerator(
         vllm_root,
@@ -671,7 +1908,15 @@ def analyze_range(
         external_roots,
         source_versions={"vllm": new_sha, "vllm_ascend": ascend_sha, **external_shas},
     )
-    relations, generator_findings = generator.generate()
+    phase_started = _diagnostic_timing("repository_indexing", phase_started, timings)
+    relations, generator_findings = generator.generate(plan)
+    timings.update(
+        {
+            f"relation_generation.{name}": duration
+            for name, duration in generator.phase_timings.items()
+        }
+    )
+    phase_started = time.perf_counter()
     old_snapshot = GitSnapshot(vllm_root, old_sha)
     new_snapshot = GitSnapshot(vllm_root, new_sha)
     old_to_new, new_to_old = _rename_maps(vllm_root, old_sha, new_sha)
@@ -679,12 +1924,49 @@ def analyze_range(
     findings = [
         finding
         for relation in relations
-        if relation.upstream_package == "vllm"
-        if (finding := _relation_finding(relation, old_snapshot, new_snapshot, new_to_old)) is not None
+        if relation.upstream_package == "vllm" and relation.relation in plan.relation_types
+        for finding in _relation_findings(
+            relation,
+            generator,
+            old_snapshot,
+            new_snapshot,
+            new_to_old,
+        )
     ]
-    findings.extend(_import_findings(ascend_root, old_snapshot, new_snapshot, old_to_new))
+    phase_started = _diagnostic_timing("relation_comparison", phase_started, timings)
+    if plan.analyze_direct_imports:
+        import_started = time.perf_counter()
+        findings.extend(_import_findings(ascend_root, old_snapshot, new_snapshot, old_to_new))
+        _diagnostic_timing("direct_import_analysis", import_started, timings)
+    else:
+        timings["direct_import_analysis"] = None
 
-    for candidate in generator_findings:
+    direct_call_dependencies: list[DirectCallDependency] = []
+    if plan.analyze_direct_calls:
+        direct_started = time.perf_counter()
+        discovered_direct_calls = DirectCallDetector(generator).discover()
+        comparison_started = _diagnostic_timing(
+            "direct_call_discovery",
+            direct_started,
+            timings,
+        )
+        direct_call_findings, direct_call_dependencies = _direct_call_findings(
+            discovered_direct_calls,
+            old_snapshot,
+            new_snapshot,
+        )
+        findings.extend(direct_call_findings)
+        _diagnostic_timing(
+            "direct_call_comparison",
+            comparison_started,
+            timings,
+        )
+    else:
+        timings["direct_call_discovery"] = None
+        timings["direct_call_comparison"] = None
+
+    generator_finding_started = time.perf_counter()
+    for candidate in generator_findings if plan.include_generator_findings else []:
         if candidate.status not in {"review", "risk"}:
             continue
         old_endpoint = old_snapshot.expression_endpoint(candidate.target_expression)
@@ -753,8 +2035,19 @@ def analyze_range(
                     else "静态证据不足，先人工确认目标绑定或补充分析规则，不要直接修改下游代码。"
                 ),
                 source="generator_finding",
+                contract_kind="target_presence" if verified_removal else "analysis_evidence",
+                direction="upstream_contract_to_downstream_implementation",
             )
         )
+
+    if plan.include_generator_findings:
+        _diagnostic_timing(
+            "generator_finding_conversion",
+            generator_finding_started,
+            timings,
+        )
+    else:
+        timings["generator_finding_conversion"] = None
 
     deduplicated = {item.finding_id: item for item in findings}
     ordered = sorted(
@@ -768,21 +2061,37 @@ def analyze_range(
         ),
     )
     counts = Counter(item.classification for item in ordered)
+    relation_counts = Counter(item.relation for item in ordered)
+    contract_counts = Counter(item.contract_kind for item in ordered)
+    analyzed_relation_count = sum(
+        relation.upstream_package == "vllm" and relation.relation in plan.relation_types
+        for relation in relations
+    )
+    timings["total"] = round(time.perf_counter() - analysis_started, 6)
     return {
         "schema_version": RANGE_SCHEMA_VERSION,
         "metadata": {
             "range_analyzer_version": RANGE_ANALYZER_VERSION,
             "generator_version": GENERATOR_VERSION,
             "profile": profile,
+            "scenario": plan.scenario,
+            "analysis_plan": plan.as_dict(),
             "vllm_old_sha": old_sha,
             "vllm_new_sha": new_sha,
             "vllm_ascend_sha": ascend_sha,
             "external_sources": dict(sorted(external_shas.items())),
+            "timings_seconds": timings,
         },
         "summary": {
-            "relations": len(relations),
-            "generator_findings": len(generator_findings),
+            "relations": analyzed_relation_count,
+            "relations_collected": len(relations),
+            "direct_call_dependencies": len(direct_call_dependencies),
+            "generator_findings": (
+                len(generator_findings) if plan.include_generator_findings else 0
+            ),
             "total": len(ordered),
+            "by_relation": dict(sorted(relation_counts.items())),
+            "by_contract": dict(sorted(contract_counts.items())),
             **{name: counts[name] for name in CLASSIFICATIONS},
         },
         "findings": [item.as_dict() for item in ordered],
@@ -799,6 +2108,8 @@ def _csv_rows(findings: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
             "priority": item["priority"],
             "action": item["action"],
             "relation": item["relation"],
+            "contract_kind": item.get("contract_kind", ""),
+            "direction": item.get("direction", ""),
             "upstream_old": ":".join(str(value or "") for value in (old["file"], old["owner"], old["name"])),
             "upstream_new": ":".join(str(value or "") for value in (new["file"], new["owner"], new["name"])),
             "downstream": ":".join(
@@ -810,32 +2121,42 @@ def _csv_rows(findings: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
             "new_compatible": item["compatibility"]["new"]["compatible"],
             "confidence": item["confidence"],
             "suggestion": item["suggestion"],
+            "call_shape": json.dumps(item.get("details", {}).get("call_shape"), ensure_ascii=False),
+            "return_use": json.dumps(item.get("details", {}).get("return_use"), ensure_ascii=False),
+            "upstream_old_return": json.dumps(old.get("return_contract"), ensure_ascii=False),
+            "upstream_new_return": json.dumps(new.get("return_contract"), ensure_ascii=False),
+            "downstream_return": json.dumps(downstream.get("return_contract"), ensure_ascii=False),
         }
+
+
+CSV_FIELDS = [
+    "classification",
+    "priority",
+    "action",
+    "relation",
+    "contract_kind",
+    "direction",
+    "upstream_old",
+    "upstream_new",
+    "downstream",
+    "downstream_line",
+    "change",
+    "old_compatible",
+    "new_compatible",
+    "confidence",
+    "suggestion",
+    "call_shape",
+    "return_use",
+    "upstream_old_return",
+    "upstream_new_return",
+    "downstream_return",
+]
 
 
 def _write_csv(path: Path, findings: list[dict[str, Any]]) -> None:
     rows = list(_csv_rows(findings))
-    fields = (
-        list(rows[0])
-        if rows
-        else [
-            "classification",
-            "priority",
-            "action",
-            "relation",
-            "upstream_old",
-            "upstream_new",
-            "downstream",
-            "downstream_line",
-            "change",
-            "old_compatible",
-            "new_compatible",
-            "confidence",
-            "suggestion",
-        ]
-    )
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -861,9 +2182,19 @@ def _markdown(report: dict[str, Any]) -> str:
         lines.append("没有发现能够确认由本次区间引入的接口 break。")
     for item in introduced:
         downstream = item["downstream"]
+        contract_labels = {
+            "call_arguments": "调用参数",
+            "call_target_presence": "调用目标",
+            "return_usage": "返回值消费",
+            "replacement_return": "替代实现返回协议",
+            "symbol_presence": "导入符号",
+            "target_presence": "上游目标",
+            "base_presence": "继承目标",
+        }
+        contract_label = contract_labels.get(item.get("contract_kind"), item.get("contract_kind", "接口契约"))
         lines.extend(
             [
-                f"### {item['relation']}：{downstream['file']}:{downstream['line'] or ''}",
+                f"### {item['relation']} / {contract_label}：{downstream['file']}:{downstream['line'] or ''}",
                 "",
                 f"- 变化：{item['change']}",
                 f"- 下游接口：`{downstream['owner'] or ''}.{downstream['name'] or ''}`",
@@ -883,8 +2214,129 @@ def _markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _upstream_pr_findings(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in report["findings"]
+        if item["classification"] == "introduced_break"
+        and item["action"] == "modify"
+        and item["relation"] in {"override", "direct_call"}
+    ]
+
+
+def _root_cause_key(item: dict[str, Any]) -> tuple[object, ...]:
+    upstream = item["upstream"]["new"]
+    return (
+        item["relation"],
+        item.get("contract_kind"),
+        upstream.get("file"),
+        upstream.get("owner"),
+        upstream.get("name"),
+        item.get("change"),
+    )
+
+
+def _upstream_pr_payload(report: dict[str, Any]) -> dict[str, Any]:
+    findings = _upstream_pr_findings(report)
+    relation_counts = Counter(item["relation"] for item in findings)
+    contract_counts = Counter(item.get("contract_kind", "") for item in findings)
+    return {
+        "schema_version": report["schema_version"],
+        "metadata": report["metadata"],
+        "summary": {
+            "introduced_breaks": len(findings),
+            "root_causes": len({_root_cause_key(item) for item in findings}),
+            "by_relation": dict(sorted(relation_counts.items())),
+            "by_contract": dict(sorted(contract_counts.items())),
+        },
+        "findings": findings,
+    }
+
+
+def _upstream_pr_markdown(payload: dict[str, Any]) -> str:
+    meta = payload["metadata"]
+    summary = payload["summary"]
+    findings = payload["findings"]
+    result = "PASS" if not findings else "BREAKS FOUND"
+    lines = [
+        "# vLLM Interface Compatibility",
+        "",
+        f"**Result: {result}**",
+        "",
+        f"- vLLM range: `{meta['vllm_old_sha']}` -> `{meta['vllm_new_sha']}`",
+        f"- vllm-ascend baseline: `{meta['vllm_ascend_sha']}`",
+        "- Scope: downstream override and direct upstream-call contracts",
+        "- Monkey patches, direct imports, inheritance-only findings, generator reviews, "
+        "and historical incompatibilities are intentionally excluded.",
+        f"- Introduced breaks: {summary['introduced_breaks']}",
+        f"- Root causes: {summary['root_causes']}",
+        "",
+        "## Introduced breaks",
+        "",
+    ]
+    if not findings:
+        lines.append("No new downstream interface break was introduced by this range.")
+    for index, item in enumerate(findings, start=1):
+        upstream = item["upstream"]["new"]
+        downstream = item["downstream"]
+        upstream_name = ".".join(
+            value for value in (upstream.get("owner"), upstream.get("name")) if value
+        )
+        lines.extend(
+            [
+                f"### {index}. {item['priority']} {item['relation']} / {item.get('contract_kind', '')}",
+                "",
+                f"- Upstream: `{upstream.get('file') or ''}:{upstream_name}`",
+                f"- Downstream: `{downstream.get('file') or ''}:{downstream.get('line') or ''}`",
+                f"- Change: {item['change']}",
+                f"- Suggested action: {item['suggestion']}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _write_upstream_pr_reports(
+    report: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, str]:
+    payload = _upstream_pr_payload(report)
+    json_path = output_dir / "vllm-interface-pr-report.json"
+    introduced_csv = output_dir / "vllm-interface-introduced-breaks.csv"
+    markdown_path = output_dir / "vllm-interface-pr-summary.md"
+    metadata_path = output_dir / "vllm-interface-analysis-metadata.json"
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _write_csv(introduced_csv, payload["findings"])
+    markdown_path.write_text(_upstream_pr_markdown(payload), encoding="utf-8")
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "schema_version": report["schema_version"],
+                "metadata": report["metadata"],
+                "introduced_breaks": payload["summary"]["introduced_breaks"],
+                "root_causes": payload["summary"]["root_causes"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "json": str(json_path),
+        "introduced_csv": str(introduced_csv),
+        "markdown": str(markdown_path),
+        "metadata_json": str(metadata_path),
+    }
+
+
 def write_reports(report: dict[str, Any], output_dir: Path) -> dict[str, str]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if report.get("metadata", {}).get("scenario") == "vllm-interface":
+        return _write_upstream_pr_reports(report, output_dir)
     json_path = output_dir / "main2main-range-report.json"
     all_csv = output_dir / "main2main-all-findings.csv"
     introduced_csv = output_dir / "main2main-introduced-breaks.csv"

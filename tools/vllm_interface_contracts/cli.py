@@ -10,9 +10,16 @@ from collections import Counter
 from pathlib import Path
 
 from tools.vllm_interface_contracts import generator
+from tools.vllm_interface_contracts.analysis_plans import (
+    MAIN2MAIN_SCENARIO,
+    SCENARIOS,
+    resolve_analysis_plan,
+)
 from tools.vllm_interface_contracts.range_analysis import (
+    GitSnapshot,
     analyze_range,
     git_head,
+    validate_current_contracts,
     write_reports,
 )
 
@@ -43,17 +50,23 @@ def _range_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser
     parser.add_argument("--old", required=True)
     parser.add_argument("--new", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--scenario", choices=SCENARIOS, default=MAIN2MAIN_SCENARIO)
     parser.add_argument("--profile", choices=("exact-contracts", "expanded"), default="exact-contracts")
     parser.add_argument("--fail-on", choices=("never", "introduced", "unresolved"), default="never")
 
 
 def _validate_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
-    parser = subparsers.add_parser("validate", help="Regenerate and validate the live dependency graph.")
+    parser = subparsers.add_parser(
+        "validate",
+        help="Regenerate the live dependency graph and validate exact call/return contracts.",
+    )
     _add_sources(parser)
+    parser.add_argument("--scenario", choices=SCENARIOS, default=MAIN2MAIN_SCENARIO)
     parser.add_argument("--output", type=Path)
 
 
 def _validate(args: argparse.Namespace) -> int:
+    plan = resolve_analysis_plan(args.scenario)
     vllm_sha = git_head(args.vllm_root)
     ascend_sha = git_head(args.ascend_root)
     expected_ascend = generator._git_head(args.ascend_root)
@@ -74,20 +87,44 @@ def _validate(args: argparse.Namespace) -> int:
         external_roots,
         source_versions={"vllm": vllm_sha, "vllm_ascend": ascend_sha, **external_shas},
     )
-    relations, findings = engine.generate()
-    statuses = Counter(item.status for item in findings)
+    relations, findings = engine.generate(plan)
+    visible_generator_findings = findings if plan.include_generator_findings else []
+    direct_calls, contract_findings = validate_current_contracts(
+        engine,
+        relations,
+        GitSnapshot(args.vllm_root, vllm_sha),
+        plan,
+    )
+    statuses = Counter(item.status for item in visible_generator_findings)
+    contract_statuses = Counter(str(item["status"]) for item in contract_findings)
     payload = {
         "inputs": {
             "vllm_sha": vllm_sha,
             "vllm_ascend_sha": ascend_sha,
             "generator_version": generator.GENERATOR_VERSION,
+            "scenario": plan.scenario,
+            "analysis_plan": plan.as_dict(),
+            "relation_generation_timings_seconds": engine.phase_timings,
         },
         "summary": {
-            "relations": len(relations),
-            "findings": len(findings),
-            "generator_issues": sum(item.generator_issue for item in findings),
+            "relations": sum(
+                relation.upstream_package == "vllm"
+                and relation.relation in plan.relation_types
+                for relation in relations
+            ),
+            "relations_collected": len(relations),
+            "direct_call_dependencies": len(direct_calls),
+            "findings": len(visible_generator_findings) + len(contract_findings),
+            "generator_findings": len(visible_generator_findings),
+            "contract_findings": len(contract_findings),
+            "contract_risks": contract_statuses["risk"],
+            "contract_reviews": contract_statuses["review"],
+            "generator_issues": sum(
+                item.generator_issue for item in visible_generator_findings
+            ),
             "by_status": dict(sorted(statuses.items())),
         },
+        "contract_findings": contract_findings,
     }
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -108,9 +145,18 @@ def _analyze(args: argparse.Namespace) -> int:
         external_roots=external_roots,
         external_shas=external_shas,
         profile=args.profile,
+        scenario=args.scenario,
     )
     outputs = write_reports(report, args.output_dir)
-    console = {"metadata": report["metadata"], "summary": report["summary"], "outputs": outputs}
+    console_summary = report["summary"]
+    if args.scenario == "vllm-interface":
+        pr_payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
+        console_summary = pr_payload["summary"]
+    console = {
+        "metadata": report["metadata"],
+        "summary": console_summary,
+        "outputs": outputs,
+    }
     print(json.dumps(console, ensure_ascii=False, indent=2))
     if args.fail_on == "introduced" and report["summary"]["introduced_break"]:
         return 1

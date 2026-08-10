@@ -6,6 +6,8 @@ vllm-ascend. The existing upstream `vllm-interface` job collects it because that
 
 The compact `interface_boundaries.jsonl` file stores one upstream callable per line. Each record contains the upstream
 signature boundary and all related vllm-ascend patch, override, direct-call, or inheritance endpoints.
+Its historical `direct_callable` consumer record is distinct from the range analyzer's concrete `direct_call`
+dependencies; the latter are contract-analysis-only and do not enter the schema-6 relation golden.
 
 The test checks:
 
@@ -31,7 +33,7 @@ python -m tools.vllm_interface_contracts validate --help
 
 The main2main skill is intentionally only an adapter around this package.  It validates the requested SHAs, selects
 `new`, `legacy`, or `compare` mode, reuses an exact-input cache, and renders the Chinese report.  AST indexing, MRO,
-override, monkey-patch, import, and signature decisions are owned by this package alone.
+override, monkey-patch, import, callsite, signature, and return-contract decisions are owned by this package alone.
 
 For a Chinese explanation of why the generator grew from its early version to more than 10,000 lines, including the
 problem solved by every version from v0.3 to v0.36, see `接口映射生成器代码演进说明.md`.
@@ -119,9 +121,61 @@ python -m tools.vllm_interface_contracts analyze-range \
   --old <old-sha> \
   --new <new-sha> \
   --expect-ascend-sha <ascend-sha> \
+  --scenario main2main \
   --output-dir /path/to/report-dir
 ```
+
+`--scenario` selects one of two fixed execution plans; it is not a collection of independent low-level switches:
+
+- `main2main` (default) runs the full exact-contract analysis: patch, override, inheritance, direct import, direct call,
+  return protocol, and generator findings. It preserves the existing report names and behavior.
+- `vllm-interface` is the upstream PR awareness plan. It analyzes override and exact downstream-call contracts only.
+  Inheritance/MRO discovery still runs as an override prerequisite, but it does not emit inheritance findings. Monkey
+  patch collection, direct-import comparison, and generator-finding conversion are skipped before execution. This plan
+  accepts only `exact-contracts`.
+
+The upstream plan writes `vllm-interface-pr-summary.md`, `vllm-interface-pr-report.json`,
+`vllm-interface-introduced-breaks.csv`, and `vllm-interface-analysis-metadata.json`. Its PR-facing Markdown, JSON, and
+CSV contain only actionable `introduced_break` findings for override or direct-call contracts; historical and
+unresolved items are intentionally absent. The metadata records every capability as `analyzed`, `prerequisite`, or
+`skipped`, plus per-phase elapsed time. The command remains awareness-only unless `--fail-on` is explicitly selected.
 
 Findings are separated into `introduced_break`, `compatibility_warning`, `preexisting`, `fixed`, and
 `analysis_unresolved`.  Unchanged verified relationships are omitted from the upgrade report.  By default the command
 only warns and exits successfully; `--fail-on introduced` is available for a future blocking CI, but is not the default.
+
+Range schema version 3 reports the selected scenario, fixed plan version, capability states, and phase timings in
+addition to the four exact contract families introduced by schema 2. Under the default `exact-contracts` profile,
+these families remain available without changing the generator JSONL schema or its fixed relation golden:
+
+- downstream-to-upstream calls: uniquely resolved module functions, constructors, class/static methods, annotated or
+  provably constructed instances are checked by binding each concrete `args`/`kwargs` shape independently at old and
+  new. For downstream `self`/`super`, the pinned vllm-ascend MRO must first prove one effective upstream owner, and each
+  snapshot then validates that exact owner. Immediate or uniquely aliased tuple/list unpacking, literal subscripts,
+  iteration, context-manager use, and `await` are checked separately against the old/new return protocols;
+- upstream-to-downstream implementations: each generator-proven patch or override keeps the existing installed-input
+  substitutability check, while exact return annotations or statically proven return paths are checked covariantly
+  against the old and new upstream return protocols.
+
+Imported, annotated, or constructed vLLM receiver members are re-resolved at old and new only through a unique,
+statically provable single-inheritance vLLM chain. Multiple, external, incomplete, or otherwise ambiguous receiver
+hierarchies are not selected; a moved or missing `self`/`super` owner is unknown rather than guessed. Constructor calls
+are exact only when class decorators/keywords, custom or inherited `__new__`, metaclass behavior, and the effective
+`__init__` are all proven safe. Descriptor and overload handling likewise requires a unique runtime implementation and
+origin-proven builtins; shadowed decorators or overload-only/conditional bindings are unknown. Return covariance is a
+conservative structural check over the protocols and shapes that the analyzer can prove, not arbitrary nominal subtype
+inference. For this interface-only pass, a concrete downstream callsite or a generator-proven patch/override
+installation is sufficient source reachability evidence; full model/device/runtime-path reachability is intentionally
+not modeled.
+
+The detector omits a dependency when the callsite itself cannot be uniquely resolved, including dynamic
+`*args`/`**kwargs`, ambiguous callees, and unsupported receiver hierarchies. Once a dependency is proven, an ambiguous
+old/new endpoint, runtime signature, or constrained return shape becomes `analysis_unresolved`; neither path becomes
+`modify`. Unused, forwarded, escaping, or otherwise unconstrained return values do not produce a return-use finding.
+Calls nested under any `if` condition containing a call named `vllm_version_is` are excluded from this default detector
+on both branches. These dynamic exact call contracts are different from the historical static `call_protocol` mapping
+table, which remains an opt-in `expanded`/legacy review asset.
+
+`validate` applies the same detector to the checked-out source pair and includes current direct-call and
+patch/override-return risks in `contract_findings`.  `analyze-range` remains the command that attributes a compatibility
+transition specifically to `old -> new`.
