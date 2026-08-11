@@ -100,6 +100,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Diagnostic only. Record device-side hidden/logits probes and sampled-token
+    # snapshots, then print them after the async output's existing D2H wait.
+    # This must remain disabled outside sample-memory-corruption investigations.
+    "VLLM_ASCEND_SAMPLE_TRACE": lambda: bool(int(os.getenv("VLLM_ASCEND_SAMPLE_TRACE", "0"))),
 }
 
 # end-env-vars-definition

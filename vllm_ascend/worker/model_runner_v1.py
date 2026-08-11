@@ -112,6 +112,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -190,6 +191,16 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.dcp_utils import DCPAsyncSpecDecodeRebuildResult, DCPManager
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
+from vllm_ascend.worker.sample_trace import (
+    PROBE_STAGE_HIDDEN_STATES,
+    PROBE_STAGE_LOGITS,
+    TOKEN_STAGE_AFTER_SAMPLE,
+    TOKEN_STAGE_BEFORE_ASYNC_OUTPUT,
+    SampleTraceBufferPool,
+    SampleTraceHandle,
+    TracedAsyncGPUModelRunnerOutput,
+    normalize_eos_token_ids,
+)
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
@@ -286,6 +297,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: "ECConnectorOutput | None"
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
+    sample_trace: SampleTraceHandle | None
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -340,6 +352,34 @@ class NPUModelRunner(GPUModelRunner):
 
         self.sampler = AscendSampler()
         self.attn_state: AscendAttentionState | None = None
+
+        self.sample_trace_pool: SampleTraceBufferPool | None = None
+        if envs.VLLM_ASCEND_SAMPLE_TRACE:
+            if not self.use_async_scheduling:
+                logger.warning(
+                    "VLLM_ASCEND_SAMPLE_TRACE requires async scheduling and was disabled"
+                )
+            elif not self.pin_memory:
+                logger.warning(
+                    "VLLM_ASCEND_SAMPLE_TRACE requires pinned host memory and was disabled"
+                )
+            else:
+                hf_config = getattr(self.model_config, "hf_text_config", None)
+                if hf_config is None:
+                    hf_config = getattr(self.model_config, "hf_config", None)
+                eos_token_ids = normalize_eos_token_ids(
+                    getattr(hf_config, "eos_token_id", None)
+                )
+                self.sample_trace_pool = SampleTraceBufferPool(
+                    max_num_reqs=self.max_num_reqs,
+                    max_sample_tokens=max(1, self.num_spec_tokens + 1),
+                    device=self.device,
+                    eos_token_ids=eos_token_ids,
+                )
+                logger.warning(
+                    "VLLM_ASCEND_SAMPLE_TRACE enabled with eos_token_ids=%s",
+                    eos_token_ids,
+                )
 
         # Ascend-specific configurations
         self.ascend_config = get_ascend_config()
@@ -2174,6 +2214,24 @@ class NPUModelRunner(GPUModelRunner):
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+            sample_trace = None
+            if self.sample_trace_pool is not None:
+                sample_trace = self.sample_trace_pool.acquire(
+                    self.input_batch.req_ids.copy()
+                )
+                if sample_trace is not None:
+                    sample_trace.snapshot_tensor_probes(
+                        PROBE_STAGE_HIDDEN_STATES,
+                        "sample_hidden_states",
+                        sample_hidden_states,
+                    )
+                    sample_trace.snapshot_tensor_probes(
+                        PROBE_STAGE_LOGITS,
+                        "logits_before_sample",
+                        logits,
+                        include_eos=True,
+                    )
+
             # Apply structured output bitmasks if present
             self.execute_model_state = ExecuteModelState(
                 scheduler_output,
@@ -2188,6 +2246,7 @@ class NPUModelRunner(GPUModelRunner):
                 ec_connector_output,
                 cudagraph_stats,
                 batch_desc,
+                sample_trace,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -2233,6 +2292,7 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output,
             cudagraph_stats,
             batch_desc,
+            sample_trace,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -2248,6 +2308,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if sample_trace is not None:
+            sample_trace.snapshot_token_ids(
+                TOKEN_STAGE_AFTER_SAMPLE,
+                "sampled_token_ids_after_sample",
+                sampler_output.sampled_token_ids,
+            )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -2415,15 +2481,32 @@ class NPUModelRunner(GPUModelRunner):
                     :total
                 ].clone(),
             )
-        async_output = AsyncGPUModelRunnerOutput(
-            model_runner_output=model_runner_output,
-            sampled_token_ids=sampler_output.sampled_token_ids,
-            logprobs_tensors=sampler_output.logprobs_tensors,
-            invalid_req_indices=invalid_req_indices,
-            async_output_copy_stream=self.async_output_copy_stream,
-            vocab_size=self.input_batch.vocab_size,
-            routed_experts=routed_experts_snapshot,
-        )
+        if sample_trace is None:
+            async_output = AsyncGPUModelRunnerOutput(
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+                routed_experts=routed_experts_snapshot,
+            )
+        else:
+            sample_trace.snapshot_token_ids(
+                TOKEN_STAGE_BEFORE_ASYNC_OUTPUT,
+                "sampled_token_ids_before_async_output",
+                sampler_output.sampled_token_ids,
+            )
+            async_output = TracedAsyncGPUModelRunnerOutput(
+                sample_trace=sample_trace,
+                model_runner_output=model_runner_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                logprobs_tensors=sampler_output.logprobs_tensors,
+                invalid_req_indices=invalid_req_indices,
+                async_output_copy_stream=self.async_output_copy_stream,
+                vocab_size=self.input_batch.vocab_size,
+                routed_experts=routed_experts_snapshot,
+            )
         self.input_batch.set_async_sampled_token_ids(
             async_output.sampled_token_ids_cpu,
             async_output.async_copy_ready_event,
