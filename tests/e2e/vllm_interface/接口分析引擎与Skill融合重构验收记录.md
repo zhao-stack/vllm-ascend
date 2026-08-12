@@ -96,7 +96,7 @@
 
 因为生成器关系语义和 JSONL schema 均未变化，本轮按约定没有重复执行固定 972 条 golden 全量回放，也没有重复执行当前 main 全量回放；上一轮逐字节 golden 和当前 main 验收结果继续有效。
 
-## 8. 按使用场景选择执行步骤（2026-08-10）
+## 8. 按使用场景选择执行步骤：初版（2026-08-10）
 
 公共引擎新增两套固定执行计划，不开放任意组合的底层开关，也没有复制 AST、MRO、patch、签名或返回值分析逻辑：
 
@@ -124,3 +124,57 @@ PR 级产物不展示 `preexisting`、`analysis_unresolved`、patch、direct imp
 - 两套场景共同保留 5005 个 direct-call 依赖；上游场景保留 683 条 override 分析关系，另收集 210 条 inheritance 关系作为 MRO 前置证据但不输出 finding。
 - 因为本轮修改了 `generator.generate()` 的计划调度入口，重新执行固定 golden：耗时 752 秒，972 条关系全部 exact match，173 条 finding 和状态分布不变，old-only/new-only、descriptor/signature change、generator issue 均为 0；SHA-256 仍为 `725504ef474f4cf52f6a1a06a12a0440b56c6d7ff8861a7a39e47cd48a815cc5`。
 - 本轮代表性回放保存在 `analysis_runs/interface_engine_scenario_refactor_20260810`，没有覆盖旧验收报告，也没有重复执行当前 main 全量回放。
+
+## 9. vllm-interface 补充 direct import（2026-08-10）
+
+根据上游 PR 预警的实际用途，对第 8 节的初版计划做一处边界调整：`vllm-interface` 最终执行 direct import、override 和 direct call 分析，仍然在执行前跳过 monkey patch 和 generator finding 转换。上游 PR 移除导出符号时，即使当前下游调用点未覆盖到，也会及时显示受影响的下游 import；下游主动安装的 patch 仍只在 main2main 全量场景分析。
+
+range analyzer 升级为 `1.2.1`，固定计划版本升级为 2；range schema 仍为 3，generator 仍为 `0.36.0`。direct import 分析和旧上游端点解析均复用公共引擎已有能力，没有在场景层重新实现 AST、MRO、patch 或签名分析。PR 摘要将解析到同一旧上游 callable 指纹的 import/call findings 聚合为一个根因，但 JSON、CSV 和 Markdown 仍保留每个受影响代码位置。
+
+本轮验收结果：
+
+- 公共引擎测试：291 passed；新增根因聚合和 Markdown 上游路径定向回归通过；Ruff 通过。
+- skill 工作副本：51 passed；`quick_validate` 通过。
+- PR13477 `vllm-interface` 冷启动：总耗时 795.499 秒，输出 4 条 actionable introduced break，其中 `direct_import=3`、`direct_call=1`，聚合为 1 个 `FusedMoE` 上游根因。
+- 3 个 import 位置分别是 `vllm_ascend/models/deepseek_v4.py:47`、`vllm_ascend/models/minimax_m3/minimax_m3.py:43` 和 `vllm_ascend/ops/fused_moe/fused_moe.py:20`；call 位置为 `vllm_ascend/models/minimax_m3/minimax_m3.py:549`。
+- 能力元数据明确记录 direct import、override、direct call 为 `analyzed`，monkey patch 和 generator findings 为 `skipped`；报告中 monkey-patch finding 为 0。
+- 分阶段耗时：仓库索引 433.355 秒、inheritance/MRO 9.870 秒、override 133.023 秒、关系比较 41.112 秒、direct import 64.928 秒、direct-call 发现 61.945 秒、direct-call 比较 50.688 秒。
+- 新验收产物保存在 `analysis_runs/interface_engine_scenario_refactor_20260810/pr13477_vllm_interface_with_imports`，没有覆盖初版产物。
+
+因为本轮只调整 range 场景计划、PR 根因聚合和展示，没有改变生成器关系语义、JSONL schema 或 main2main 能力集，因此按约定没有重复执行固定 golden 和当前 main 全量回放，上一轮验收结果继续有效。
+
+## 10. PR13477 漏检边界复核与后续事项（2026-08-12）
+
+按 `vllm-interface` 当前阶段只完善直接接口和 import、暂不引入普通字段/属性类型传播的边界重新对照 PR13477 后，本阶段没有新增的范围内漏检根因。`vllm_ascend/worker/model_runner_v1.py` 中的 `self.routed_experts_capturer.clear_buffer()` 在运行语义上确实是下游调用上游方法：旧上游的 `GPUModelRunner.init_routed_experts_capturer()` 将 `RoutedExpertsCapturer(...)` 写入普通实例字段，旧版 `RoutedExpertsCapturer.clear_buffer` 存在而新版已删除。但下游该调用点没有直接 import、构造、继承或 override `RoutedExpertsCapturer`，其 receiver 类型必须通过上游基类方法对实例字段的赋值才能证明，因此随字段/属性看护放到下一阶段。
+
+当前发现器能解析 `self.method()`、`super().method()`、带唯一类型注解的 receiver 和函数内唯一构造的实例，但不能为 `self.<field>.<method>()` 跨完整 MRO 追踪“继承基类方法给实例字段赋值”的类型来源。该调用因此没有生成 dependency，后续比较阶段也就没有机会报告缺失方法。下一阶段的修复方向是仅在字段类型和单继承链均可唯一静态证明时，解析这种二级实例 receiver；歧义赋值、多继承或动态重绑定仍保持 omitted/unresolved，不猜测目标。仓库另有 patch 文件直接 import `RoutedExpertsCapturer` 并替换 `capture`，但该 monkey-patch 关系不能证明 `model_runner_v1.py` 中 `clear_buffer()` receiver 的类型，而且不属于本调用点的依赖。
+
+以下项目明确延后，不计入当前接口/import 阶段的漏检数：
+
+- 普通属性存在性与属性读取契约，例如 `envs.Q_SCALE_CONSTANT/K_SCALE_CONSTANT/V_SCALE_CONSTANT` 的运行时映射变化，以及继承对象上的 `self.calculate_kv_scales`；进入下一阶段的 attribute presence/read 分析。
+- 通过普通实例字段间接调用的方法，例如 `self.routed_experts_capturer.clear_buffer()`；与字段 receiver 类型传播一起进入下一阶段，届时仍按 `direct_call/call_target_presence` 比较最终方法端点。
+- Mamba postprocess 的复制实现、索引映射、buffer 和 Triton kernel 数据协议同步；不属于 direct import、override 或 exact direct call。
+- `FusedMoE -> FusedMoEFactory` 的 monkey-patch 安装落点；`vllm-interface` 计划明确在执行前跳过 monkey patch，相关 direct import 和构造调用落点已由当前计划报告。
+- 测试中的动态 `torch.ops.vllm.maybe_calc_kv_scales` mock，以及 Vision/PyTorch 版本语义兼容；前者不是生产代码依赖，后者不是本阶段的接口/import 契约。
+
+因此，在上述阶段边界不变的前提下，PR13477 没有暴露新的本阶段待修漏检；`RoutedExpertsCapturer.clear_buffer()` 作为下一阶段字段 receiver 类型传播的代表性验收样本保留。
+
+## 11. PR11709 Triton `kernel[grid](...)` 漏检修复（2026-08-12）
+
+本轮按阶段边界只修复 direct call，不扩大 monkey-patch wrapper 的扫描范围。`vllm-interface` 计划仍在执行前跳过 monkey patch；wrapper 是否安装、PR 是否修改 wrapper 均不作为本次依赖发现条件。
+
+漏检包含两个连续原因：下游 `_compute_slot_mapping_kernel[(num_reqs + 1,)](...)` 在 AST 中的 `Call.func` 是 `Subscript`，原发现器不能从中取得真正的 kernel；即使取得目标，原端点分析也把带 `@triton.jit(...)` 的定义签名标为 unknown。修复后，发现器从 `kernel[grid]` 解出唯一上游 callable，但仍对外层 `(...)` 统计实参；端点仅在函数具有一个可规范解析为 `vllm.triton_utils.triton.jit` 的装饰器时使用定义签名。普通 `mapping[key](...)` 和额外/未知装饰器栈继续 fail closed，不把任意下标调用猜成 Triton。
+
+公共 range analyzer 升级为 `1.3.0`，range schema 升级为 4；`DirectCallDependency` 和 finding evidence 新增 `invocation_kind=triton_kernel_launch`。generator 仍为 `0.36.0`、JSONL schema 仍为 6、固定场景计划仍为版本 2，monkey-patch 能力和计划没有修改。
+
+定向回归覆盖四种情况：标准 `@triton.jit(...)` 的 `kernel[grid](...)` 能解析并保留外层参数；无 Triton 装饰器的普通下标 callable 不会被误报；额外装饰器栈保持 fail closed；old 可绑定而 new 新增必需参数时输出 `introduced_break`。`test_call_contracts.py` 与 `test_range_analysis.py` 合计 78 passed，Ruff check/format 和 `git diff --check` 通过。
+
+PR11709 固定输入全量回放：
+
+- vLLM old：`1f486d96a17303ce8db8e02be39545b2be338446`
+- vLLM new：`e5588e49bc2642670116664a7fc4096e27adb179`
+- vllm-ascend baseline：`3b75c4ecf8ef471fc751ce34af806e1be407f397`
+- 结果：actionable introduced breaks 从修复前 4 条增加为 5 条；新增项是 `vllm_ascend/worker/block_table.py:160` 的 `direct_call/call_arguments`。
+- 绑定证据：下游调用为 8 个位置参数和 `TOTAL_CP_WORLD_SIZE`、`TOTAL_CP_RANK`、`CP_KV_CACHE_INTERLEAVE_SIZE`、`PAD_ID`、`BLOCK_SIZE` 5 个关键字；old 端绑定成功，new 端因缺少必需参数 `KV_CACHE_BLOCK_SIZE` 失败，随后还缺少 `BLOCKS_PER_KV_BLOCK`。
+- 总耗时 722.317 秒：仓库索引 424.610 秒、relation comparison 22.465 秒、direct import 43.112 秒、direct-call discovery 59.122 秒、direct-call comparison 48.839 秒。
+- 产物目录：`analysis_runs/pr11709_vllm_interface_20260812_triton_fix`。原始 PR JSON、CSV、Markdown 和元数据均保留，没有覆盖修复前报告。

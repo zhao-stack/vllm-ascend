@@ -19,7 +19,7 @@ def test_vllm_interface_plan_excludes_downstream_patch_scope() -> None:
     assert plan.collect_inheritance
     assert not plan.analyze_inheritance
     assert not plan.collect_monkey_patches
-    assert not plan.analyze_direct_imports
+    assert plan.analyze_direct_imports
     assert plan.analyze_direct_calls
     assert not plan.include_generator_findings
 

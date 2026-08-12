@@ -4,6 +4,45 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v1.3.0 - exact Triton subscript launches
+
+- Direct-call discovery now unwraps the callable from Triton's
+  `kernel[grid](...)` syntax and binds the outer call's positional and keyword
+  arguments to the old/new kernel definitions.
+- The adapter is deliberately exact: the imported upstream target must resolve
+  uniquely and have one canonical `vllm.triton_utils.triton.jit` decorator.
+  Ordinary `mapping[key](...)` calls and unsupported decorator stacks are not
+  guessed as Triton kernels.
+- Direct-call evidence records `invocation_kind=triton_kernel_launch`; range
+  schema advances to 4 while generator `0.36.0`, JSONL schema 6, and the fixed
+  scenario plans remain unchanged. In particular, the `vllm-interface` plan
+  still skips monkey-patch collection.
+- PR11709 replay (`1f486d96` -> `e5588e49`, vllm-ascend `3b75c4ec`)
+  now reports `vllm_ascend/worker/block_table.py:160`: the old launch binds,
+  while the new kernel requires missing `KV_CACHE_BLOCK_SIZE` (and then
+  `BLOCKS_PER_KV_BLOCK`). The actionable total therefore changes from 4 to 5.
+- Regression evidence: the direct-call and range-analysis modules pass 78
+  tests, including a positive Triton launch, ordinary-subscript and additional
+  decorator negative controls, and an old-compatible/new-incompatible range
+  case.
+
+## range analyzer v1.2.1 - include direct imports in upstream PR awareness
+
+- The fixed plan advances to version 2. `vllm-interface` now runs the existing
+  direct-import comparison in addition to override and exact direct-call
+  analysis, while monkey-patch collection and patch-oriented generator findings
+  remain skipped.
+- PR-facing JSON, CSV, Markdown, and console summaries now include actionable
+  introduced direct-import breaks. Historical and unresolved findings remain
+  hidden from PR presentation.
+- Direct-import findings record the existing snapshot resolver's exact old
+  callable root when provable. PR presentation uses that fingerprint to group
+  import and call failures caused by the same upstream symbol change, without
+  grouping unrelated same-name symbols.
+- The generator stays at `0.36.0`, JSONL schema stays at 6, and range schema
+  stays at 3. No AST, import, call, MRO, or signature analysis was duplicated in
+  the scenario layer.
+
 ## range analyzer v1.2.0 - scenario execution plans
 
 - Scope: the generator remains `0.36.0` with JSONL schema 6. The range report

@@ -1,0 +1,60 @@
+{
+  "schema_version": 4,
+  "metadata": {
+    "range_analyzer_version": "1.3.0",
+    "generator_version": "0.36.0",
+    "profile": "exact-contracts",
+    "scenario": "vllm-interface",
+    "analysis_plan": {
+      "scenario": "vllm-interface",
+      "plan_version": 2,
+      "report_style": "upstream-pr-introduced-only",
+      "capabilities": {
+        "inheritance_mro": {
+          "state": "prerequisite",
+          "produces_findings": false
+        },
+        "override": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "monkey_patch": {
+          "state": "skipped",
+          "produces_findings": false
+        },
+        "direct_import": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_call": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "generator_findings": {
+          "state": "skipped",
+          "produces_findings": false
+        }
+      }
+    },
+    "vllm_old_sha": "d02df748bf9efd99022f1a062597dc3cb3808485",
+    "vllm_new_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+    "vllm_ascend_sha": "97f72b814140520e7a20622dc76b2d2fcdca0f7a",
+    "external_sources": {},
+    "timings_seconds": {
+      "input_verification": 0.299855,
+      "repository_indexing": 441.6308,
+      "relation_generation.inheritance_mro": 10.177228,
+      "relation_generation.override": 146.385197,
+      "relation_generation.monkey_patch": null,
+      "relation_generation.relation_finalization": 0.051359,
+      "relation_comparison": 29.505908,
+      "direct_import_analysis": 45.840876,
+      "direct_call_discovery": 68.070285,
+      "direct_call_comparison": 50.269373,
+      "generator_finding_conversion": null,
+      "total": 792.23209
+    }
+  },
+  "introduced_breaks": 10,
+  "root_causes": 10
+}

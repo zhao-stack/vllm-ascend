@@ -166,6 +166,50 @@ def test_unimported_vllm_root_is_not_a_verified_call(tmp_path: Path) -> None:
     assert calls == []
 
 
+def test_triton_subscript_launch_uses_outer_call_arguments(tmp_path: Path) -> None:
+    calls = _direct_calls(
+        tmp_path,
+        ("from vllm.api import kernel\n\ndef use():\n    kernel[(2,)](1, BLOCK_SIZE=16)\n"),
+        upstream=(
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit(do_not_specialize=['value'])\n"
+            "def kernel(value, BLOCK_SIZE): pass\n"
+        ),
+    )
+    assert len(calls) == 1
+    assert calls[0].target == "vllm.api.kernel"
+    assert calls[0].callee == "kernel[2,]"
+    assert calls[0].invocation_kind == "triton_kernel_launch"
+    assert calls[0].call_shape == CallShape(
+        positional_count=1,
+        keyword_names=("BLOCK_SIZE",),
+    )
+
+
+def test_ordinary_subscript_callable_is_not_assumed_to_be_triton(tmp_path: Path) -> None:
+    calls = _direct_calls(
+        tmp_path,
+        "from vllm.api import kernel\n\ndef use():\n    kernel[(2,)](1)\n",
+        upstream="def kernel(value): return value\n",
+    )
+    assert calls == []
+
+
+def test_triton_launch_with_an_additional_decorator_fails_closed(tmp_path: Path) -> None:
+    calls = _direct_calls(
+        tmp_path,
+        "from vllm.api import kernel\n\ndef use():\n    kernel[(2,)](1)\n",
+        upstream=(
+            "from vllm.triton_utils import triton\n\n"
+            "def wrapper(function): return function\n\n"
+            "@wrapper\n"
+            "@triton.jit\n"
+            "def kernel(value): pass\n"
+        ),
+    )
+    assert calls == []
+
+
 def test_module_binding_rebind_is_resolved_at_each_callsite(tmp_path: Path) -> None:
     calls = _direct_calls(
         tmp_path,

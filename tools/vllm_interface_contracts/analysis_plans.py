@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-ANALYSIS_PLAN_VERSION = 1
+ANALYSIS_PLAN_VERSION = 2
 MAIN2MAIN_SCENARIO = "main2main"
 VLLM_INTERFACE_SCENARIO = "vllm-interface"
 SCENARIOS = (MAIN2MAIN_SCENARIO, VLLM_INTERFACE_SCENARIO)
@@ -43,11 +43,7 @@ class AnalysisPlan:
 
     def capabilities(self) -> dict[str, dict[str, Any]]:
         inheritance_state = (
-            "analyzed"
-            if self.analyze_inheritance
-            else "prerequisite"
-            if self.collect_inheritance
-            else "skipped"
+            "analyzed" if self.analyze_inheritance else "prerequisite" if self.collect_inheritance else "skipped"
         )
         return {
             "inheritance_mro": {
@@ -103,7 +99,7 @@ VLLM_INTERFACE_PLAN = AnalysisPlan(
     analyze_inheritance=False,
     collect_overrides=True,
     collect_monkey_patches=False,
-    analyze_direct_imports=False,
+    analyze_direct_imports=True,
     analyze_direct_calls=True,
     include_generator_findings=False,
     report_style="upstream-pr-introduced-only",

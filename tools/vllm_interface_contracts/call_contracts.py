@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from tools.vllm_interface_contracts.generator import (
+    _TRITON_JIT_DECORATOR,
+    _TRITON_KERNEL_PROTOCOL,
     InterfaceBoundaryGenerator,
     ModuleInfo,
     _expression_name,
@@ -112,6 +114,7 @@ class DirectCallDependency:
     return_use: ReturnUse
     receiver_type: str | None = None
     member: str | None = None
+    invocation_kind: str = "python_call"
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -1258,6 +1261,12 @@ class DirectCallDetector:
         # syntax-neutral fact; each old/new snapshot derives its own binding.
         return "direct"
 
+    def _triton_launch_target(self, target: str) -> bool:
+        """Prove that one subscript launch resolves to a plain Triton JIT kernel."""
+
+        callable_info = self.engine.upstream.find_callable(target)
+        return callable_info is not None and callable_info.decorator_references == (_TRITON_JIT_DECORATOR,)
+
     def discover(self) -> list[DirectCallDependency]:
         dependencies: list[DirectCallDependency] = []
         for module_info in self.engine.downstream.modules.values():
@@ -1266,11 +1275,18 @@ class DirectCallDetector:
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call) or _under_version_guard(node, parents):
                     continue
+                invocation_kind = "python_call"
+                callable_node = node.func
+                if isinstance(node.func, ast.Subscript):
+                    invocation_kind = _TRITON_KERNEL_PROTOCOL
+                    callable_node = node.func.value
                 function_node = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
                 function = function_node if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
-                special = self._self_or_super_target(node, parents, module_info.name)
-                special = special or self._annotated_instance_target(node, function, module_info)
-                expression = _expression_name(node.func)
+                special = None
+                if invocation_kind == "python_call":
+                    special = self._self_or_super_target(node, parents, module_info.name)
+                    special = special or self._annotated_instance_target(node, function, module_info)
+                expression = _expression_name(callable_node)
                 root = expression.split(".", 1)[0] if expression is not None else None
                 candidate_roots = self._scope_candidate_roots(function, module_info)
                 if root is not None and self._outer_function_shadows(
@@ -1280,11 +1296,14 @@ class DirectCallDetector:
                     function,
                 ):
                     continue
-                may_be_constructed = (
-                    isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Call)
-                    and (_expression_name(node.func.value.func) or "").split(".", 1)[0] in candidate_roots
-                ) or root in candidate_roots
+                may_be_constructed = invocation_kind == "python_call" and (
+                    (
+                        isinstance(callable_node, ast.Attribute)
+                        and isinstance(callable_node.value, ast.Call)
+                        and (_expression_name(callable_node.value.func) or "").split(".", 1)[0] in candidate_roots
+                    )
+                    or root in candidate_roots
+                )
                 if special is None and may_be_constructed:
                     special = self._constructed_instance_target(node, function, module_info)
                 if special is not None:
@@ -1296,12 +1315,14 @@ class DirectCallDetector:
                     if root not in candidate_roots:
                         continue
                     resolved = self._resolve_in_scope(
-                        node.func,
+                        callable_node,
                         function=function,
                         module_info=module_info,
                         line=getattr(node, "lineno", 0),
                     )
                     if resolved is None or not resolved.startswith("vllm."):
+                        continue
+                    if invocation_kind == _TRITON_KERNEL_PROTOCOL and not self._triton_launch_target(resolved):
                         continue
                     targets = {resolved}
                     access_kind = self._resolved_access_kind(
@@ -1313,7 +1334,7 @@ class DirectCallDetector:
                     if access_kind is None:
                         continue
                     receiver_type = None
-                    member = node.func.attr if isinstance(node.func, ast.Attribute) else None
+                    member = callable_node.attr if isinstance(callable_node, ast.Attribute) else None
                 target = next(iter(targets))
                 if not target.startswith("vllm."):
                     continue
@@ -1333,6 +1354,7 @@ class DirectCallDetector:
                         return_use=infer_return_use(node, parents, scope_node),
                         receiver_type=receiver_type,
                         member=member,
+                        invocation_kind=invocation_kind,
                     )
                 )
         unique = {
@@ -1347,6 +1369,7 @@ class DirectCallDetector:
                 json.dumps(item.return_use.as_dict(), sort_keys=True, separators=(",", ":")),
                 item.receiver_type,
                 item.member,
+                item.invocation_kind,
             ): item
             for item in dependencies
         }

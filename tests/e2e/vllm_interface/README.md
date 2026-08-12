@@ -1,5 +1,7 @@
 # vLLM interface boundary tests
 
+Current implementation and validation handoff: [`VLLM_INTERFACE_HANDOFF_20260812.md`](VLLM_INTERFACE_HANDOFF_20260812.md).
+
 `singlecard/test_interface_boundaries.py` provides a CPU-only boundary check for vLLM callables coupled to
 vllm-ascend. The existing upstream `vllm-interface` job collects it because that job runs the complete
 `tests/e2e/vllm_interface` directory.
@@ -13,7 +15,8 @@ The test checks:
 
 - upstream files, classes, callables, and parameter boundaries;
 - downstream patch and override endpoint boundaries;
-- direct calls for missing/extra positional parameters and unsupported/missing keywords;
+- direct calls for missing/extra positional parameters and unsupported/missing keywords, including exact Triton
+  `kernel[grid](...)` launches;
 - direct inheritance edges.
 
 For monkey-patched callables, direct calls are checked against the replacement signature. The test parses Python source
@@ -129,14 +132,14 @@ python -m tools.vllm_interface_contracts analyze-range \
 
 - `main2main` (default) runs the full exact-contract analysis: patch, override, inheritance, direct import, direct call,
   return protocol, and generator findings. It preserves the existing report names and behavior.
-- `vllm-interface` is the upstream PR awareness plan. It analyzes override and exact downstream-call contracts only.
-  Inheritance/MRO discovery still runs as an override prerequisite, but it does not emit inheritance findings. Monkey
-  patch collection, direct-import comparison, and generator-finding conversion are skipped before execution. This plan
-  accepts only `exact-contracts`.
+- `vllm-interface` is the upstream PR awareness plan. It analyzes direct imports, overrides, and exact downstream-call
+  contracts. Inheritance/MRO discovery still runs as an override prerequisite, but it does not emit inheritance
+  findings. Monkey-patch collection and patch-oriented generator-finding conversion are skipped before execution. This
+  plan accepts only `exact-contracts`.
 
 The upstream plan writes `vllm-interface-pr-summary.md`, `vllm-interface-pr-report.json`,
 `vllm-interface-introduced-breaks.csv`, and `vllm-interface-analysis-metadata.json`. Its PR-facing Markdown, JSON, and
-CSV contain only actionable `introduced_break` findings for override or direct-call contracts; historical and
+CSV contain only actionable `introduced_break` findings for direct-import, override, or direct-call contracts; historical and
 unresolved items are intentionally absent. The metadata records every capability as `analyzed`, `prerequisite`, or
 `skipped`, plus per-phase elapsed time. The command remains awareness-only unless `--fail-on` is explicitly selected.
 
@@ -144,9 +147,10 @@ Findings are separated into `introduced_break`, `compatibility_warning`, `preexi
 `analysis_unresolved`.  Unchanged verified relationships are omitted from the upgrade report.  By default the command
 only warns and exits successfully; `--fail-on introduced` is available for a future blocking CI, but is not the default.
 
-Range schema version 3 reports the selected scenario, fixed plan version, capability states, and phase timings in
-addition to the four exact contract families introduced by schema 2. Under the default `exact-contracts` profile,
-these families remain available without changing the generator JSONL schema or its fixed relation golden:
+Range schema version 4 reports the selected scenario, fixed plan version, capability states, phase timings, and the
+direct-call invocation kind in dependency evidence. It retains the four exact contract families introduced by schema
+2. Under the default `exact-contracts` profile, these families remain available without changing the generator JSONL
+schema or its fixed relation golden:
 
 - downstream-to-upstream calls: uniquely resolved module functions, constructors, class/static methods, annotated or
   provably constructed instances are checked by binding each concrete `args`/`kwargs` shape independently at old and
@@ -156,6 +160,13 @@ these families remain available without changing the generator JSONL schema or i
 - upstream-to-downstream implementations: each generator-proven patch or override keeps the existing installed-input
   substitutability check, while exact return annotations or statically proven return paths are checked covariantly
   against the old and new upstream return protocols.
+
+Triton subscript launches are handled as a direct-call protocol, not as an ordinary Python subscript. The detector
+resolves the callable inside `kernel[grid]`, keeps the arguments from the outer `(...)`, and binds them independently
+against old and new. This path currently requires one uniquely resolved upstream function with exactly one canonical
+`vllm.triton_utils.triton.jit` decorator. Ordinary `mapping[key](...)` calls and additional or unresolved decorator
+stacks remain fail-closed. This range capability is independent of monkey-patch collection, which remains skipped by
+the `vllm-interface` scenario.
 
 Imported, annotated, or constructed vLLM receiver members are re-resolved at old and new only through a unique,
 statically provable single-inheritance vLLM chain. Multiple, external, incomplete, or otherwise ambiguous receiver

@@ -1,0 +1,2574 @@
+{
+  "schema_version": 4,
+  "metadata": {
+    "range_analyzer_version": "1.3.0",
+    "generator_version": "0.36.0",
+    "profile": "exact-contracts",
+    "scenario": "vllm-interface",
+    "analysis_plan": {
+      "scenario": "vllm-interface",
+      "plan_version": 2,
+      "report_style": "upstream-pr-introduced-only",
+      "capabilities": {
+        "inheritance_mro": {
+          "state": "prerequisite",
+          "produces_findings": false
+        },
+        "override": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "monkey_patch": {
+          "state": "skipped",
+          "produces_findings": false
+        },
+        "direct_import": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_call": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "generator_findings": {
+          "state": "skipped",
+          "produces_findings": false
+        }
+      }
+    },
+    "vllm_old_sha": "d02df748bf9efd99022f1a062597dc3cb3808485",
+    "vllm_new_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+    "vllm_ascend_sha": "97f72b814140520e7a20622dc76b2d2fcdca0f7a",
+    "external_sources": {},
+    "timings_seconds": {
+      "input_verification": 0.299855,
+      "repository_indexing": 441.6308,
+      "relation_generation.inheritance_mro": 10.177228,
+      "relation_generation.override": 146.385197,
+      "relation_generation.monkey_patch": null,
+      "relation_generation.relation_finalization": 0.051359,
+      "relation_comparison": 29.505908,
+      "direct_import_analysis": 45.840876,
+      "direct_call_discovery": 68.070285,
+      "direct_call_comparison": 50.269373,
+      "generator_finding_conversion": null,
+      "total": 792.23209
+    }
+  },
+  "summary": {
+    "introduced_breaks": 10,
+    "root_causes": 10,
+    "by_relation": {
+      "direct_call": 1,
+      "direct_import": 1,
+      "override": 8
+    },
+    "by_contract": {
+      "call_arguments": 9,
+      "symbol_presence": 1
+    }
+  },
+  "findings": [
+    {
+      "id": "77a3ce0721d6180d",
+      "classification": "introduced_break",
+      "relation": "direct_call",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+          "owner": null,
+          "name": "prepare_inputs_to_capture",
+          "line": 588,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_reqs",
+                true
+              ],
+              [
+                "num_tokens",
+                true
+              ],
+              [
+                "model_state",
+                true
+              ],
+              [
+                "input_buffers",
+                true
+              ],
+              [
+                "block_tables",
+                true
+              ],
+              [
+                "attn_groups",
+                true
+              ],
+              [
+                "kv_cache_config",
+                true
+              ],
+              [
+                "skip_attn",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "13ba26ce95189bfddd44a6ca352d34cabe497bb81cf36c7aa95c5a430753141b",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.v1.worker.gpu.cudagraph_utils.AttentionState"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation",
+              "return_statements"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+          "owner": null,
+          "name": "prepare_inputs_to_capture",
+          "line": 584,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_reqs",
+                true
+              ],
+              [
+                "num_tokens",
+                true
+              ],
+              [
+                "model_state",
+                true
+              ],
+              [
+                "input_buffers",
+                true
+              ],
+              [
+                "block_tables",
+                true
+              ],
+              [
+                "attn_groups",
+                true
+              ],
+              [
+                "kv_cache_config",
+                true
+              ],
+              [
+                "full_cudagraph",
+                true
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "627b21aa05b4ea74e47d577a6f92550c006f4dd73289642eddf4223e5af106a1",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.v1.worker.gpu.cudagraph_utils.AttentionState"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation",
+              "return_statements"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/worker/v2/spec_decode/eagle/aclgraph.py",
+        "owner": "EagleAclGraphManager",
+        "name": "prepare_inputs_to_capture",
+        "line": 105,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": "callsite",
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "call arguments bind to the callable contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "call arguments do not bind: missing a required argument: 'full_cudagraph'"
+        }
+      },
+      "change": "callable parameter contract changed",
+      "evidence": [
+        {
+          "target": "vllm.v1.worker.gpu.cudagraph_utils.prepare_inputs_to_capture",
+          "access_kind": "direct",
+          "file": "vllm_ascend/worker/v2/spec_decode/eagle/aclgraph.py",
+          "line": 105,
+          "column": 16,
+          "owner": "EagleAclGraphManager",
+          "scope": "create_forward_fn",
+          "callee": "prepare_inputs_to_capture",
+          "call_shape": {
+            "positional_count": 7,
+            "keyword_names": [
+              "skip_attn"
+            ],
+            "dynamic_starargs": false,
+            "dynamic_kwargs": false
+          },
+          "return_use": {
+            "kind": "ignored",
+            "awaited": false,
+            "arity": null,
+            "minimum_arity": null,
+            "key": null,
+            "index": null,
+            "attribute": null,
+            "status": "exact"
+          },
+          "receiver_type": null,
+          "member": null,
+          "invocation_kind": "python_call"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。",
+      "source": "direct_call_detector",
+      "contract_kind": "call_arguments",
+      "direction": "downstream_call_to_upstream",
+      "details": {
+        "target": "vllm.v1.worker.gpu.cudagraph_utils.prepare_inputs_to_capture",
+        "access_kind": "direct",
+        "receiver_type": null,
+        "member": null,
+        "invocation_kind": "python_call",
+        "call_shape": {
+          "positional_count": 7,
+          "keyword_names": [
+            "skip_attn"
+          ],
+          "dynamic_starargs": false,
+          "dynamic_kwargs": false
+        },
+        "scope": "create_forward_fn"
+      }
+    },
+    {
+      "id": "42a87713b2d0410c",
+      "classification": "introduced_break",
+      "relation": "direct_import",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/distributed/weight_transfer/ipc_engine.py",
+          "owner": null,
+          "name": "IPCTrainerSendWeightsArgs",
+          "line": 34,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": "class",
+          "signature_status": null,
+          "analysis_fingerprint": "54359f97fb2ee3db398c4c9bbefacde112d988925d07cb30b0018e986a94c2c2",
+          "return_contract": null
+        },
+        "new": {
+          "file": null,
+          "owner": null,
+          "name": "IPCTrainerSendWeightsArgs",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": null,
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/distributed/weight_transfer/npu_ipc_engine.py",
+        "owner": null,
+        "name": "IPCTrainerSendWeightsArgs",
+        "line": 24,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": null,
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "import target exists at old"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "old import path no longer resolves at new"
+        }
+      },
+      "change": "import module or symbol was removed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/distributed/weight_transfer/npu_ipc_engine.py",
+          "line": 24,
+          "import": "vllm.distributed.weight_transfer.ipc_engine",
+          "symbol": "IPCTrainerSendWeightsArgs"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "更新下游依赖目标；若上游已删除该能力，需要移除 patch/继承并补充替代实现。",
+      "source": "direct_import_detector",
+      "contract_kind": "symbol_presence",
+      "direction": "downstream_import_to_upstream",
+      "details": {
+        "target": "vllm.distributed.weight_transfer.ipc_engine.IPCTrainerSendWeightsArgs",
+        "root_upstream": {
+          "file": "vllm/distributed/weight_transfer/ipc_engine.py",
+          "owner": null,
+          "name": "IPCTrainerSendWeightsArgs",
+          "line": 34,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": "constructor",
+          "signature_status": "unknown",
+          "analysis_fingerprint": "3d0e160586b83b02609d2744fd6a235bd9a9d385282ee811345c919a4bde1024",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.distributed.weight_transfer.ipc_engine.IPCTrainerSendWeightsArgs"
+              }
+            ],
+            "status": "unknown",
+            "provenance": [
+              "class_constructor",
+              "unknown_constructor_protocol"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "192067fcd6ca4672",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "owner": "MoERunner",
+          "name": "_maybe_reduce_shared_expert_output",
+          "line": 416,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "shared_output",
+                true
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "23cc227454b83530cebbebb336cdccbefc77a1f57effb500e6372985a073ffac",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              },
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "torch.Tensor"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "owner": "MoERunner",
+          "name": "_maybe_reduce_shared_expert_output",
+          "line": 417,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "shared_output",
+                true
+              ],
+              [
+                "fused_output_is_reduced",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "f434a69c7b3fd1a93ea1c0a07898970b277f3c6e2045e02a73b521c57ad2b22b",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              },
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "torch.Tensor"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/ops/fused_moe/fused_moe.py",
+        "owner": "AscendMoERunner",
+        "name": "_maybe_reduce_shared_expert_output",
+        "line": 118,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "shared_output",
+              true
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "none",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            },
+            {
+              "kind": "object",
+              "arity": null,
+              "keys": [],
+              "type_ref": "torch.Tensor"
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_annotation"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/ops/fused_moe/fused_moe.py",
+          "line": 118
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "shared_output",
+              true
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    },
+    {
+      "id": "d590ff219995383c",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "owner": "MoERunner",
+          "name": "_maybe_reduce_final_output",
+          "line": 436,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "states",
+                true
+              ],
+              [
+                "trunc_size",
+                true
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "7fc6bf18df088b7eefd7e7f127f29ed214b16997e4f4d35a1319286fb75a2541",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "torch.Tensor"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/model_executor/layers/fused_moe/runner/moe_runner.py",
+          "owner": "MoERunner",
+          "name": "_maybe_reduce_final_output",
+          "line": 462,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "states",
+                true
+              ],
+              [
+                "trunc_size",
+                true
+              ],
+              [
+                "output_is_reduced",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "7065f4450c58362aa060a465d7dd648f89aaa195b94f54745570e1773848abfc",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "torch.Tensor"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/ops/fused_moe/fused_moe.py",
+        "owner": "AscendMoERunner",
+        "name": "_maybe_reduce_final_output",
+        "line": 128,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "states",
+              true
+            ],
+            [
+              "trunc_size",
+              true
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "object",
+              "arity": null,
+              "keys": [],
+              "type_ref": "torch.Tensor"
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_annotation"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/ops/fused_moe/fused_moe.py",
+          "line": 128
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "states",
+              true
+            ],
+            [
+              "trunc_size",
+              true
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    },
+    {
+      "id": "d21c28ff648bf6f4",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/mla.py",
+          "owner": "MultiHeadLatentAttentionWrapper",
+          "name": "__init__",
+          "line": 53,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "hidden_size",
+                true
+              ],
+              [
+                "num_heads",
+                true
+              ],
+              [
+                "scale",
+                true
+              ],
+              [
+                "qk_nope_head_dim",
+                true
+              ],
+              [
+                "qk_rope_head_dim",
+                true
+              ],
+              [
+                "v_head_dim",
+                true
+              ],
+              [
+                "q_lora_rank",
+                true
+              ],
+              [
+                "kv_lora_rank",
+                true
+              ],
+              [
+                "mla_modules",
+                true
+              ],
+              [
+                "cache_config",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ],
+              [
+                "skip_topk",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "0b1a8f0c3c0f9aa7134b2a394841ac0ec1cb8ac07b5ffa0c846151eed127e090",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation",
+              "return_statements"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/model_executor/layers/mla.py",
+          "owner": "MultiHeadLatentAttentionWrapper",
+          "name": "__init__",
+          "line": 55,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "hidden_size",
+                true
+              ],
+              [
+                "num_heads",
+                true
+              ],
+              [
+                "scale",
+                true
+              ],
+              [
+                "qk_nope_head_dim",
+                true
+              ],
+              [
+                "qk_rope_head_dim",
+                true
+              ],
+              [
+                "v_head_dim",
+                true
+              ],
+              [
+                "q_lora_rank",
+                true
+              ],
+              [
+                "kv_lora_rank",
+                true
+              ],
+              [
+                "mla_modules",
+                true
+              ],
+              [
+                "cache_config",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ],
+              [
+                "skip_topk",
+                false
+              ],
+              [
+                "non_causal_multi_token_decode",
+                false
+              ],
+              [
+                "allow_short_prefill_indexer_scoring_skip",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "af0b5734d65b55d29a3fbc16360834af9260f6b672c6219b139e8381d954a992",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation",
+              "return_statements"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/ops/mla.py",
+        "owner": "AscendMultiHeadLatentAttention",
+        "name": "__init__",
+        "line": 67,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "hidden_size",
+              true
+            ],
+            [
+              "num_heads",
+              true
+            ],
+            [
+              "scale",
+              true
+            ],
+            [
+              "qk_nope_head_dim",
+              true
+            ],
+            [
+              "qk_rope_head_dim",
+              true
+            ],
+            [
+              "v_head_dim",
+              true
+            ],
+            [
+              "q_lora_rank",
+              true
+            ],
+            [
+              "kv_lora_rank",
+              true
+            ],
+            [
+              "mla_modules",
+              true
+            ],
+            [
+              "cache_config",
+              false
+            ],
+            [
+              "quant_config",
+              false
+            ],
+            [
+              "prefix",
+              false
+            ],
+            [
+              "skip_topk",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "none",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_annotation",
+            "return_statements"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/ops/mla.py",
+          "line": 67
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "hidden_size",
+              true
+            ],
+            [
+              "num_heads",
+              true
+            ],
+            [
+              "scale",
+              true
+            ],
+            [
+              "qk_nope_head_dim",
+              true
+            ],
+            [
+              "qk_rope_head_dim",
+              true
+            ],
+            [
+              "v_head_dim",
+              true
+            ],
+            [
+              "q_lora_rank",
+              true
+            ],
+            [
+              "kv_lora_rank",
+              true
+            ],
+            [
+              "mla_modules",
+              true
+            ],
+            [
+              "cache_config",
+              false
+            ],
+            [
+              "quant_config",
+              false
+            ],
+            [
+              "prefix",
+              false
+            ],
+            [
+              "skip_topk",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    },
+    {
+      "id": "66aa11e2f484b901",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/vocab_parallel_embedding.py",
+          "owner": "VocabParallelEmbedding",
+          "name": "__init__",
+          "line": 239,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "num_embeddings",
+                true
+              ],
+              [
+                "embedding_dim",
+                true
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "org_num_embeddings",
+                false
+              ],
+              [
+                "padding_size",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "2a7ced35ef65ffb512e56c917ebd3f460580c9b944e12de3ac7bc2c00245759b",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/model_executor/layers/vocab_parallel_embedding.py",
+          "owner": "VocabParallelEmbedding",
+          "name": "__init__",
+          "line": 240,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "num_embeddings",
+                true
+              ],
+              [
+                "embedding_dim",
+                true
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "org_num_embeddings",
+                false
+              ],
+              [
+                "padding_size",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ]
+            ],
+            null,
+            [
+              [
+                "disable_tp",
+                false
+              ]
+            ],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "cbdbb2dabaf75f74a3292171f11d97c4c8244cbbfac91abb8739517f232e40b9",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/ops/vocab_parallel_embedding.py",
+        "owner": "AscendVocabParallelEmbedding",
+        "name": "__init__",
+        "line": 52,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "num_embeddings",
+              true
+            ],
+            [
+              "embedding_dim",
+              true
+            ],
+            [
+              "params_dtype",
+              false
+            ],
+            [
+              "org_num_embeddings",
+              false
+            ],
+            [
+              "padding_size",
+              false
+            ],
+            [
+              "quant_config",
+              false
+            ],
+            [
+              "prefix",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "none",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_statements"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/ops/vocab_parallel_embedding.py",
+          "line": 52
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "num_embeddings",
+              true
+            ],
+            [
+              "embedding_dim",
+              true
+            ],
+            [
+              "params_dtype",
+              false
+            ],
+            [
+              "org_num_embeddings",
+              false
+            ],
+            [
+              "padding_size",
+              false
+            ],
+            [
+              "quant_config",
+              false
+            ],
+            [
+              "prefix",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    },
+    {
+      "id": "dbab4627612d95ac",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/vocab_parallel_embedding.py",
+          "owner": "ParallelLMHead",
+          "name": "__init__",
+          "line": 523,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "num_embeddings",
+                true
+              ],
+              [
+                "embedding_dim",
+                true
+              ],
+              [
+                "bias",
+                false
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "org_num_embeddings",
+                false
+              ],
+              [
+                "padding_size",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "3270c4c496a0a499b984452f95b9aeb536a490b1f87cb993f88ee3fa136786ec",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/model_executor/layers/vocab_parallel_embedding.py",
+          "owner": "ParallelLMHead",
+          "name": "__init__",
+          "line": 539,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "num_embeddings",
+                true
+              ],
+              [
+                "embedding_dim",
+                true
+              ],
+              [
+                "bias",
+                false
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "org_num_embeddings",
+                false
+              ],
+              [
+                "padding_size",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ]
+            ],
+            null,
+            [
+              [
+                "disable_tp",
+                false
+              ]
+            ],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "bcbd3c10cd6004b24db01fa177b8bb40431b58acd3f62f4bc384fa63ecb82d7b",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/ops/vocab_parallel_embedding.py",
+        "owner": "AscendParallelLMHead",
+        "name": "__init__",
+        "line": 256,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "num_embeddings",
+              true
+            ],
+            [
+              "embedding_dim",
+              true
+            ],
+            [
+              "bias",
+              false
+            ],
+            [
+              "params_dtype",
+              false
+            ],
+            [
+              "org_num_embeddings",
+              false
+            ],
+            [
+              "padding_size",
+              false
+            ],
+            [
+              "quant_config",
+              false
+            ],
+            [
+              "prefix",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "none",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_statements"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/ops/vocab_parallel_embedding.py",
+          "line": 256
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "num_embeddings",
+              true
+            ],
+            [
+              "embedding_dim",
+              true
+            ],
+            [
+              "bias",
+              false
+            ],
+            [
+              "params_dtype",
+              false
+            ],
+            [
+              "org_num_embeddings",
+              false
+            ],
+            [
+              "padding_size",
+              false
+            ],
+            [
+              "quant_config",
+              false
+            ],
+            [
+              "prefix",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    },
+    {
+      "id": "0a324a1d8f443833",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/distributed/parallel_state.py",
+          "owner": "GroupCoordinator",
+          "name": "__init__",
+          "line": 387,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "group_ranks",
+                true
+              ],
+              [
+                "local_rank",
+                true
+              ],
+              [
+                "torch_distributed_backend",
+                true
+              ],
+              [
+                "use_device_communicator",
+                true
+              ],
+              [
+                "use_message_queue_broadcaster",
+                false
+              ],
+              [
+                "group_name",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "f509cae6e4f9fd4887b4f1ef766d8f832431ad68ee0571002d7a029dfeb59cab",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/distributed/parallel_state.py",
+          "owner": "GroupCoordinator",
+          "name": "__init__",
+          "line": 409,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "group_ranks",
+                true
+              ],
+              [
+                "local_rank",
+                true
+              ],
+              [
+                "torch_distributed_backend",
+                true
+              ],
+              [
+                "use_device_communicator",
+                true
+              ],
+              [
+                "use_message_queue_broadcaster",
+                false
+              ],
+              [
+                "group_name",
+                false
+              ],
+              [
+                "use_all2all",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "94aa8a8cdf041da6238ee085ef4896e9f94b3d27e0c68e2e227d755f6fe7b491",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/patch/worker/patch_distributed.py",
+        "owner": "GroupCoordinatorPatch",
+        "name": "__init__",
+        "line": 101,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "group_ranks",
+              true
+            ],
+            [
+              "local_rank",
+              true
+            ],
+            [
+              "torch_distributed_backend",
+              true
+            ],
+            [
+              "use_device_communicator",
+              true
+            ],
+            [
+              "use_message_queue_broadcaster",
+              false
+            ],
+            [
+              "group_name",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "none",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_statements"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/patch/worker/patch_distributed.py",
+          "line": 101
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "group_ranks",
+              true
+            ],
+            [
+              "local_rank",
+              true
+            ],
+            [
+              "torch_distributed_backend",
+              true
+            ],
+            [
+              "use_device_communicator",
+              true
+            ],
+            [
+              "use_message_queue_broadcaster",
+              false
+            ],
+            [
+              "group_name",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    },
+    {
+      "id": "74ee7b1a9442e003",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/v1/worker/gpu/spec_decode/speculator.py",
+          "owner": "DraftModelSpeculator",
+          "name": "_build_draft_attn_metadata",
+          "line": 208,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "num_reqs",
+                true
+              ],
+              [
+                "num_reqs_padded",
+                true
+              ],
+              [
+                "num_tokens_padded",
+                true
+              ],
+              [
+                "seq_lens_cpu_upper_bound",
+                true
+              ],
+              [
+                "step",
+                true
+              ],
+              [
+                "num_query_per_req",
+                false
+              ],
+              [
+                "causal",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "681c66cebeb4ca1680ca2f66e9efb5bb648923ce0bb5f312eeac61daf04ff0f4",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "mapping",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              },
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/v1/worker/gpu/spec_decode/speculator.py",
+          "owner": "DraftModelSpeculator",
+          "name": "_build_draft_attn_metadata",
+          "line": 209,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "num_reqs",
+                true
+              ],
+              [
+                "num_reqs_padded",
+                true
+              ],
+              [
+                "num_tokens_padded",
+                true
+              ],
+              [
+                "seq_lens_cpu_upper_bound",
+                true
+              ],
+              [
+                "step",
+                true
+              ],
+              [
+                "num_query_per_req",
+                false
+              ],
+              [
+                "causal",
+                false
+              ],
+              [
+                "query_start_loc_np",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "7344c3dacaec6aebd4328fb5a13dac44aeeb892c13e78c28ab5440e877ee55ad",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "mapping",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              },
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py",
+        "owner": "AscendAutoRegressiveSpeculator",
+        "name": "_build_draft_attn_metadata",
+        "line": 371,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "num_reqs",
+              true
+            ],
+            [
+              "num_reqs_padded",
+              true
+            ],
+            [
+              "num_tokens_padded",
+              true
+            ],
+            [
+              "seq_lens_cpu_upper_bound",
+              true
+            ],
+            [
+              "step",
+              true
+            ],
+            [
+              "num_query_per_req",
+              false
+            ],
+            [
+              "causal",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "mapping",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            },
+            {
+              "kind": "none",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_annotation",
+            "return_statements"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/worker/v2/spec_decode/autoregressive/speculator.py",
+          "line": 371
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "num_reqs",
+              true
+            ],
+            [
+              "num_reqs_padded",
+              true
+            ],
+            [
+              "num_tokens_padded",
+              true
+            ],
+            [
+              "seq_lens_cpu_upper_bound",
+              true
+            ],
+            [
+              "step",
+              true
+            ],
+            [
+              "num_query_per_req",
+              false
+            ],
+            [
+              "causal",
+              false
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    },
+    {
+      "id": "663bacdbc1c060c7",
+      "classification": "introduced_break",
+      "relation": "override",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/v1/worker/gpu/states.py",
+          "owner": "RequestState",
+          "name": "__init__",
+          "line": 10,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "max_num_reqs",
+                true
+              ],
+              [
+                "max_model_len",
+                true
+              ],
+              [
+                "max_num_batched_tokens",
+                true
+              ],
+              [
+                "num_speculative_steps",
+                true
+              ],
+              [
+                "vocab_size",
+                true
+              ],
+              [
+                "device",
+                true
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "d952832854ce994e7a5cc630e99cbced321120a4a5f08c289ab9d86583ad6722",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/v1/worker/gpu/states.py",
+          "owner": "RequestState",
+          "name": "__init__",
+          "line": 10,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "self",
+                true
+              ],
+              [
+                "max_num_reqs",
+                true
+              ],
+              [
+                "max_model_len",
+                true
+              ],
+              [
+                "max_num_batched_tokens",
+                true
+              ],
+              [
+                "num_speculative_steps",
+                true
+              ],
+              [
+                "vocab_size",
+                true
+              ],
+              [
+                "device",
+                true
+              ],
+              [
+                "num_prefill_lookahead",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "aaeac0822b4c4ba341e172b1f9b12d1c6fe75aa5184e5a0032b485ae8b228889",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/worker/v2/states.py",
+        "owner": "AscendRequestState",
+        "name": "__init__",
+        "line": 27,
+        "signature": [
+          "sync",
+          [],
+          [
+            [
+              "max_num_reqs",
+              true
+            ],
+            [
+              "max_model_len",
+              true
+            ],
+            [
+              "max_num_batched_tokens",
+              true
+            ],
+            [
+              "num_speculative_steps",
+              true
+            ],
+            [
+              "vocab_size",
+              true
+            ],
+            [
+              "device",
+              true
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "descriptor": "ordinary",
+        "symbol_kind": "callable",
+        "signature_status": "exact",
+        "analysis_fingerprint": null,
+        "return_contract": {
+          "protocol": "value",
+          "variants": [
+            {
+              "kind": "none",
+              "arity": null,
+              "keys": [],
+              "type_ref": null
+            }
+          ],
+          "status": "exact",
+          "provenance": [
+            "return_statements"
+          ]
+        }
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "downstream accepts the upstream call contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "downstream does not accept the upstream call contract"
+        }
+      },
+      "change": "callable runtime signature contract changed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/worker/v2/states.py",
+          "line": 27
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步 override 参数并检查 super() 调用和关键字转发。",
+      "source": "dynamic_relation_graph",
+      "contract_kind": "call_arguments",
+      "direction": "upstream_contract_to_downstream_implementation",
+      "details": {
+        "installed_signature": [
+          "sync",
+          [],
+          [
+            [
+              "max_num_reqs",
+              true
+            ],
+            [
+              "max_model_len",
+              true
+            ],
+            [
+              "max_num_batched_tokens",
+              true
+            ],
+            [
+              "num_speculative_steps",
+              true
+            ],
+            [
+              "vocab_size",
+              true
+            ],
+            [
+              "device",
+              true
+            ]
+          ],
+          null,
+          [],
+          null
+        ],
+        "installed_descriptor": "ordinary"
+      }
+    }
+  ]
+}

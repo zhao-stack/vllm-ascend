@@ -1,0 +1,1021 @@
+{
+  "schema_version": 4,
+  "metadata": {
+    "range_analyzer_version": "1.3.0",
+    "generator_version": "0.36.0",
+    "profile": "exact-contracts",
+    "scenario": "vllm-interface",
+    "analysis_plan": {
+      "scenario": "vllm-interface",
+      "plan_version": 2,
+      "report_style": "upstream-pr-introduced-only",
+      "capabilities": {
+        "inheritance_mro": {
+          "state": "prerequisite",
+          "produces_findings": false
+        },
+        "override": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "monkey_patch": {
+          "state": "skipped",
+          "produces_findings": false
+        },
+        "direct_import": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_call": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "generator_findings": {
+          "state": "skipped",
+          "produces_findings": false
+        }
+      }
+    },
+    "vllm_old_sha": "1f486d96a17303ce8db8e02be39545b2be338446",
+    "vllm_new_sha": "e5588e49bc2642670116664a7fc4096e27adb179",
+    "vllm_ascend_sha": "3b75c4ecf8ef471fc751ce34af806e1be407f397",
+    "external_sources": {},
+    "timings_seconds": {
+      "input_verification": 0.28393,
+      "repository_indexing": 424.610359,
+      "relation_generation.inheritance_mro": 8.624651,
+      "relation_generation.override": 115.212209,
+      "relation_generation.monkey_patch": null,
+      "relation_generation.relation_finalization": 0.046404,
+      "relation_comparison": 22.46516,
+      "direct_import_analysis": 43.112158,
+      "direct_call_discovery": 59.121528,
+      "direct_call_comparison": 48.838528,
+      "generator_finding_conversion": null,
+      "total": 722.316688
+    }
+  },
+  "summary": {
+    "introduced_breaks": 5,
+    "root_causes": 5,
+    "by_relation": {
+      "direct_call": 4,
+      "direct_import": 1
+    },
+    "by_contract": {
+      "call_arguments": 2,
+      "call_target_presence": 2,
+      "symbol_presence": 1
+    }
+  },
+  "findings": [
+    {
+      "id": "17a75ad8fd7240aa",
+      "classification": "introduced_break",
+      "relation": "direct_call",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/v1/core/kv_cache_coordinator.py",
+          "owner": null,
+          "name": "get_kv_cache_coordinator",
+          "line": 782,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "kv_cache_config",
+                true
+              ],
+              [
+                "max_model_len",
+                true
+              ],
+              [
+                "max_num_batched_tokens",
+                true
+              ],
+              [
+                "use_eagle",
+                true
+              ],
+              [
+                "enable_caching",
+                true
+              ],
+              [
+                "enable_kv_cache_events",
+                true
+              ],
+              [
+                "dcp_world_size",
+                true
+              ],
+              [
+                "pcp_world_size",
+                true
+              ],
+              [
+                "scheduler_block_size",
+                true
+              ],
+              [
+                "hash_block_size",
+                true
+              ],
+              [
+                "metrics_collector",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "6c2203577fc5e8b80e5ff38b37dd3547a4392886108ea65a220d6c42690185ee",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.v1.core.kv_cache_coordinator.KVCacheCoordinator"
+              }
+            ],
+            "status": "unknown",
+            "provenance": [
+              "return_annotation",
+              "return_statements",
+              "annotation_body_conflict"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/v1/core/kv_cache_coordinator.py",
+          "owner": null,
+          "name": "get_kv_cache_coordinator",
+          "line": 808,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "kv_cache_config",
+                true
+              ],
+              [
+                "max_model_len",
+                true
+              ],
+              [
+                "max_in_flight_tokens",
+                true
+              ],
+              [
+                "use_eagle",
+                true
+              ],
+              [
+                "enable_caching",
+                true
+              ],
+              [
+                "enable_kv_cache_events",
+                true
+              ],
+              [
+                "dcp_world_size",
+                true
+              ],
+              [
+                "pcp_world_size",
+                true
+              ],
+              [
+                "scheduler_block_size",
+                true
+              ],
+              [
+                "hash_block_size",
+                true
+              ],
+              [
+                "metrics_collector",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "37bc9951944a7af818835175ef9ac3281ff1539d79799b3d00160663c13162c8",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.v1.core.kv_cache_coordinator.KVCacheCoordinator"
+              }
+            ],
+            "status": "unknown",
+            "provenance": [
+              "return_annotation",
+              "return_statements",
+              "annotation_body_conflict"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/distributed/kv_transfer/kv_pool/recompute_cpu_offload/manager.py",
+        "owner": "RecomputeCPUOffloadScheduler",
+        "name": "get_kv_cache_coordinator",
+        "line": 91,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": "callsite",
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "call arguments bind to the callable contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "call arguments do not bind: missing a required argument: 'max_in_flight_tokens'"
+        }
+      },
+      "change": "callable parameter contract changed",
+      "evidence": [
+        {
+          "target": "vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator",
+          "access_kind": "direct",
+          "file": "vllm_ascend/distributed/kv_transfer/kv_pool/recompute_cpu_offload/manager.py",
+          "line": 91,
+          "column": 51,
+          "owner": "RecomputeCPUOffloadScheduler",
+          "scope": "__init__",
+          "callee": "get_kv_cache_coordinator",
+          "call_shape": {
+            "positional_count": 0,
+            "keyword_names": [
+              "kv_cache_config",
+              "max_model_len",
+              "max_num_batched_tokens",
+              "use_eagle",
+              "enable_caching",
+              "enable_kv_cache_events",
+              "dcp_world_size",
+              "pcp_world_size",
+              "scheduler_block_size",
+              "hash_block_size"
+            ],
+            "dynamic_starargs": false,
+            "dynamic_kwargs": false
+          },
+          "return_use": {
+            "kind": "unknown",
+            "awaited": false,
+            "arity": null,
+            "minimum_arity": null,
+            "key": null,
+            "index": null,
+            "attribute": null,
+            "status": "unknown"
+          },
+          "receiver_type": null,
+          "member": null,
+          "invocation_kind": "python_call"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。",
+      "source": "direct_call_detector",
+      "contract_kind": "call_arguments",
+      "direction": "downstream_call_to_upstream",
+      "details": {
+        "target": "vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator",
+        "access_kind": "direct",
+        "receiver_type": null,
+        "member": null,
+        "invocation_kind": "python_call",
+        "call_shape": {
+          "positional_count": 0,
+          "keyword_names": [
+            "kv_cache_config",
+            "max_model_len",
+            "max_num_batched_tokens",
+            "use_eagle",
+            "enable_caching",
+            "enable_kv_cache_events",
+            "dcp_world_size",
+            "pcp_world_size",
+            "scheduler_block_size",
+            "hash_block_size"
+          ],
+          "dynamic_starargs": false,
+          "dynamic_kwargs": false
+        },
+        "scope": "__init__"
+      }
+    },
+    {
+      "id": "ed13b310e6fe4e4a",
+      "classification": "introduced_break",
+      "relation": "direct_call",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/tool_parsers/deepseekv32_tool_parser.py",
+          "owner": "DeepSeekV32ToolParser",
+          "name": "_generate_tool_call_id",
+          "line": 119,
+          "signature": [
+            "sync",
+            [],
+            [],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "1a72bb84b2d7c02a1bb868290598d51b628d296662432a616558b6d9cb5bcb0f",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "scalar",
+                "arity": null,
+                "keys": [],
+                "type_ref": "builtins.str"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/tool_parsers/__init__.py",
+          "owner": "deepseekv4_tool_parser",
+          "name": "_generate_tool_call_id",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": "missing",
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/patch/platform/patch_deepseek_v4_tool_call_parser.py",
+        "owner": null,
+        "name": "self._generate_tool_call_id",
+        "line": 461,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": "callsite",
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "call arguments bind to the callable contract"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "upstream call target does not exist"
+        }
+      },
+      "change": "upstream symbol was removed",
+      "evidence": [
+        {
+          "target": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser._generate_tool_call_id",
+          "access_kind": "instance",
+          "file": "vllm_ascend/patch/platform/patch_deepseek_v4_tool_call_parser.py",
+          "line": 461,
+          "column": 19,
+          "owner": null,
+          "scope": "_emit_tool_name_delta",
+          "callee": "self._generate_tool_call_id",
+          "call_shape": {
+            "positional_count": 0,
+            "keyword_names": [],
+            "dynamic_starargs": false,
+            "dynamic_kwargs": false
+          },
+          "return_use": {
+            "kind": "unknown",
+            "awaited": false,
+            "arity": null,
+            "minimum_arity": null,
+            "key": null,
+            "index": null,
+            "attribute": null,
+            "status": "unknown"
+          },
+          "receiver_type": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser",
+          "member": "_generate_tool_call_id",
+          "invocation_kind": "python_call"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。",
+      "source": "direct_call_detector",
+      "contract_kind": "call_target_presence",
+      "direction": "downstream_call_to_upstream",
+      "details": {
+        "target": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser._generate_tool_call_id",
+        "access_kind": "instance",
+        "receiver_type": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser",
+        "member": "_generate_tool_call_id",
+        "invocation_kind": "python_call",
+        "call_shape": {
+          "positional_count": 0,
+          "keyword_names": [],
+          "dynamic_starargs": false,
+          "dynamic_kwargs": false
+        },
+        "scope": "_emit_tool_name_delta"
+      }
+    },
+    {
+      "id": "b8dccc5d1f5d083a",
+      "classification": "introduced_break",
+      "relation": "direct_call",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/tool_parsers/deepseekv32_tool_parser.py",
+          "owner": "DeepSeekV32ToolParser",
+          "name": "_reset_streaming_state",
+          "line": 232,
+          "signature": [
+            "sync",
+            [],
+            [],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "1ab1b5322a790f86cae4a1941ab3fe8332a5f708dc3c6c7f6e5a497697f8ef56",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_statements"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/tool_parsers/__init__.py",
+          "owner": "deepseekv4_tool_parser",
+          "name": "_reset_streaming_state",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": "missing",
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/patch/platform/patch_deepseek_v4_tool_call_parser.py",
+        "owner": null,
+        "name": "self._reset_streaming_state",
+        "line": 757,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": "callsite",
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "call arguments bind to the callable contract"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "upstream call target does not exist"
+        }
+      },
+      "change": "upstream symbol was removed",
+      "evidence": [
+        {
+          "target": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser._reset_streaming_state",
+          "access_kind": "instance",
+          "file": "vllm_ascend/patch/platform/patch_deepseek_v4_tool_call_parser.py",
+          "line": 757,
+          "column": 8,
+          "owner": null,
+          "scope": "_patched_extract_tool_calls_streaming",
+          "callee": "self._reset_streaming_state",
+          "call_shape": {
+            "positional_count": 0,
+            "keyword_names": [],
+            "dynamic_starargs": false,
+            "dynamic_kwargs": false
+          },
+          "return_use": {
+            "kind": "ignored",
+            "awaited": false,
+            "arity": null,
+            "minimum_arity": null,
+            "key": null,
+            "index": null,
+            "attribute": null,
+            "status": "exact"
+          },
+          "receiver_type": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser",
+          "member": "_reset_streaming_state",
+          "invocation_kind": "python_call"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。",
+      "source": "direct_call_detector",
+      "contract_kind": "call_target_presence",
+      "direction": "downstream_call_to_upstream",
+      "details": {
+        "target": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser._reset_streaming_state",
+        "access_kind": "instance",
+        "receiver_type": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser",
+        "member": "_reset_streaming_state",
+        "invocation_kind": "python_call",
+        "call_shape": {
+          "positional_count": 0,
+          "keyword_names": [],
+          "dynamic_starargs": false,
+          "dynamic_kwargs": false
+        },
+        "scope": "_patched_extract_tool_calls_streaming"
+      }
+    },
+    {
+      "id": "a90870cc07b10c55",
+      "classification": "introduced_break",
+      "relation": "direct_call",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/v1/worker/block_table.py",
+          "owner": null,
+          "name": "_compute_slot_mapping_kernel",
+          "line": 326,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_tokens",
+                true
+              ],
+              [
+                "max_num_tokens",
+                true
+              ],
+              [
+                "query_start_loc_ptr",
+                true
+              ],
+              [
+                "positions_ptr",
+                true
+              ],
+              [
+                "block_table_ptr",
+                true
+              ],
+              [
+                "block_table_stride",
+                true
+              ],
+              [
+                "block_size",
+                true
+              ],
+              [
+                "slot_mapping_ptr",
+                true
+              ],
+              [
+                "TOTAL_CP_WORLD_SIZE",
+                true
+              ],
+              [
+                "TOTAL_CP_RANK",
+                true
+              ],
+              [
+                "CP_KV_CACHE_INTERLEAVE_SIZE",
+                true
+              ],
+              [
+                "PAD_ID",
+                true
+              ],
+              [
+                "BLOCK_SIZE",
+                true
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "80b8015ed44030c74fb2083aaed6bb31ec52072b7776adfc7b71f3c1f7010c42",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "unknown",
+            "provenance": [
+              "return_statements",
+              "unknown_return_transform"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/v1/worker/block_table.py",
+          "owner": null,
+          "name": "_compute_slot_mapping_kernel",
+          "line": 349,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_tokens",
+                true
+              ],
+              [
+                "max_num_tokens",
+                true
+              ],
+              [
+                "query_start_loc_ptr",
+                true
+              ],
+              [
+                "positions_ptr",
+                true
+              ],
+              [
+                "block_table_ptr",
+                true
+              ],
+              [
+                "block_table_stride",
+                true
+              ],
+              [
+                "block_size",
+                true
+              ],
+              [
+                "slot_mapping_ptr",
+                true
+              ],
+              [
+                "KV_CACHE_BLOCK_SIZE",
+                true
+              ],
+              [
+                "BLOCKS_PER_KV_BLOCK",
+                true
+              ],
+              [
+                "TOTAL_CP_WORLD_SIZE",
+                true
+              ],
+              [
+                "TOTAL_CP_RANK",
+                true
+              ],
+              [
+                "CP_KV_CACHE_INTERLEAVE_SIZE",
+                true
+              ],
+              [
+                "PAD_ID",
+                true
+              ],
+              [
+                "BLOCK_SIZE",
+                true
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "f7f8e632ffabae306c60bbdfddc64f1f767de7777e09155f463fec8ac9e53440",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "none",
+                "arity": null,
+                "keys": [],
+                "type_ref": null
+              }
+            ],
+            "status": "unknown",
+            "provenance": [
+              "return_statements",
+              "unknown_return_transform"
+            ]
+          }
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/worker/block_table.py",
+        "owner": "BlockTable",
+        "name": "_compute_slot_mapping_kernel[num_reqs + 1,]",
+        "line": 160,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": "callsite",
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "call arguments bind to the callable contract"
+        },
+        "new": {
+          "exists": true,
+          "compatible": false,
+          "reason": "call arguments do not bind: missing a required argument: 'KV_CACHE_BLOCK_SIZE'"
+        }
+      },
+      "change": "callable parameter contract changed",
+      "evidence": [
+        {
+          "target": "vllm.v1.worker.block_table._compute_slot_mapping_kernel",
+          "access_kind": "direct",
+          "file": "vllm_ascend/worker/block_table.py",
+          "line": 160,
+          "column": 12,
+          "owner": "BlockTable",
+          "scope": "compute_slot_mapping",
+          "callee": "_compute_slot_mapping_kernel[num_reqs + 1,]",
+          "call_shape": {
+            "positional_count": 8,
+            "keyword_names": [
+              "TOTAL_CP_WORLD_SIZE",
+              "TOTAL_CP_RANK",
+              "CP_KV_CACHE_INTERLEAVE_SIZE",
+              "PAD_ID",
+              "BLOCK_SIZE"
+            ],
+            "dynamic_starargs": false,
+            "dynamic_kwargs": false
+          },
+          "return_use": {
+            "kind": "ignored",
+            "awaited": false,
+            "arity": null,
+            "minimum_arity": null,
+            "key": null,
+            "index": null,
+            "attribute": null,
+            "status": "exact"
+          },
+          "receiver_type": null,
+          "member": null,
+          "invocation_kind": "triton_kernel_launch"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。",
+      "source": "direct_call_detector",
+      "contract_kind": "call_arguments",
+      "direction": "downstream_call_to_upstream",
+      "details": {
+        "target": "vllm.v1.worker.block_table._compute_slot_mapping_kernel",
+        "access_kind": "direct",
+        "receiver_type": null,
+        "member": null,
+        "invocation_kind": "triton_kernel_launch",
+        "call_shape": {
+          "positional_count": 8,
+          "keyword_names": [
+            "TOTAL_CP_WORLD_SIZE",
+            "TOTAL_CP_RANK",
+            "CP_KV_CACHE_INTERLEAVE_SIZE",
+            "PAD_ID",
+            "BLOCK_SIZE"
+          ],
+          "dynamic_starargs": false,
+          "dynamic_kwargs": false
+        },
+        "scope": "compute_slot_mapping"
+      }
+    },
+    {
+      "id": "a0e2e86055f769f8",
+      "classification": "introduced_break",
+      "relation": "direct_import",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/tool_parsers/deepseekv4_tool_parser.py",
+          "owner": null,
+          "name": "DeepSeekV4ToolParser",
+          "line": 7,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": "class",
+          "signature_status": null,
+          "analysis_fingerprint": "7b6f2d62c52fd05e18fb6622512dab76309d5d5dcf9f67e6d658b1928c72c14f",
+          "return_contract": null
+        },
+        "new": {
+          "file": null,
+          "owner": null,
+          "name": "DeepSeekV4ToolParser",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": null,
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/patch/platform/patch_deepseek_v4_tool_call_parser.py",
+        "owner": null,
+        "name": "DeepSeekV4ToolParser",
+        "line": 38,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": null,
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "import target exists at old"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "old import path no longer resolves at new"
+        }
+      },
+      "change": "import module or symbol was removed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/patch/platform/patch_deepseek_v4_tool_call_parser.py",
+          "line": 38,
+          "import": "vllm.tool_parsers.deepseekv4_tool_parser",
+          "symbol": "DeepSeekV4ToolParser"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "更新下游依赖目标；若上游已删除该能力，需要移除 patch/继承并补充替代实现。",
+      "source": "direct_import_detector",
+      "contract_kind": "symbol_presence",
+      "direction": "downstream_import_to_upstream",
+      "details": {
+        "target": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser",
+        "root_upstream": {
+          "file": "vllm/tool_parsers/deepseekv4_tool_parser.py",
+          "owner": null,
+          "name": "DeepSeekV4ToolParser",
+          "line": 7,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "tokenizer",
+                true
+              ],
+              [
+                "tools",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": null,
+          "symbol_kind": "constructor",
+          "signature_status": "exact",
+          "analysis_fingerprint": "8d6746d34fbd5ad54a8f55bff05f8a75fecf69f7825142e7f1d90ae285be1093",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.tool_parsers.deepseekv4_tool_parser.DeepSeekV4ToolParser"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "class_constructor"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

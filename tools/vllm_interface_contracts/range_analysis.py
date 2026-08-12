@@ -39,6 +39,8 @@ from tools.vllm_interface_contracts.call_contracts import (
     return_use_compatible,
 )
 from tools.vllm_interface_contracts.generator import (
+    _TRITON_JIT_DECORATOR,
+    _TRITON_KERNEL_PROTOCOL,
     GENERATOR_VERSION,
     InterfaceBoundaryGenerator,
     Relation,
@@ -56,8 +58,8 @@ from tools.vllm_interface_contracts.models import (
     SourceEndpoint,
 )
 
-RANGE_SCHEMA_VERSION = 3
-RANGE_ANALYZER_VERSION = "1.2.0"
+RANGE_SCHEMA_VERSION = 4
+RANGE_ANALYZER_VERSION = "1.3.0"
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -177,6 +179,22 @@ def _signature_status(
             continue
         return "unknown"
     return "exact"
+
+
+def _invocation_signature_status(
+    node: ast.AST | None,
+    resolver: Any | None,
+    invocation_kind: str,
+) -> str | None:
+    if invocation_kind != _TRITON_KERNEL_PROTOCOL:
+        return _signature_status(node, resolver)
+    if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+        return None
+    references: list[str | None] = []
+    for item in node.decorator_list:
+        raw = _decorator_name(item)
+        references.append(resolver(raw) if resolver is not None and raw else raw or None)
+    return "exact" if references == [_TRITON_JIT_DECORATOR] else "unknown"
 
 
 def _class_nodes(tree: ast.Module) -> Iterator[tuple[tuple[str, ...], ast.ClassDef]]:
@@ -714,6 +732,7 @@ class GitSnapshot:
         *,
         receiver_type: str | None = None,
         member: str | None = None,
+        invocation_kind: str = "python_call",
     ) -> SourceEndpoint:
         effective_access_kind = access_kind
         resolved: _QualifiedBinding | None = None
@@ -879,7 +898,11 @@ class GitSnapshot:
             signature=signature,
             descriptor=descriptor,
             symbol_kind="callable",
-            signature_status=_signature_status(node, self._return_resolver(file_name)),
+            signature_status=_invocation_signature_status(
+                node,
+                self._return_resolver(file_name),
+                invocation_kind,
+            ),
             analysis_fingerprint=resolved.fingerprint,
             return_contract=contract.as_dict() if contract is not None else None,
         )
@@ -1567,6 +1590,12 @@ def _import_findings(
             "runtime_reachable": True,
             "version_lane_matches": True,
         }
+        target = ".".join(value for value in (reference.module, reference.symbol) if value)
+        root_upstream = old_endpoint
+        if reference.symbol and "." not in reference.symbol:
+            resolved_root = old_snapshot.call_endpoint(target, "direct")
+            if resolved_root.file is not None:
+                root_upstream = resolved_root
         findings.append(
             RangeFinding(
                 finding_id=_finding_id("import", reference, old_snapshot.revision, new_snapshot.revision),
@@ -1598,6 +1627,10 @@ def _import_findings(
                 source="direct_import_detector",
                 contract_kind="symbol_presence",
                 direction="downstream_import_to_upstream",
+                details={
+                    "target": target,
+                    "root_upstream": root_upstream.as_dict(),
+                },
             )
         )
     return findings
@@ -1616,12 +1649,14 @@ def _direct_call_findings(
             dependency.access_kind,
             receiver_type=dependency.receiver_type,
             member=dependency.member,
+            invocation_kind=dependency.invocation_kind,
         )
         new_endpoint = new_snapshot.call_endpoint(
             dependency.target,
             dependency.access_kind,
             receiver_type=dependency.receiver_type,
             member=dependency.member,
+            invocation_kind=dependency.invocation_kind,
         )
         callable_kinds = {"callable", "constructor"}
         exact_dependencies.append(dependency)
@@ -1696,6 +1731,7 @@ def _direct_call_findings(
                         "access_kind": dependency.access_kind,
                         "receiver_type": dependency.receiver_type,
                         "member": dependency.member,
+                        "invocation_kind": dependency.invocation_kind,
                         "call_shape": dependency.call_shape.as_dict(),
                         "scope": dependency.scope,
                     },
@@ -1774,9 +1810,7 @@ def validate_current_contracts(
     """Validate exact call/return contracts for one checked-out source pair."""
 
     plan = plan or resolve_analysis_plan()
-    discovered_dependencies = (
-        DirectCallDetector(engine).discover() if plan.analyze_direct_calls else []
-    )
+    discovered_dependencies = DirectCallDetector(engine).discover() if plan.analyze_direct_calls else []
     dependencies: list[DirectCallDependency] = []
     findings: list[dict[str, Any]] = []
     for dependency in discovered_dependencies:
@@ -1785,6 +1819,7 @@ def validate_current_contracts(
             dependency.access_kind,
             receiver_type=dependency.receiver_type,
             member=dependency.member,
+            invocation_kind=dependency.invocation_kind,
         )
         dependencies.append(dependency)
         argument_state = _direct_call_state(upstream, dependency)
@@ -1910,12 +1945,7 @@ def analyze_range(
     )
     phase_started = _diagnostic_timing("repository_indexing", phase_started, timings)
     relations, generator_findings = generator.generate(plan)
-    timings.update(
-        {
-            f"relation_generation.{name}": duration
-            for name, duration in generator.phase_timings.items()
-        }
-    )
+    timings.update({f"relation_generation.{name}": duration for name, duration in generator.phase_timings.items()})
     phase_started = time.perf_counter()
     old_snapshot = GitSnapshot(vllm_root, old_sha)
     new_snapshot = GitSnapshot(vllm_root, new_sha)
@@ -2064,8 +2094,7 @@ def analyze_range(
     relation_counts = Counter(item.relation for item in ordered)
     contract_counts = Counter(item.contract_kind for item in ordered)
     analyzed_relation_count = sum(
-        relation.upstream_package == "vllm" and relation.relation in plan.relation_types
-        for relation in relations
+        relation.upstream_package == "vllm" and relation.relation in plan.relation_types for relation in relations
     )
     timings["total"] = round(time.perf_counter() - analysis_started, 6)
     return {
@@ -2086,9 +2115,7 @@ def analyze_range(
             "relations": analyzed_relation_count,
             "relations_collected": len(relations),
             "direct_call_dependencies": len(direct_call_dependencies),
-            "generator_findings": (
-                len(generator_findings) if plan.include_generator_findings else 0
-            ),
+            "generator_findings": (len(generator_findings) if plan.include_generator_findings else 0),
             "total": len(ordered),
             "by_relation": dict(sorted(relation_counts.items())),
             "by_contract": dict(sorted(contract_counts.items())),
@@ -2220,15 +2247,21 @@ def _upstream_pr_findings(report: dict[str, Any]) -> list[dict[str, Any]]:
         for item in report["findings"]
         if item["classification"] == "introduced_break"
         and item["action"] == "modify"
-        and item["relation"] in {"override", "direct_call"}
+        and item["relation"] in {"override", "direct_call", "direct_import"}
     ]
 
 
 def _root_cause_key(item: dict[str, Any]) -> tuple[object, ...]:
-    upstream = item["upstream"]["new"]
+    details = item.get("details", {})
+    upstream = details.get("root_upstream") or item["upstream"]["old"]
+    fingerprint = upstream.get("analysis_fingerprint")
+    if fingerprint:
+        return ("upstream_fingerprint", fingerprint, upstream.get("name"))
+    target = details.get("target")
+    if target:
+        return ("upstream_target", target, item.get("change"))
     return (
-        item["relation"],
-        item.get("contract_kind"),
+        "upstream_endpoint",
         upstream.get("file"),
         upstream.get("owner"),
         upstream.get("name"),
@@ -2265,8 +2298,8 @@ def _upstream_pr_markdown(payload: dict[str, Any]) -> str:
         "",
         f"- vLLM range: `{meta['vllm_old_sha']}` -> `{meta['vllm_new_sha']}`",
         f"- vllm-ascend baseline: `{meta['vllm_ascend_sha']}`",
-        "- Scope: downstream override and direct upstream-call contracts",
-        "- Monkey patches, direct imports, inheritance-only findings, generator reviews, "
+        "- Scope: downstream imports, overrides, and direct upstream-call contracts",
+        "- Monkey patches, inheritance-only findings, generator reviews, "
         "and historical incompatibilities are intentionally excluded.",
         f"- Introduced breaks: {summary['introduced_breaks']}",
         f"- Root causes: {summary['root_causes']}",
@@ -2277,11 +2310,11 @@ def _upstream_pr_markdown(payload: dict[str, Any]) -> str:
     if not findings:
         lines.append("No new downstream interface break was introduced by this range.")
     for index, item in enumerate(findings, start=1):
-        upstream = item["upstream"]["new"]
+        upstream = item.get("details", {}).get("root_upstream") or item["upstream"]["new"]
+        if not upstream.get("file"):
+            upstream = item["upstream"]["old"]
         downstream = item["downstream"]
-        upstream_name = ".".join(
-            value for value in (upstream.get("owner"), upstream.get("name")) if value
-        )
+        upstream_name = ".".join(value for value in (upstream.get("owner"), upstream.get("name")) if value)
         lines.extend(
             [
                 f"### {index}. {item['priority']} {item['relation']} / {item.get('contract_kind', '')}",

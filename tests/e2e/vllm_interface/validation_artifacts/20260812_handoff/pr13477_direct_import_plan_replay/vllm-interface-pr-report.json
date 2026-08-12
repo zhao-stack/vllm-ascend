@@ -1,0 +1,1546 @@
+{
+  "schema_version": 3,
+  "metadata": {
+    "range_analyzer_version": "1.2.1",
+    "generator_version": "0.36.0",
+    "profile": "exact-contracts",
+    "scenario": "vllm-interface",
+    "analysis_plan": {
+      "scenario": "vllm-interface",
+      "plan_version": 2,
+      "report_style": "upstream-pr-introduced-only",
+      "capabilities": {
+        "inheritance_mro": {
+          "state": "prerequisite",
+          "produces_findings": false
+        },
+        "override": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "monkey_patch": {
+          "state": "skipped",
+          "produces_findings": false
+        },
+        "direct_import": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_call": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "generator_findings": {
+          "state": "skipped",
+          "produces_findings": false
+        }
+      }
+    },
+    "vllm_old_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+    "vllm_new_sha": "beca88e59ea75a7aa1af72a5ae50188fa91d4e3d",
+    "vllm_ascend_sha": "61cfd1fc6a79ae139a3c5bdb8051ba7edb9c022e",
+    "external_sources": {},
+    "timings_seconds": {
+      "input_verification": 0.530327,
+      "repository_indexing": 433.354698,
+      "relation_generation.inheritance_mro": 9.870315,
+      "relation_generation.override": 133.023493,
+      "relation_generation.monkey_patch": null,
+      "relation_generation.relation_finalization": 0.046137,
+      "relation_comparison": 41.11222,
+      "direct_import_analysis": 64.927692,
+      "direct_call_discovery": 61.94477,
+      "direct_call_comparison": 50.68801,
+      "generator_finding_conversion": null,
+      "total": 795.4986
+    }
+  },
+  "summary": {
+    "introduced_breaks": 4,
+    "root_causes": 1,
+    "by_relation": {
+      "direct_call": 1,
+      "direct_import": 3
+    },
+    "by_contract": {
+      "call_target_presence": 1,
+      "symbol_presence": 3
+    }
+  },
+  "findings": [
+    {
+      "id": "458fe41a8b979f02",
+      "classification": "introduced_break",
+      "relation": "direct_call",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/fused_moe/layer.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": 100,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_experts",
+                true
+              ],
+              [
+                "top_k",
+                true
+              ],
+              [
+                "hidden_size",
+                true
+              ],
+              [
+                "intermediate_size",
+                true
+              ],
+              [
+                "intermediate_pad",
+                false
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "renormalize",
+                false
+              ],
+              [
+                "use_grouped_topk",
+                false
+              ],
+              [
+                "num_expert_group",
+                false
+              ],
+              [
+                "topk_group",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "tp_size",
+                false
+              ],
+              [
+                "dp_size",
+                false
+              ],
+              [
+                "pcp_size",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ],
+              [
+                "custom_routing_function",
+                false
+              ],
+              [
+                "router",
+                false
+              ],
+              [
+                "scoring_func",
+                false
+              ],
+              [
+                "routed_scaling_factor",
+                false
+              ],
+              [
+                "swiglu_limit",
+                false
+              ],
+              [
+                "swiglu_alpha",
+                false
+              ],
+              [
+                "swiglu_beta",
+                false
+              ],
+              [
+                "activation_situ_beta",
+                false
+              ],
+              [
+                "activation_situ_linear_beta",
+                false
+              ],
+              [
+                "e_score_correction_bias",
+                false
+              ],
+              [
+                "apply_router_weight_on_input",
+                false
+              ],
+              [
+                "activation",
+                false
+              ],
+              [
+                "enable_eplb",
+                false
+              ],
+              [
+                "num_redundant_experts",
+                false
+              ],
+              [
+                "has_bias",
+                false
+              ],
+              [
+                "is_sequence_parallel",
+                false
+              ],
+              [
+                "reduce_results",
+                false
+              ],
+              [
+                "ckpt_names",
+                false
+              ],
+              [
+                "n_shared_experts",
+                false
+              ],
+              [
+                "router_logits_dtype",
+                false
+              ],
+              [
+                "gate",
+                false
+              ],
+              [
+                "shared_experts",
+                false
+              ],
+              [
+                "shared_expert_gate",
+                false
+              ],
+              [
+                "routed_input_transform",
+                false
+              ],
+              [
+                "routed_output_transform",
+                false
+              ],
+              [
+                "apply_routed_scale_to_output",
+                false
+              ],
+              [
+                "zero_expert_type",
+                false
+              ],
+              [
+                "hash_indices_table",
+                false
+              ],
+              [
+                "runner_cls",
+                false
+              ],
+              [
+                "runner_args",
+                false
+              ],
+              [
+                "routed_experts_cls",
+                false
+              ],
+              [
+                "routed_experts_args",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "d7cb20834e231091577e154dd732a5dd3b036ad2f57001b95d8d7279ba485d9d",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        },
+        "new": {
+          "file": "vllm/model_executor/layers/fused_moe/__init__.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": "missing",
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/models/minimax_m3/minimax_m3.py",
+        "owner": "MiniMaxM3MoE",
+        "name": "FusedMoE",
+        "line": 549,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": "callsite",
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "call arguments bind to the callable contract"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "upstream call target does not exist"
+        }
+      },
+      "change": "upstream symbol was removed",
+      "evidence": [
+        {
+          "target": "vllm.model_executor.layers.fused_moe.FusedMoE",
+          "access_kind": "direct",
+          "file": "vllm_ascend/models/minimax_m3/minimax_m3.py",
+          "line": 549,
+          "column": 23,
+          "owner": "MiniMaxM3MoE",
+          "scope": "__init__",
+          "callee": "FusedMoE",
+          "call_shape": {
+            "positional_count": 0,
+            "keyword_names": [
+              "shared_experts",
+              "num_experts",
+              "top_k",
+              "scoring_func",
+              "e_score_correction_bias",
+              "hidden_size",
+              "intermediate_size",
+              "renormalize",
+              "activation",
+              "swiglu_limit",
+              "swiglu_alpha",
+              "swiglu_beta",
+              "quant_config",
+              "prefix",
+              "router_logits_dtype",
+              "routed_scaling_factor",
+              "apply_routed_scale_to_output"
+            ],
+            "dynamic_starargs": false,
+            "dynamic_kwargs": false
+          },
+          "return_use": {
+            "kind": "unknown",
+            "awaited": false,
+            "arity": null,
+            "minimum_arity": null,
+            "key": null,
+            "index": null,
+            "attribute": null,
+            "status": "unknown"
+          },
+          "receiver_type": null,
+          "member": null
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。",
+      "source": "direct_call_detector",
+      "contract_kind": "call_target_presence",
+      "direction": "downstream_call_to_upstream",
+      "details": {
+        "target": "vllm.model_executor.layers.fused_moe.FusedMoE",
+        "access_kind": "direct",
+        "receiver_type": null,
+        "member": null,
+        "call_shape": {
+          "positional_count": 0,
+          "keyword_names": [
+            "shared_experts",
+            "num_experts",
+            "top_k",
+            "scoring_func",
+            "e_score_correction_bias",
+            "hidden_size",
+            "intermediate_size",
+            "renormalize",
+            "activation",
+            "swiglu_limit",
+            "swiglu_alpha",
+            "swiglu_beta",
+            "quant_config",
+            "prefix",
+            "router_logits_dtype",
+            "routed_scaling_factor",
+            "apply_routed_scale_to_output"
+          ],
+          "dynamic_starargs": false,
+          "dynamic_kwargs": false
+        },
+        "scope": "__init__"
+      }
+    },
+    {
+      "id": "bc0bba784049c41d",
+      "classification": "introduced_break",
+      "relation": "direct_import",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/fused_moe/__init__.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": 21,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": null,
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        },
+        "new": {
+          "file": null,
+          "owner": null,
+          "name": "FusedMoE",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": null,
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/models/deepseek_v4.py",
+        "owner": null,
+        "name": "FusedMoE",
+        "line": 47,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": null,
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "import target exists at old"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "old import path no longer resolves at new"
+        }
+      },
+      "change": "import module or symbol was removed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/models/deepseek_v4.py",
+          "line": 47,
+          "import": "vllm.model_executor.layers.fused_moe",
+          "symbol": "FusedMoE"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "更新下游依赖目标；若上游已删除该能力，需要移除 patch/继承并补充替代实现。",
+      "source": "direct_import_detector",
+      "contract_kind": "symbol_presence",
+      "direction": "downstream_import_to_upstream",
+      "details": {
+        "target": "vllm.model_executor.layers.fused_moe.FusedMoE",
+        "root_upstream": {
+          "file": "vllm/model_executor/layers/fused_moe/layer.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": 100,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_experts",
+                true
+              ],
+              [
+                "top_k",
+                true
+              ],
+              [
+                "hidden_size",
+                true
+              ],
+              [
+                "intermediate_size",
+                true
+              ],
+              [
+                "intermediate_pad",
+                false
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "renormalize",
+                false
+              ],
+              [
+                "use_grouped_topk",
+                false
+              ],
+              [
+                "num_expert_group",
+                false
+              ],
+              [
+                "topk_group",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "tp_size",
+                false
+              ],
+              [
+                "dp_size",
+                false
+              ],
+              [
+                "pcp_size",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ],
+              [
+                "custom_routing_function",
+                false
+              ],
+              [
+                "router",
+                false
+              ],
+              [
+                "scoring_func",
+                false
+              ],
+              [
+                "routed_scaling_factor",
+                false
+              ],
+              [
+                "swiglu_limit",
+                false
+              ],
+              [
+                "swiglu_alpha",
+                false
+              ],
+              [
+                "swiglu_beta",
+                false
+              ],
+              [
+                "activation_situ_beta",
+                false
+              ],
+              [
+                "activation_situ_linear_beta",
+                false
+              ],
+              [
+                "e_score_correction_bias",
+                false
+              ],
+              [
+                "apply_router_weight_on_input",
+                false
+              ],
+              [
+                "activation",
+                false
+              ],
+              [
+                "enable_eplb",
+                false
+              ],
+              [
+                "num_redundant_experts",
+                false
+              ],
+              [
+                "has_bias",
+                false
+              ],
+              [
+                "is_sequence_parallel",
+                false
+              ],
+              [
+                "reduce_results",
+                false
+              ],
+              [
+                "ckpt_names",
+                false
+              ],
+              [
+                "n_shared_experts",
+                false
+              ],
+              [
+                "router_logits_dtype",
+                false
+              ],
+              [
+                "gate",
+                false
+              ],
+              [
+                "shared_experts",
+                false
+              ],
+              [
+                "shared_expert_gate",
+                false
+              ],
+              [
+                "routed_input_transform",
+                false
+              ],
+              [
+                "routed_output_transform",
+                false
+              ],
+              [
+                "apply_routed_scale_to_output",
+                false
+              ],
+              [
+                "zero_expert_type",
+                false
+              ],
+              [
+                "hash_indices_table",
+                false
+              ],
+              [
+                "runner_cls",
+                false
+              ],
+              [
+                "runner_args",
+                false
+              ],
+              [
+                "routed_experts_cls",
+                false
+              ],
+              [
+                "routed_experts_args",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "d7cb20834e231091577e154dd732a5dd3b036ad2f57001b95d8d7279ba485d9d",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "541380f2f8a7bc9e",
+      "classification": "introduced_break",
+      "relation": "direct_import",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/fused_moe/__init__.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": 21,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": null,
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        },
+        "new": {
+          "file": null,
+          "owner": null,
+          "name": "FusedMoE",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": null,
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/models/minimax_m3/minimax_m3.py",
+        "owner": null,
+        "name": "FusedMoE",
+        "line": 43,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": null,
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "import target exists at old"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "old import path no longer resolves at new"
+        }
+      },
+      "change": "import module or symbol was removed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/models/minimax_m3/minimax_m3.py",
+          "line": 43,
+          "import": "vllm.model_executor.layers.fused_moe",
+          "symbol": "FusedMoE"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "更新下游依赖目标；若上游已删除该能力，需要移除 patch/继承并补充替代实现。",
+      "source": "direct_import_detector",
+      "contract_kind": "symbol_presence",
+      "direction": "downstream_import_to_upstream",
+      "details": {
+        "target": "vllm.model_executor.layers.fused_moe.FusedMoE",
+        "root_upstream": {
+          "file": "vllm/model_executor/layers/fused_moe/layer.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": 100,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_experts",
+                true
+              ],
+              [
+                "top_k",
+                true
+              ],
+              [
+                "hidden_size",
+                true
+              ],
+              [
+                "intermediate_size",
+                true
+              ],
+              [
+                "intermediate_pad",
+                false
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "renormalize",
+                false
+              ],
+              [
+                "use_grouped_topk",
+                false
+              ],
+              [
+                "num_expert_group",
+                false
+              ],
+              [
+                "topk_group",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "tp_size",
+                false
+              ],
+              [
+                "dp_size",
+                false
+              ],
+              [
+                "pcp_size",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ],
+              [
+                "custom_routing_function",
+                false
+              ],
+              [
+                "router",
+                false
+              ],
+              [
+                "scoring_func",
+                false
+              ],
+              [
+                "routed_scaling_factor",
+                false
+              ],
+              [
+                "swiglu_limit",
+                false
+              ],
+              [
+                "swiglu_alpha",
+                false
+              ],
+              [
+                "swiglu_beta",
+                false
+              ],
+              [
+                "activation_situ_beta",
+                false
+              ],
+              [
+                "activation_situ_linear_beta",
+                false
+              ],
+              [
+                "e_score_correction_bias",
+                false
+              ],
+              [
+                "apply_router_weight_on_input",
+                false
+              ],
+              [
+                "activation",
+                false
+              ],
+              [
+                "enable_eplb",
+                false
+              ],
+              [
+                "num_redundant_experts",
+                false
+              ],
+              [
+                "has_bias",
+                false
+              ],
+              [
+                "is_sequence_parallel",
+                false
+              ],
+              [
+                "reduce_results",
+                false
+              ],
+              [
+                "ckpt_names",
+                false
+              ],
+              [
+                "n_shared_experts",
+                false
+              ],
+              [
+                "router_logits_dtype",
+                false
+              ],
+              [
+                "gate",
+                false
+              ],
+              [
+                "shared_experts",
+                false
+              ],
+              [
+                "shared_expert_gate",
+                false
+              ],
+              [
+                "routed_input_transform",
+                false
+              ],
+              [
+                "routed_output_transform",
+                false
+              ],
+              [
+                "apply_routed_scale_to_output",
+                false
+              ],
+              [
+                "zero_expert_type",
+                false
+              ],
+              [
+                "hash_indices_table",
+                false
+              ],
+              [
+                "runner_cls",
+                false
+              ],
+              [
+                "runner_args",
+                false
+              ],
+              [
+                "routed_experts_cls",
+                false
+              ],
+              [
+                "routed_experts_args",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "d7cb20834e231091577e154dd732a5dd3b036ad2f57001b95d8d7279ba485d9d",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "54f137578fa3b738",
+      "classification": "introduced_break",
+      "relation": "direct_import",
+      "priority": "P1",
+      "action": "modify",
+      "confidence": "high",
+      "upstream": {
+        "old": {
+          "file": "vllm/model_executor/layers/fused_moe/layer.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": 100,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_experts",
+                true
+              ],
+              [
+                "top_k",
+                true
+              ],
+              [
+                "hidden_size",
+                true
+              ],
+              [
+                "intermediate_size",
+                true
+              ],
+              [
+                "intermediate_pad",
+                false
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "renormalize",
+                false
+              ],
+              [
+                "use_grouped_topk",
+                false
+              ],
+              [
+                "num_expert_group",
+                false
+              ],
+              [
+                "topk_group",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "tp_size",
+                false
+              ],
+              [
+                "dp_size",
+                false
+              ],
+              [
+                "pcp_size",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ],
+              [
+                "custom_routing_function",
+                false
+              ],
+              [
+                "router",
+                false
+              ],
+              [
+                "scoring_func",
+                false
+              ],
+              [
+                "routed_scaling_factor",
+                false
+              ],
+              [
+                "swiglu_limit",
+                false
+              ],
+              [
+                "swiglu_alpha",
+                false
+              ],
+              [
+                "swiglu_beta",
+                false
+              ],
+              [
+                "activation_situ_beta",
+                false
+              ],
+              [
+                "activation_situ_linear_beta",
+                false
+              ],
+              [
+                "e_score_correction_bias",
+                false
+              ],
+              [
+                "apply_router_weight_on_input",
+                false
+              ],
+              [
+                "activation",
+                false
+              ],
+              [
+                "enable_eplb",
+                false
+              ],
+              [
+                "num_redundant_experts",
+                false
+              ],
+              [
+                "has_bias",
+                false
+              ],
+              [
+                "is_sequence_parallel",
+                false
+              ],
+              [
+                "reduce_results",
+                false
+              ],
+              [
+                "ckpt_names",
+                false
+              ],
+              [
+                "n_shared_experts",
+                false
+              ],
+              [
+                "router_logits_dtype",
+                false
+              ],
+              [
+                "gate",
+                false
+              ],
+              [
+                "shared_experts",
+                false
+              ],
+              [
+                "shared_expert_gate",
+                false
+              ],
+              [
+                "routed_input_transform",
+                false
+              ],
+              [
+                "routed_output_transform",
+                false
+              ],
+              [
+                "apply_routed_scale_to_output",
+                false
+              ],
+              [
+                "zero_expert_type",
+                false
+              ],
+              [
+                "hash_indices_table",
+                false
+              ],
+              [
+                "runner_cls",
+                false
+              ],
+              [
+                "runner_args",
+                false
+              ],
+              [
+                "routed_experts_cls",
+                false
+              ],
+              [
+                "routed_experts_args",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "d7cb20834e231091577e154dd732a5dd3b036ad2f57001b95d8d7279ba485d9d",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        },
+        "new": {
+          "file": null,
+          "owner": null,
+          "name": "FusedMoE",
+          "line": null,
+          "signature": null,
+          "descriptor": null,
+          "symbol_kind": null,
+          "signature_status": null,
+          "analysis_fingerprint": null,
+          "return_contract": null
+        }
+      },
+      "downstream": {
+        "file": "vllm_ascend/ops/fused_moe/fused_moe.py",
+        "owner": null,
+        "name": "FusedMoE",
+        "line": 20,
+        "signature": null,
+        "descriptor": null,
+        "symbol_kind": null,
+        "signature_status": null,
+        "analysis_fingerprint": null,
+        "return_contract": null
+      },
+      "compatibility": {
+        "old": {
+          "exists": true,
+          "compatible": true,
+          "reason": "import target exists at old"
+        },
+        "new": {
+          "exists": false,
+          "compatible": false,
+          "reason": "old import path no longer resolves at new"
+        }
+      },
+      "change": "import module or symbol was removed",
+      "evidence": [
+        {
+          "file": "vllm_ascend/ops/fused_moe/fused_moe.py",
+          "line": 20,
+          "import": "vllm.model_executor.layers.fused_moe.layer",
+          "symbol": "FusedMoE"
+        }
+      ],
+      "gates": {
+        "relationship_verified": true,
+        "contract_changed": true,
+        "runtime_reachable": true,
+        "version_lane_matches": true
+      },
+      "suggestion": "更新下游依赖目标；若上游已删除该能力，需要移除 patch/继承并补充替代实现。",
+      "source": "direct_import_detector",
+      "contract_kind": "symbol_presence",
+      "direction": "downstream_import_to_upstream",
+      "details": {
+        "target": "vllm.model_executor.layers.fused_moe.layer.FusedMoE",
+        "root_upstream": {
+          "file": "vllm/model_executor/layers/fused_moe/layer.py",
+          "owner": null,
+          "name": "FusedMoE",
+          "line": 100,
+          "signature": [
+            "sync",
+            [],
+            [
+              [
+                "num_experts",
+                true
+              ],
+              [
+                "top_k",
+                true
+              ],
+              [
+                "hidden_size",
+                true
+              ],
+              [
+                "intermediate_size",
+                true
+              ],
+              [
+                "intermediate_pad",
+                false
+              ],
+              [
+                "params_dtype",
+                false
+              ],
+              [
+                "renormalize",
+                false
+              ],
+              [
+                "use_grouped_topk",
+                false
+              ],
+              [
+                "num_expert_group",
+                false
+              ],
+              [
+                "topk_group",
+                false
+              ],
+              [
+                "quant_config",
+                false
+              ],
+              [
+                "tp_size",
+                false
+              ],
+              [
+                "dp_size",
+                false
+              ],
+              [
+                "pcp_size",
+                false
+              ],
+              [
+                "prefix",
+                false
+              ],
+              [
+                "custom_routing_function",
+                false
+              ],
+              [
+                "router",
+                false
+              ],
+              [
+                "scoring_func",
+                false
+              ],
+              [
+                "routed_scaling_factor",
+                false
+              ],
+              [
+                "swiglu_limit",
+                false
+              ],
+              [
+                "swiglu_alpha",
+                false
+              ],
+              [
+                "swiglu_beta",
+                false
+              ],
+              [
+                "activation_situ_beta",
+                false
+              ],
+              [
+                "activation_situ_linear_beta",
+                false
+              ],
+              [
+                "e_score_correction_bias",
+                false
+              ],
+              [
+                "apply_router_weight_on_input",
+                false
+              ],
+              [
+                "activation",
+                false
+              ],
+              [
+                "enable_eplb",
+                false
+              ],
+              [
+                "num_redundant_experts",
+                false
+              ],
+              [
+                "has_bias",
+                false
+              ],
+              [
+                "is_sequence_parallel",
+                false
+              ],
+              [
+                "reduce_results",
+                false
+              ],
+              [
+                "ckpt_names",
+                false
+              ],
+              [
+                "n_shared_experts",
+                false
+              ],
+              [
+                "router_logits_dtype",
+                false
+              ],
+              [
+                "gate",
+                false
+              ],
+              [
+                "shared_experts",
+                false
+              ],
+              [
+                "shared_expert_gate",
+                false
+              ],
+              [
+                "routed_input_transform",
+                false
+              ],
+              [
+                "routed_output_transform",
+                false
+              ],
+              [
+                "apply_routed_scale_to_output",
+                false
+              ],
+              [
+                "zero_expert_type",
+                false
+              ],
+              [
+                "hash_indices_table",
+                false
+              ],
+              [
+                "runner_cls",
+                false
+              ],
+              [
+                "runner_args",
+                false
+              ],
+              [
+                "routed_experts_cls",
+                false
+              ],
+              [
+                "routed_experts_args",
+                false
+              ]
+            ],
+            null,
+            [],
+            null
+          ],
+          "descriptor": "ordinary",
+          "symbol_kind": "callable",
+          "signature_status": "exact",
+          "analysis_fingerprint": "d7cb20834e231091577e154dd732a5dd3b036ad2f57001b95d8d7279ba485d9d",
+          "return_contract": {
+            "protocol": "value",
+            "variants": [
+              {
+                "kind": "object",
+                "arity": null,
+                "keys": [],
+                "type_ref": "vllm.model_executor.layers.fused_moe.runner.moe_runner.MoERunner"
+              }
+            ],
+            "status": "exact",
+            "provenance": [
+              "return_annotation"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

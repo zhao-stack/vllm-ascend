@@ -246,7 +246,7 @@ def test_report_writer_separates_introduced_csv(tmp_path: Path) -> None:
     outputs = write_reports(report, tmp_path / "reports")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
     introduced_csv = Path(outputs["introduced_csv"]).read_text(encoding="utf-8-sig")
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["metadata"]["vllm_old_sha"] == roots[2]
     assert "introduced_break" in introduced_csv
     assert "contract_kind" in introduced_csv.splitlines()[0]
@@ -357,6 +357,37 @@ def test_direct_call_required_parameter_is_an_introduced_break(tmp_path: Path) -
     assert calls[0]["classification"] == "introduced_break"
     assert calls[0]["direction"] == "downstream_call_to_upstream"
     assert calls[0]["details"]["call_shape"]["positional_count"] == 1
+
+
+def test_triton_kernel_launch_required_parameter_is_an_introduced_break(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=(
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit(do_not_specialize=['value'])\n"
+            "def kernel(value, BLOCK_SIZE): pass\n"
+        ),
+        new_source=(
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit(do_not_specialize=['value'])\n"
+            "def kernel(value, required, BLOCK_SIZE): pass\n"
+        ),
+        consumer_source=("from vllm.api import kernel\n\ndef use():\n    kernel[(2,)](1, BLOCK_SIZE=16)\n"),
+    )
+    report = _run(*roots)
+    calls = [
+        item
+        for item in report["findings"]
+        if item["relation"] == "direct_call" and item["contract_kind"] == "call_arguments"
+    ]
+    assert len(calls) == 1
+    assert calls[0]["classification"] == "introduced_break"
+    assert calls[0]["compatibility"]["old"]["compatible"] is True
+    assert calls[0]["compatibility"]["new"]["compatible"] is False
+    assert calls[0]["details"]["invocation_kind"] == "triton_kernel_launch"
+    assert calls[0]["evidence"][0]["callee"] == "kernel[2,]"
 
 
 def test_direct_call_keyword_rename_is_an_introduced_break(tmp_path: Path) -> None:
@@ -1023,10 +1054,7 @@ def test_vllm_interface_scenario_runs_only_upstream_pr_capabilities(tmp_path: Pa
         old_source="class Base:\n    def run(self, value): return value\n",
         new_source="class Base:\n    def run(self, value, required): return value\n",
         consumer_source=(
-            "from vllm.api import Base\n\n"
-            "def replacement(self, value):\n"
-            "    return value\n\n"
-            "Base.run = replacement\n"
+            "from vllm.api import Base\n\ndef replacement(self, value):\n    return value\n\nBase.run = replacement\n"
         ),
     )
     report = analyze_range(
@@ -1041,8 +1069,9 @@ def test_vllm_interface_scenario_runs_only_upstream_pr_capabilities(tmp_path: Pa
     capabilities = report["metadata"]["analysis_plan"]["capabilities"]
     assert capabilities["inheritance_mro"]["state"] == "prerequisite"
     assert capabilities["monkey_patch"]["state"] == "skipped"
-    assert capabilities["direct_import"]["state"] == "skipped"
+    assert capabilities["direct_import"]["state"] == "analyzed"
     assert report["metadata"]["timings_seconds"]["relation_generation.monkey_patch"] is None
+    assert report["metadata"]["timings_seconds"]["direct_import_analysis"] is not None
     assert not any(item["relation"] == "monkey_patch" for item in report["findings"])
 
 
@@ -1060,11 +1089,46 @@ def test_vllm_interface_scenario_keeps_override_breaks(tmp_path: Path) -> None:
         expect_ascend_sha=roots[4],
         scenario="vllm-interface",
     )
-    introduced = [
-        item for item in report["findings"] if item["classification"] == "introduced_break"
-    ]
+    introduced = [item for item in report["findings"] if item["classification"] == "introduced_break"]
     assert introduced
     assert {item["relation"] for item in introduced} == {"override"}
+
+
+def test_vllm_interface_reports_import_and_call_breaks_as_one_root_cause(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="def helper(value): return value\n",
+        new_source="OTHER = 1\n",
+        consumer_source=("from vllm.api import helper\n\ndef use():\n    return helper(1)\n"),
+    )
+    report = analyze_range(
+        vllm_root=roots[0],
+        ascend_root=roots[1],
+        old=roots[2],
+        new=roots[3],
+        expect_ascend_sha=roots[4],
+        scenario="vllm-interface",
+    )
+    introduced = [item for item in report["findings"] if item["classification"] == "introduced_break"]
+    assert {item["relation"] for item in introduced} == {
+        "direct_call",
+        "direct_import",
+    }
+    output_dir = tmp_path / "upstream-report"
+    outputs = write_reports(report, output_dir)
+    payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
+    assert payload["summary"]["introduced_breaks"] == 2
+    assert payload["summary"]["root_causes"] == 1
+    assert {item["relation"] for item in payload["findings"]} == {
+        "direct_call",
+        "direct_import",
+    }
+    markdown = Path(outputs["markdown"]).read_text(encoding="utf-8")
+    assert "downstream imports, overrides" in markdown
+    assert "direct imports" not in markdown
+    assert markdown.count("- Upstream: `vllm/api.py:helper`") == 2
 
 
 def test_vllm_interface_reports_only_actionable_introduced_breaks(tmp_path: Path) -> None:
