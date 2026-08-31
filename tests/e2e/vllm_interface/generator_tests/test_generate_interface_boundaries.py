@@ -344,6 +344,141 @@ class Child(Base):
     assert any(relation.relation == "override" and relation.downstream_name == "__init__" for relation in relations)
 
 
+def test_verified_override_expands_transitive_downstream_subclasses(
+    tmp_path: Path,
+) -> None:
+    vllm_root = tmp_path / "vllm-repo"
+    ascend_root = tmp_path / "ascend-repo"
+    _write(vllm_root, "vllm/__init__.py", "")
+    _write(
+        vllm_root,
+        "vllm/base.py",
+        """
+class Base:
+    def run(self, value):
+        return value
+""",
+    )
+    _write(ascend_root, "vllm_ascend/__init__.py", "")
+    _write(
+        ascend_root,
+        "vllm_ascend/plugin.py",
+        """
+from vllm.base import Base
+
+
+class Parent(Base):
+    def run(self, value):
+        return value
+
+
+class GrandChild(Parent):
+    def run(self, value):
+        return value
+
+
+class GreatGrandChild(GrandChild):
+    def run(self, value):
+        return value
+""",
+    )
+
+    engine = generator.InterfaceBoundaryGenerator(vllm_root, ascend_root)
+    relations, findings = engine.generate()
+    overrides = {
+        relation.downstream_owner: relation
+        for relation in relations
+        if relation.relation == "override" and relation.downstream_name == "run"
+    }
+
+    assert set(overrides) == {"Parent", "GrandChild", "GreatGrandChild"}
+    assert all((relation.upstream_owner, relation.upstream_name) == ("Base", "run") for relation in overrides.values())
+    assert overrides["Parent"].override_paths == (
+        (
+            "vllm_ascend.plugin.Parent.run",
+            "vllm.base.Base.run",
+        ),
+    )
+    assert overrides["GrandChild"].override_paths == (
+        (
+            "vllm_ascend.plugin.GrandChild.run",
+            "vllm_ascend.plugin.Parent.run",
+            "vllm.base.Base.run",
+        ),
+    )
+    assert overrides["GreatGrandChild"].override_paths == (
+        (
+            "vllm_ascend.plugin.GreatGrandChild.run",
+            "vllm_ascend.plugin.GrandChild.run",
+            "vllm_ascend.plugin.Parent.run",
+            "vllm.base.Base.run",
+        ),
+    )
+    assert not findings
+    assert {
+        "vllm_ascend.plugin.Parent",
+        "vllm_ascend.plugin.GrandChild",
+        "vllm_ascend.plugin.GreatGrandChild",
+    } <= engine._mro_cache.keys()
+
+
+def test_transitive_override_uses_a_callable_prefix_of_an_incomplete_mro(
+    tmp_path: Path,
+) -> None:
+    vllm_root = tmp_path / "vllm-repo"
+    ascend_root = tmp_path / "ascend-repo"
+    _write(vllm_root, "vllm/__init__.py", "")
+    _write(
+        vllm_root,
+        "vllm/base.py",
+        """
+from unknown_package import ExternalBase
+
+
+class Base(ExternalBase):
+    def run(self, value):
+        return value
+""",
+    )
+    _write(ascend_root, "vllm_ascend/__init__.py", "")
+    _write(
+        ascend_root,
+        "vllm_ascend/plugin.py",
+        """
+from vllm.base import Base
+
+
+class Parent(Base):
+    def run(self, value):
+        return value
+
+
+class GrandChild(Parent):
+    def run(self, value):
+        return value
+""",
+    )
+
+    engine = generator.InterfaceBoundaryGenerator(vllm_root, ascend_root)
+    relations, findings = engine.generate()
+    overrides = {
+        relation.downstream_owner: relation
+        for relation in relations
+        if relation.relation == "override" and relation.downstream_name == "run"
+    }
+
+    assert not engine._linearized_mro("vllm_ascend.plugin.GrandChild").complete
+    assert set(overrides) == {"Parent", "GrandChild"}
+    assert overrides["GrandChild"].override_paths == (
+        (
+            "vllm_ascend.plugin.GrandChild.run",
+            "vllm_ascend.plugin.Parent.run",
+            "vllm.base.Base.run",
+        ),
+    )
+    assert not findings
+
+
 def test_dataclass_generated_init_has_a_field_derived_signature(
     tmp_path: Path,
 ) -> None:
@@ -586,6 +721,21 @@ class Base(Base):
     assert index.canonical_name("vllm.wrapper.Base") == ("vllm.wrapper.Base")
     assert index.find_class("vllm.wrapper.Base").file == ("vllm/wrapper.py")
     assert index.find_class("vllm.wrapper.Base").resolved_bases == ("vllm.base.Base",)
+
+
+def test_canonical_name_fails_closed_on_self_expanding_alias(tmp_path: Path) -> None:
+    vllm_root = tmp_path / "vllm-repo"
+    _write(vllm_root, "vllm/__init__.py", "")
+    _write(
+        vllm_root,
+        "vllm/wrapper.py",
+        "from vllm.wrapper.Base import Base as Base\n",
+    )
+
+    index = generator.RepositoryIndex(vllm_root, "vllm")
+
+    assert index.aliases["vllm.wrapper.Base"] == "vllm.wrapper.Base.Base"
+    assert index.canonical_name("vllm.wrapper.Base.method") == ("vllm.wrapper.Base.method")
 
 
 def test_star_reexport_resolves_to_the_defining_callable(tmp_path: Path) -> None:
@@ -7820,7 +7970,7 @@ Target.run = staticmethod(lambda value: value)
     assert not findings
 
 
-def test_v024_pinned_torch_inference_mode_is_an_ordinary_descriptor(
+def test_v024_known_torch_inference_mode_is_commit_independent(
     tmp_path: Path,
 ) -> None:
     vllm_root, ascend_root = _v018_source_roots(tmp_path)
@@ -7867,11 +8017,8 @@ class Child(Base):
     unregistered = next(relation for relation in unregistered_relations if relation.relation == "override")
     assert pinned.upstream_descriptor_kind == "ordinary"
     assert not pinned_findings
-    assert unregistered.upstream_descriptor_kind == "unknown"
-    assert {finding.reason_code for finding in unregistered_findings} == {
-        "unknown_descriptor_kind",
-        "unknown_signature_transform",
-    }
+    assert unregistered.upstream_descriptor_kind == "ordinary"
+    assert not unregistered_findings
 
 
 def test_v024_outer_classmethod_determines_kind_after_unknown_inner_decorator(
@@ -9161,7 +9308,7 @@ class Child(Base):
     assert "unknown_signature_transform" in {finding.reason_code for finding in findings if finding.supplemental}
 
 
-def test_v031_torch_compiler_disable_wrapper_adapter_is_sha_pinned(
+def test_v031_torch_compiler_disable_wrapper_adapter_is_commit_independent(
     tmp_path: Path,
 ) -> None:
     vllm_root, ascend_root = _v018_source_roots(tmp_path)
@@ -9211,16 +9358,11 @@ base.run = replacement
     assert pinned.upstream_signature_contract.runtime_entry_signature == wrapper_signature
     assert pinned.upstream_signature_contract.reported_signature == pinned.upstream_signature
     assert pinned.upstream_signature_contract.forwarded_targets == ("vllm.base.run",)
-    assert any(
-        "torch.compiler.disable" in item and torch_sha in item
-        for item in pinned.upstream_signature_contract.provenance
-    )
+    assert "torch.compiler.disable:wrapped" in pinned.upstream_signature_contract.provenance
     assert not [finding for finding in pinned_findings if finding.reason_code == "unknown_signature_transform"]
-    assert unknown.upstream_signature_contract.status == "unknown"
-    assert any(
-        finding.reason_code == "unknown_signature_transform" and finding.supplemental
-        for finding in unknown_findings
-    )
+    assert unknown.upstream_signature_contract.status == "exact"
+    assert unknown.upstream_signature_contract.runtime_entry_signature == wrapper_signature
+    assert not [finding for finding in unknown_findings if finding.reason_code == "unknown_signature_transform"]
 
 
 def test_v032_forwarding_wrappers_do_not_hide_reported_signature_break(
@@ -9356,7 +9498,7 @@ class Child(Base):
     assert any("runtime_decorator" in item for item in contract.provenance)
 
 
-def test_v025_signature_decorator_adapter_is_sha_pinned_and_fails_closed(
+def test_v025_signature_decorator_adapter_is_commit_independent(
     tmp_path: Path,
 ) -> None:
     vllm_root, ascend_root = _v018_source_roots(tmp_path)
@@ -9401,14 +9543,10 @@ class Child(Base):
     pinned = next(relation for relation in pinned_relations if relation.relation == "override")
     unknown = next(relation for relation in unknown_relations if relation.relation == "override")
     assert pinned.upstream_signature_contract.status == "exact"
-    assert any(
-        "torch.inference_mode" in item and torch_sha in item for item in pinned.upstream_signature_contract.provenance
-    )
-    assert unknown.upstream_signature_contract.status == "unknown"
-    assert unknown.upstream_signature_contract.runtime_entry_signature is None
-    assert any(
-        finding.reason_code == "unknown_signature_transform" and finding.supplemental for finding in unknown_findings
-    )
+    assert "torch.inference_mode" in pinned.upstream_signature_contract.provenance
+    assert unknown.upstream_signature_contract.status == "exact"
+    assert unknown.upstream_signature_contract.runtime_entry_signature == unknown.upstream_signature
+    assert not [finding for finding in unknown_findings if finding.reason_code == "unknown_signature_transform"]
 
 
 def test_v025_signature_contract_separates_definition_and_bound_receiver(
@@ -9505,16 +9643,15 @@ base.run = replacement
     ) == ("review", False, True)
 
 
-def test_v026_descriptor_sha_allowlist_does_not_imply_signature_transparency(
+def test_v026_descriptor_allowlist_does_not_imply_signature_transparency(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     vllm_root, ascend_root = _v018_source_roots(tmp_path)
-    descriptor_only_sha = "descriptor-only-sha"
-    monkeypatch.setitem(
-        generator._PINNED_ORDINARY_DESCRIPTOR_DECORATORS,
-        ("fixture", descriptor_only_sha),
-        frozenset({"vllm.base.signature_transform"}),
+    monkeypatch.setattr(
+        generator,
+        "_KNOWN_ORDINARY_DESCRIPTOR_DECORATORS",
+        generator._KNOWN_ORDINARY_DESCRIPTOR_DECORATORS | {"vllm.base.signature_transform"},
     )
     _write(
         vllm_root,
@@ -9546,7 +9683,6 @@ class Child(Base):
     relations, findings = generator.InterfaceBoundaryGenerator(
         vllm_root,
         ascend_root,
-        source_versions={"fixture": descriptor_only_sha},
     ).generate()
 
     override = next(relation for relation in relations if relation.relation == "override")
@@ -9835,7 +9971,7 @@ Target.enabled = mock_true
     assert [finding.reason_code for finding in findings] == ["descriptor_kind_mismatch"]
 
 
-def test_v034_pinned_triton_jit_uses_kernel_launch_contract(
+def test_v034_triton_jit_kernel_contract_is_commit_independent(
     tmp_path: Path,
 ) -> None:
     vllm_root, ascend_root = _v018_source_roots(tmp_path)
@@ -9893,9 +10029,11 @@ base.kernel = replacement
     assert pinned.upstream_signature_contract.protocol == "triton_kernel_launch"
     assert pinned.installed_signature_contract.protocol == "triton_kernel_launch"
     assert not [finding for finding in pinned_findings if finding.reason_code == "unknown_signature_transform"]
-    assert unknown.upstream_signature_contract.status == "unknown"
-    assert unknown.installed_signature_contract.status == "unknown"
-    assert any(finding.reason_code == "unknown_signature_transform" for finding in unknown_findings)
+    assert unknown.upstream_signature_contract.status == "exact"
+    assert unknown.installed_signature_contract.status == "exact"
+    assert unknown.upstream_signature_contract.protocol == "triton_kernel_launch"
+    assert unknown.installed_signature_contract.protocol == "triton_kernel_launch"
+    assert not [finding for finding in unknown_findings if finding.reason_code == "unknown_signature_transform"]
 
 
 def test_v034_pinned_triton_heuristics_models_generated_launch_parameters(
@@ -10147,12 +10285,8 @@ def _replace_gpu_model_runner_function_wrapper(target_module_name):
     ).generate()
 
     assert not any(
-        relation.relation == "monkey_patch"
-        and relation.downstream_name == "graph_capture"
-        for relation in relations
+        relation.relation == "monkey_patch" and relation.downstream_name == "graph_capture" for relation in relations
     )
     assert not any(
-        finding.relation == "monkey_patch"
-        and finding.downstream_name == "graph_capture"
-        for finding in findings
+        finding.relation == "monkey_patch" and finding.downstream_name == "graph_capture" for finding in findings
     )

@@ -37,22 +37,32 @@ from __future__ import annotations
 import argparse
 import ast
 import builtins
+import contextlib
 import hashlib
 import inspect
 import json
+import os
+import pickle
+import posixpath
+import sqlite3
 import subprocess
+import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
-from tools.vllm_interface_contracts import schema as _boundary_schema
-from tools.vllm_interface_contracts.analysis_plans import MAIN2MAIN_PLAN, AnalysisPlan
+from . import schema as _boundary_schema
+from .analysis_plans import MAIN2MAIN_PLAN, AnalysisPlan
 
 SCHEMA_VERSION = 6
-GENERATOR_VERSION = "0.36.0"
+GENERATOR_VERSION = "0.44.0"
+REPOSITORY_INDEX_CACHE_SCHEMA_VERSION = 2
+REPOSITORY_FILE_FRAGMENT_CACHE_SCHEMA_VERSION = 2
 SUPPORTED_RELATIONS = frozenset({"inheritance", "monkey_patch", "override"})
 FINDING_STATUSES = frozenset({"expected", "excluded", "review", "risk", "verified"})
 DESCRIPTOR_KINDS = frozenset(
@@ -79,51 +89,24 @@ _TRANSPARENT_DESCRIPTOR_DECORATORS = frozenset(
         "typing_extensions.override",
     }
 )
-_PINNED_ORDINARY_DESCRIPTOR_DECORATORS: dict[
-    tuple[str, str],
-    frozenset[str],
-] = {
-    (
-        "torch",
-        "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0",
-    ): frozenset({"torch.inference_mode"}),
-    (
-        "vllm",
-        "88402a41c4ab272ebbbd33f4a77fbbac0431cbb9",
-    ): frozenset({"vllm.tracing.instrument"}),
-}
-_PINNED_TRANSPARENT_SIGNATURE_DECORATORS: dict[
-    tuple[str, str],
-    frozenset[str],
-] = {
-    (
-        "torch",
-        "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0",
-    ): frozenset({"torch.inference_mode"}),
-    (
-        "vllm",
-        "88402a41c4ab272ebbbd33f4a77fbbac0431cbb9",
-    ): frozenset({"vllm.tracing.instrument"}),
-}
-_PINNED_WRAPS_SIGNATURE_DECORATORS: dict[
-    tuple[str, str],
-    frozenset[str],
-] = {
-    (
-        "torch",
-        "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0",
-    ): frozenset({"torch.compiler.disable"}),
-}
-_STDLIB_WRAPS_SIGNATURE_DECORATORS = frozenset({"contextlib.contextmanager"})
-_PINNED_TRITON_KERNEL_SOURCES = frozenset(
+_KNOWN_ORDINARY_DESCRIPTOR_DECORATORS = frozenset(
     {
-        ("vllm", "88402a41c4ab272ebbbd33f4a77fbbac0431cbb9"),
-        ("vllm_ascend", "81d3450128528be2c343232fcc28220814a15fd6"),
+        "torch.inference_mode",
+        "vllm.tracing.instrument",
     }
 )
+_KNOWN_TRANSPARENT_SIGNATURE_DECORATORS = frozenset(
+    {
+        "torch.inference_mode",
+        "vllm.tracing.instrument",
+    }
+)
+_KNOWN_WRAPS_SIGNATURE_DECORATORS = frozenset({"torch.compiler.disable"})
+_STDLIB_WRAPS_SIGNATURE_DECORATORS = frozenset({"contextlib.contextmanager"})
 _TRITON_JIT_DECORATOR = "vllm.triton_utils.triton.jit"
 _TRITON_HEURISTICS_DECORATOR = "vllm.triton_utils.triton.heuristics"
 _TRITON_KERNEL_PROTOCOL = "triton_kernel_launch"
+_TRY_STAR_TYPE: Any = getattr(ast, "TryStar", ())
 STDLIB_STRUCTURAL_BASES: dict[str, tuple[str, ...]] = {
     "abc.ABC": (),
     "typing.Generic": (),
@@ -490,9 +473,9 @@ def _scope_flow_statement(
     state = _clone_scope_binding_state(incoming)
 
     if isinstance(node, ast.If):
-        exits: list[_ScopeFlowExit] = []
+        if_exits: list[_ScopeFlowExit] = []
         if _scope_expression_may_raise(node.test):
-            exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
+            if_exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
         condition = _main_condition_value(node.test, tag_guard_names)
         branches: list[Sequence[ast.stmt]]
         if condition is True:
@@ -501,7 +484,7 @@ def _scope_flow_statement(
             branches = [node.orelse]
         else:
             branches = [node.body, node.orelse]
-        normal: list[dict[str, tuple[_ScopeBinding, ...]]] = []
+        if_normal: list[dict[str, tuple[_ScopeBinding, ...]]] = []
         for statements in branches:
             branch = _scope_binding_flow(
                 statements,
@@ -510,16 +493,17 @@ def _scope_flow_statement(
                 loop_body=loop_body,
                 active_exception=active_exception,
             )
-            normal.extend(branch.normal)
-            exits.extend(branch.exits)
-        return _compact_scope_flow(_ScopeFlowResult(normal=normal, exits=exits))
+            if_normal.extend(branch.normal)
+            if_exits.extend(branch.exits)
+        return _compact_scope_flow(_ScopeFlowResult(normal=if_normal, exits=if_exits))
 
-    if isinstance(node, ast.TryStar):
+    if isinstance(node, _TRY_STAR_TYPE):
         # ExceptionGroup routing differs from ordinary try/except.  Preserve
         # every explicit path conservatively until a dedicated model exists.
+        try_star_node: Any = node
         paths = [
             _scope_binding_flow(
-                node.body,
+                try_star_node.body,
                 tag_guard_names,
                 state,
                 loop_body=loop_body,
@@ -533,26 +517,26 @@ def _scope_flow_statement(
                     loop_body=loop_body,
                     active_exception=None,
                 )
-                for handler in node.handlers
+                for handler in try_star_node.handlers
             ),
         ]
-        normal = [candidate for path in paths for candidate in path.normal]
-        exits = [candidate for path in paths for candidate in path.exits]
-        if node.orelse:
+        try_star_normal = [candidate for path in paths for candidate in path.normal]
+        try_star_exits = [candidate for path in paths for candidate in path.exits]
+        if try_star_node.orelse:
             else_flow = _scope_binding_flow(
-                node.orelse,
+                try_star_node.orelse,
                 tag_guard_names,
-                _merge_scope_binding_states(normal) or state,
+                _merge_scope_binding_states(try_star_normal) or state,
                 loop_body=loop_body,
                 active_exception=active_exception,
             )
-            normal.extend(else_flow.normal)
-            exits.extend(else_flow.exits)
-        result = _compact_scope_flow(_ScopeFlowResult(normal=normal, exits=exits))
-        if node.finalbody:
+            try_star_normal.extend(else_flow.normal)
+            try_star_exits.extend(else_flow.exits)
+        result = _compact_scope_flow(_ScopeFlowResult(normal=try_star_normal, exits=try_star_exits))
+        if try_star_node.finalbody:
             return _apply_scope_finally(
                 result,
-                node.finalbody,
+                try_star_node.finalbody,
                 tag_guard_names,
                 loop_body=loop_body,
             )
@@ -566,8 +550,8 @@ def _scope_flow_statement(
             loop_body=loop_body,
             active_exception=active_exception,
         )
-        normal: list[dict[str, tuple[_ScopeBinding, ...]]] = []
-        exits: list[_ScopeFlowExit] = [candidate for candidate in body.exits if candidate.kind != "raise"]
+        try_normal: list[dict[str, tuple[_ScopeBinding, ...]]] = []
+        try_exits: list[_ScopeFlowExit] = [candidate for candidate in body.exits if candidate.kind != "raise"]
 
         for body_state in body.normal:
             else_flow = _scope_binding_flow(
@@ -577,8 +561,8 @@ def _scope_flow_statement(
                 loop_body=loop_body,
                 active_exception=active_exception,
             )
-            normal.extend(else_flow.normal)
-            exits.extend(else_flow.exits)
+            try_normal.extend(else_flow.normal)
+            try_exits.extend(else_flow.exits)
 
         pending = [candidate for candidate in body.exits if candidate.kind == "raise"]
         for handler in node.handlers:
@@ -598,13 +582,13 @@ def _scope_flow_statement(
                     )
                     _unbind_handler_name(handler_flow.normal, handler.name)
                     _unbind_handler_name_from_exits(handler_flow.exits, handler.name)
-                    normal.extend(handler_flow.normal)
-                    exits.extend(handler_flow.exits)
+                    try_normal.extend(handler_flow.normal)
+                    try_exits.extend(handler_flow.exits)
                 if match in {_HANDLER_NEVER, _HANDLER_MAYBE}:
                     next_pending.append(raised)
             pending = next_pending
-        exits.extend(pending)
-        result = _compact_scope_flow(_ScopeFlowResult(normal=normal, exits=exits))
+        try_exits.extend(pending)
+        result = _compact_scope_flow(_ScopeFlowResult(normal=try_normal, exits=try_exits))
         if node.finalbody:
             result = _apply_scope_finally(
                 result,
@@ -615,9 +599,9 @@ def _scope_flow_statement(
         return result
 
     if isinstance(node, (ast.With, ast.AsyncWith)):
-        exits: list[_ScopeFlowExit] = []
+        with_exits: list[_ScopeFlowExit] = []
         if any(_scope_expression_may_raise(item.context_expr) for item in node.items):
-            exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
+            with_exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
         for item in node.items:
             if item.optional_vars is not None:
                 _bind_scope_names(
@@ -632,13 +616,13 @@ def _scope_flow_statement(
             loop_body=loop_body,
             active_exception=active_exception,
         )
-        return _compact_scope_flow(_ScopeFlowResult(normal=body.normal, exits=[*exits, *body.exits]))
+        return _compact_scope_flow(_ScopeFlowResult(normal=body.normal, exits=[*with_exits, *body.exits]))
 
     if isinstance(node, (ast.AsyncFor, ast.For, ast.While)):
-        exits: list[_ScopeFlowExit] = []
+        loop_exits: list[_ScopeFlowExit] = []
         test = node.iter if isinstance(node, (ast.AsyncFor, ast.For)) else node.test
         if _scope_expression_may_raise(test):
-            exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
+            loop_exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
         body_state = _clone_scope_binding_state(state)
         if isinstance(node, (ast.AsyncFor, ast.For)):
             _bind_scope_names(
@@ -653,11 +637,11 @@ def _scope_flow_statement(
             loop_body=True,
             active_exception=active_exception,
         )
-        normal = [state, *body.normal]
-        exits.extend(candidate for candidate in body.exits if candidate.kind not in {"break", "continue"})
-        normal.extend(candidate.state for candidate in body.exits if candidate.kind in {"break", "continue"})
+        loop_normal = [state, *body.normal]
+        loop_exits.extend(candidate for candidate in body.exits if candidate.kind not in {"break", "continue"})
+        loop_normal.extend(candidate.state for candidate in body.exits if candidate.kind in {"break", "continue"})
         if node.orelse:
-            merged = _merge_scope_binding_states(normal)
+            merged = _merge_scope_binding_states(loop_normal)
             if merged is not None:
                 else_flow = _scope_binding_flow(
                     node.orelse,
@@ -666,15 +650,15 @@ def _scope_flow_statement(
                     loop_body=loop_body,
                     active_exception=active_exception,
                 )
-                normal.extend(else_flow.normal)
-                exits.extend(else_flow.exits)
-        return _compact_scope_flow(_ScopeFlowResult(normal=normal, exits=exits))
+                loop_normal.extend(else_flow.normal)
+                loop_exits.extend(else_flow.exits)
+        return _compact_scope_flow(_ScopeFlowResult(normal=loop_normal, exits=loop_exits))
 
     if isinstance(node, ast.Match):
-        exits: list[_ScopeFlowExit] = []
+        match_exits: list[_ScopeFlowExit] = []
         if _scope_expression_may_raise(node.subject):
-            exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
-        normal = [state]
+            match_exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
+        match_normal = [state]
         for case in node.cases:
             branch = _scope_binding_flow(
                 case.body,
@@ -683,12 +667,12 @@ def _scope_flow_statement(
                 loop_body=loop_body,
                 active_exception=active_exception,
             )
-            normal.extend(branch.normal)
-            exits.extend(branch.exits)
-        return _compact_scope_flow(_ScopeFlowResult(normal=normal, exits=exits))
+            match_normal.extend(branch.normal)
+            match_exits.extend(branch.exits)
+        return _compact_scope_flow(_ScopeFlowResult(normal=match_normal, exits=match_exits))
 
     implicit_raise = _scope_simple_statement_may_raise(node)
-    exits = [_ScopeFlowExit("raise", _clone_scope_binding_state(state))] if implicit_raise else []
+    statement_exits = [_ScopeFlowExit("raise", _clone_scope_binding_state(state))] if implicit_raise else []
 
     if isinstance(node, ast.Raise):
         exception_name = active_exception if node.exc is None else _scope_exception_name(node.exc, state)
@@ -702,11 +686,11 @@ def _scope_flow_statement(
 
     if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
         if _scope_function_header_may_raise(node):
-            exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
+            statement_exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
         state[node.name] = (_scope_binding("function", node),)
     elif isinstance(node, ast.ClassDef):
         if _scope_class_header_may_raise(node):
-            exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
+            statement_exits.append(_ScopeFlowExit("raise", _clone_scope_binding_state(state)))
         class_flow = _scope_binding_flow(
             node.body,
             tag_guard_names,
@@ -714,7 +698,7 @@ def _scope_flow_statement(
             loop_body=False,
             active_exception=None,
         )
-        exits.extend(
+        statement_exits.extend(
             _ScopeFlowExit(
                 kind=candidate.kind,
                 state=_clone_scope_binding_state(state),
@@ -724,7 +708,7 @@ def _scope_flow_statement(
             if candidate.kind == "raise"
         )
         if not class_flow.normal:
-            return _compact_scope_flow(_ScopeFlowResult(exits=exits))
+            return _compact_scope_flow(_ScopeFlowResult(exits=statement_exits))
         state[node.name] = (_scope_binding("class", node),)
     elif isinstance(node, ast.Import):
         _bind_scope_names(
@@ -785,7 +769,7 @@ def _scope_flow_statement(
             _UNBOUND_SCOPE_BINDING,
         )
 
-    return _compact_scope_flow(_ScopeFlowResult(normal=[state], exits=exits))
+    return _compact_scope_flow(_ScopeFlowResult(normal=[state], exits=statement_exits))
 
 
 def _scope_binding_flow(
@@ -1367,7 +1351,12 @@ def _tag_guard_names(statements: Sequence[ast.stmt]) -> set[str]:
     for node in statements:
         if isinstance(node, ast.Assign) and _is_exact_tag_check(node.value):
             names.update(target.id for target in node.targets if isinstance(target, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and _is_exact_tag_check(node.value):
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+            and _is_exact_tag_check(node.value)
+        ):
             names.add(node.target.id)
     return names
 
@@ -1644,7 +1633,9 @@ def _scope_must_bound_names(
 ) -> set[str]:
     """Return names present after every normally completing active-main path."""
 
-    initial = {name: (_scope_binding("value", ast.Pass()),) for name in incoming or ()}
+    initial: dict[str, tuple[_ScopeBinding, ...]] = {
+        name: (_scope_binding("value", ast.Pass()),) for name in incoming or ()
+    }
     final = _scope_final_binding_state(
         statements,
         tag_guard_names,
@@ -1745,11 +1736,11 @@ def _main_ast_walk(tree: ast.AST) -> Iterable[ast.AST]:
                 branches = node.orelse
             else:
                 branches = (*node.body, *node.orelse)
-            for child in branches:
-                yield from walk(child)
+            for branch_child in branches:
+                yield from walk(branch_child)
             return
-        for child in ast.iter_child_nodes(node):
-            yield from walk(child)
+        for ast_child in ast.iter_child_nodes(node):
+            yield from walk(ast_child)
 
     yield from walk(tree)
 
@@ -1848,7 +1839,10 @@ def _signature_contract_from_payload(
     )
 
 
-def _one_json_value(values: Iterable[object]) -> tuple[object, bool]:
+_T = TypeVar("_T")
+
+
+def _one_json_value(values: Iterable[_T]) -> tuple[_T | None, bool]:
     keyed = {json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")): value for value in values}
     if len(keyed) == 1:
         return next(iter(keyed.values())), True
@@ -1932,7 +1926,11 @@ def _inspect_signature(
         return None
     positional_only, positional_or_keyword = signature[1], signature[2]
     vararg, keyword_only, kwarg = signature[3], signature[4], signature[5]
-    if not all(isinstance(items, list) for items in (positional_only, positional_or_keyword, keyword_only)):
+    if (
+        not isinstance(positional_only, list)
+        or not isinstance(positional_or_keyword, list)
+        or not isinstance(keyword_only, list)
+    ):
         return None
 
     parameters: list[inspect.Parameter] = []
@@ -1975,9 +1973,9 @@ def _inspect_signature(
 def _signature_call_witnesses(
     signature: list[object],
 ) -> list[tuple[list[object], dict[str, object]]]:
-    positional_only = signature[1]
-    positional_or_keyword = signature[2]
-    keyword_only = signature[4]
+    positional_only = cast(list[tuple[str, bool]], signature[1])
+    positional_or_keyword = cast(list[tuple[str, bool]], signature[2])
+    keyword_only = cast(list[tuple[str, bool]], signature[4])
     marker = {item[0]: object() for items in (positional_only, positional_or_keyword, keyword_only) for item in items}
 
     witnesses: list[tuple[list[object], dict[str, object]]] = []
@@ -2030,14 +2028,18 @@ def _accepts_signature_contract(
         except TypeError:
             return False
 
-    upstream_positional = [*upstream_signature[1], *upstream_signature[2]]
-    installed_positional = [*installed_signature[1], *installed_signature[2]]
+    upstream_positional_only = cast(list[tuple[str, bool]], upstream_signature[1])
+    upstream_positional_or_keyword = cast(list[tuple[str, bool]], upstream_signature[2])
+    installed_positional_only = cast(list[tuple[str, bool]], installed_signature[1])
+    installed_positional_or_keyword = cast(list[tuple[str, bool]], installed_signature[2])
+    upstream_positional = [*upstream_positional_only, *upstream_positional_or_keyword]
+    installed_positional = [*installed_positional_only, *installed_positional_or_keyword]
     for index, upstream_parameter in enumerate(upstream_positional):
         if index >= len(installed_positional):
             break
         installed_parameter = installed_positional[index]
-        upstream_is_positional_or_keyword = index >= len(upstream_signature[1])
-        installed_is_positional_only = index < len(installed_signature[1])
+        upstream_is_positional_or_keyword = index >= len(upstream_positional_only)
+        installed_is_positional_only = index < len(installed_positional_only)
         if upstream_is_positional_or_keyword and (
             installed_is_positional_only or upstream_parameter[0] != installed_parameter[0]
         ):
@@ -2084,7 +2086,12 @@ class CallableInfo:
     ) -> tuple[list[object] | None, list[object] | None, list[object] | None] | None:
         if self.property_accessor_nodes is None:
             return None
-        return tuple(_jsonable_signature(node) for node in self.property_accessor_nodes)
+        getter, setter, deleter = self.property_accessor_nodes
+        return (
+            _jsonable_signature(getter),
+            _jsonable_signature(setter),
+            _jsonable_signature(deleter),
+        )
 
 
 @dataclass(frozen=True)
@@ -2229,6 +2236,11 @@ class Relation:
         compare=False,
         hash=False,
     )
+    override_paths: tuple[tuple[str, ...], ...] = field(
+        default=(),
+        compare=False,
+        hash=False,
+    )
 
     def upstream_key(self) -> tuple[str, str, str, str]:
         return (
@@ -2267,6 +2279,23 @@ class Relation:
 
     def comparison_exact_keys(self) -> tuple[tuple[str, ...], ...]:
         return tuple((*downstream_key, *self.upstream_key()) for downstream_key in self.comparison_downstream_keys())
+
+
+@dataclass(frozen=True)
+class HistoricalOverrideCandidate:
+    """A downstream method whose new MRO has no upstream implementation.
+
+    This is not yet a verified override relation.  The range layer must prove
+    that the same lookup root resolved to a callable at ``old`` before it can
+    promote the candidate into the exact relation graph.
+    """
+
+    lookup_root: str
+    downstream_file: str
+    downstream_owner: str
+    downstream_qualified_owner: str
+    downstream_name: str
+    evidence_line: int
 
 
 @dataclass(frozen=True)
@@ -2578,6 +2607,48 @@ def _merge_binding_alternative_maps(
     }
 
 
+def _git_symlink_source(repo_root: Path, path: Path, source: str) -> str | None:
+    """Resolve a checked-out Git symlink stub without leaving the repository.
+
+    Windows checkouts with ``core.symlinks=false`` materialize a Git symlink as
+    a small text file containing its relative target.  Resolve only paths that
+    Git itself records with mode ``120000`` and reject absolute or escaping
+    targets.  Native filesystem symlinks need no special handling because
+    ``Path.read_text`` already follows them.
+    """
+
+    stripped = source.strip()
+    if not stripped.endswith(".py") or "\n" in stripped or "\r" in stripped:
+        return None
+    try:
+        relative = path.resolve().relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        return None
+    try:
+        stage = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "--stage", "--", relative],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    metadata, separator, tracked_path = stage.strip().partition("\t")
+    if not separator or tracked_path != relative or metadata.split(maxsplit=1)[0] != "120000":
+        return None
+    target_relative = posixpath.normpath(posixpath.join(posixpath.dirname(relative), stripped))
+    if posixpath.isabs(target_relative) or target_relative == ".." or target_relative.startswith("../"):
+        return None
+    target = repo_root.joinpath(*target_relative.split("/"))
+    try:
+        target.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return None
+    if target.suffix != ".py" or not target.is_file():
+        return None
+    return target.read_text(encoding="utf-8")
+
+
 class RepositoryIndex:
     """AST-only symbol and import index for one Python package."""
 
@@ -2587,6 +2658,8 @@ class RepositoryIndex:
         package_name: str,
         *,
         ordinary_descriptor_decorators: set[str] | frozenset[str] = frozenset(),
+        _source_paths: Sequence[Path] | None = None,
+        _finalize: bool = True,
     ):
         self.repo_root = repo_root.resolve()
         self.package_name = package_name
@@ -2621,13 +2694,88 @@ class RepositoryIndex:
         ] = {}
         self._class_alias_descriptor_kinds: dict[tuple[str, int], str | None] = {}
         self.parse_errors: list[dict[str, str]] = []
+        self._source_paths = tuple(_source_paths) if _source_paths is not None else None
+        self._finalize_after_parse = _finalize
         self._parse()
+        del self._source_paths
+        del self._finalize_after_parse
+
+    def __getstate__(self) -> dict[str, object]:
+        """Preserve AST identity-based maps when the index is serialized.
+
+        Several resolver maps use ``id(ast_node)`` for fast lookup.  Numeric
+        identities are process-local, so a plain pickle would silently retain
+        stale keys after loading.  Store the AST node objects beside their
+        values and rebuild the numeric keys in ``__setstate__`` instead.
+        """
+
+        state = dict(self.__dict__)
+        nodes_by_id = {id(node): node for module in self.modules.values() for node in ast.walk(module.tree)}
+        for name in (
+            "_descriptor_kinds_by_node",
+            "_descriptor_variants_by_node",
+            "_decorator_references_by_node",
+        ):
+            mapping = state.pop(name)
+            serialized: list[tuple[ast.AST, object]] = []
+            for node_id, value in mapping.items():
+                node = nodes_by_id.get(node_id)
+                if node is None:
+                    raise ValueError(f"repository index contains an unreachable AST identity in {name}")
+                serialized.append((node, value))
+            state[f"__serialized{name}"] = serialized
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        for name in (
+            "_descriptor_kinds_by_node",
+            "_descriptor_variants_by_node",
+            "_decorator_references_by_node",
+        ):
+            serialized = cast(list[tuple[ast.AST, object]], state.pop(f"__serialized{name}"))
+            state[name] = {id(node): value for node, value in serialized}
+        self.__dict__.update(state)
+
+    @classmethod
+    def _from_serial_file_fragments(
+        cls,
+        repo_root: Path,
+        package_name: str,
+        *,
+        ordinary_descriptor_decorators: set[str] | frozenset[str] = frozenset(),
+    ) -> RepositoryIndex:
+        """Build an index through isolated file fragments for parity tests."""
+
+        package_root = repo_root.resolve() / package_name
+        paths = sorted(package_root.rglob("*.py"))
+        combined = cls(
+            repo_root,
+            package_name,
+            ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+            _source_paths=(),
+            _finalize=False,
+        )
+        for path in paths:
+            fragment = cls(
+                repo_root,
+                package_name,
+                ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+                _source_paths=(path,),
+                _finalize=False,
+            )
+            combined._merge_pre_final_fragment(fragment)
+        combined._finalize_index()
+        return combined
 
     def _parse(self) -> None:
-        for path in sorted(self.package_root.rglob("*.py")):
+        """Parse repository modules and build the static symbol indexes."""
+        paths = sorted(self.package_root.rglob("*.py")) if self._source_paths is None else sorted(self._source_paths)
+        for path in paths:
             relative_file = path.relative_to(self.repo_root).as_posix()
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                source = path.read_text(encoding="utf-8")
+                symlink_source = _git_symlink_source(self.repo_root, path, source)
+                tree = ast.parse(symlink_source if symlink_source is not None else source, filename=str(path))
             except (SyntaxError, UnicodeDecodeError) as error:
                 self.parse_errors.append(
                     {
@@ -2755,6 +2903,7 @@ class RepositoryIndex:
                         int,
                         tuple[ast.AST | None, ast.AST | None, ast.AST | None],
                     ] = {}
+                    current_class_node = cast(ast.ClassDef, node)
 
                     def module_reference_resolver(
                         expression: ast.AST,
@@ -2776,7 +2925,7 @@ class RepositoryIndex:
                     def class_reference_resolver(
                         expression: ast.AST,
                         line: int,
-                        class_node: ast.ClassDef = node,
+                        class_node: ast.ClassDef = current_class_node,
                         active_tag_guards: set[str] = tag_guard_names,
                         current_class: str = qualified_name,
                         module_fallback: Callable[[ast.AST], set[str | None]] = module_reference_resolver,
@@ -2812,7 +2961,7 @@ class RepositoryIndex:
                     def callable_node_for_expression(
                         expression_node: ast.AST,
                         line: int,
-                        class_node: ast.ClassDef = node,
+                        class_node: ast.ClassDef = current_class_node,
                         active_tag_guards: set[str] = tag_guard_names,
                         current_module: str = module,
                         current_imports: dict[str, str] = imports,
@@ -2909,16 +3058,20 @@ class RepositoryIndex:
                                 function_line,
                             ),
                         }
+
+                        def function_reference_resolver(
+                            expression: ast.AST,
+                            current_line: int = function_line,
+                        ) -> set[str | None]:
+                            return class_reference_resolver(expression, current_line)
+
                         variants_for_node = _definition_descriptor_kinds(
                             function_node,
                             imports=imports,
                             shadowed_names=class_shadowed_names,
                             known_properties=known_properties,
                             ordinary_decorators=self.ordinary_descriptor_decorators,
-                            reference_resolver=lambda expression, line=function_line: class_reference_resolver(
-                                expression,
-                                line,
-                            ),
+                            reference_resolver=function_reference_resolver,
                         )
                         descriptor_kind = variants_for_node[0] if len(variants_for_node) == 1 else "unknown"
                         descriptor_kinds[id(function_node)] = descriptor_kind
@@ -2927,10 +3080,7 @@ class RepositoryIndex:
                         self._descriptor_variants_by_node[id(function_node)] = variants_for_node
                         self._decorator_references_by_node[id(function_node)] = _decorator_reference_tuple(
                             function_node,
-                            lambda expression, line=function_line: class_reference_resolver(
-                                expression,
-                                line,
-                            ),
+                            function_reference_resolver,
                         )
 
                         accessor_kind: str | None = None
@@ -2995,7 +3145,7 @@ class RepositoryIndex:
                         node,
                         tag_guard_names,
                     )
-                    info = ClassInfo(
+                    class_info = ClassInfo(
                         qualified_name=qualified_name,
                         module=module,
                         file=relative_file,
@@ -3005,10 +3155,10 @@ class RepositoryIndex:
                         methods={name: candidates[0] for name, candidates in method_variants.items()},
                         method_variants=method_variants,
                     )
-                    self.class_variants[qualified_name].append(info)
+                    self.class_variants[qualified_name].append(class_info)
                     self._class_variant_bindings[qualified_name].append(class_final_bindings)
-                    classes[node.name] = info
-                    self.classes[qualified_name] = info
+                    classes[node.name] = class_info
+                    self.classes[qualified_name] = class_info
                     if class_is_unconditional:
                         self.unconditional_exports.add(qualified_name)
                         self.unconditional_symbols.add(qualified_name)
@@ -3042,7 +3192,7 @@ class RepositoryIndex:
                                 name=target.id,
                                 node=class_value,
                             )
-                    for method_name, method_node in info.methods.items():
+                    for method_name, method_node in class_info.methods.items():
                         method_qualified_name = f"{qualified_name}.{method_name}"
                         variants = tuple(
                             CallableInfo(
@@ -3074,7 +3224,7 @@ class RepositoryIndex:
                                     else None
                                 ),
                             )
-                            for candidate in info.method_variants.get(method_name, (method_node,))
+                            for candidate in class_info.method_variants.get(method_name, (method_node,))
                         )
                         self.callable_variants[method_qualified_name] = variants
                         self.callables[method_qualified_name] = variants[0]
@@ -3100,7 +3250,7 @@ class RepositoryIndex:
                         is_package=is_package,
                     )
                     self._decorator_references_by_node[id(node)] = decorator_references
-                    info = CallableInfo(
+                    function_info = CallableInfo(
                         qualified_name=qualified_name,
                         module=module,
                         file=relative_file,
@@ -3118,9 +3268,9 @@ class RepositoryIndex:
                         ),
                         decorator_references=decorator_references,
                     )
-                    functions[node.name] = info
-                    self._descriptor_kinds_by_node[id(node)] = info.descriptor_kind
-                    self.callables[qualified_name] = info
+                    functions[node.name] = function_info
+                    self._descriptor_kinds_by_node[id(node)] = function_info.descriptor_kind
+                    self.callables[qualified_name] = function_info
                     if unconditional or node.name in module_must_names:
                         self.unconditional_exports.add(qualified_name)
                         self.unconditional_symbols.add(qualified_name)
@@ -3186,39 +3336,39 @@ class RepositoryIndex:
                     self.unconditional_exports.add(qualified_name)
                     self.unconditional_symbols.add(qualified_name)
 
-            for node in _main_ast_walk(tree):
-                if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            for walked_node in _main_ast_walk(tree):
+                if not isinstance(walked_node, (ast.AsyncFunctionDef, ast.FunctionDef)):
                     continue
-                qualified_name = f"{module}.{node.name}"
+                qualified_name = f"{module}.{walked_node.name}"
                 decorator_references = _scope_decorator_reference_tuple(
-                    node,
+                    walked_node,
                     statements=tree.body,
                     tag_guard_names=tag_guard_names,
                     module=module,
                     is_package=is_package,
                 )
                 self._decorator_references_by_node.setdefault(
-                    id(node),
+                    id(walked_node),
                     decorator_references,
                 )
-                loose_functions[node.name].append(
+                loose_functions[walked_node.name].append(
                     CallableInfo(
                         qualified_name=qualified_name,
                         module=module,
                         file=relative_file,
                         owner=None,
-                        name=node.name,
-                        node=node,
+                        name=walked_node.name,
+                        node=walked_node,
                         descriptor_kind=_definition_descriptor_kind(
-                            node,
+                            walked_node,
                             imports=imports,
                             shadowed_names=_scope_bound_names_before(
                                 tree.body,
-                                getattr(node, "lineno", 0),
+                                getattr(walked_node, "lineno", 0),
                             ),
                             ordinary_decorators=self.ordinary_descriptor_decorators,
                         ),
-                        decorator_references=self._decorator_references_by_node[id(node)],
+                        decorator_references=self._decorator_references_by_node[id(walked_node)],
                     )
                 )
 
@@ -3250,17 +3400,53 @@ class RepositoryIndex:
                 star_imports=tuple(star_imports),
             )
             self.modules[module] = module_info
-            for local_name, target in imports.items():
-                self.aliases[f"{module}.{local_name}"] = target
-            for export_name, target in typed_lazy_exports.items():
-                self.aliases[f"{module}.{export_name}"] = target
+            for local_name, imported_target in imports.items():
+                self.aliases[f"{module}.{local_name}"] = imported_target
+            for export_name, lazy_target in typed_lazy_exports.items():
+                self.aliases[f"{module}.{export_name}"] = lazy_target
                 self.typed_instance_aliases.add(f"{module}.{export_name}")
 
+        if self._finalize_after_parse:
+            self._finalize_index()
+
+    def _finalize_index(self) -> None:
         self._aggregate_class_variants()
         self._materialize_star_import_aliases()
         self._materialize_dataclass_initializers()
         self._materialize_class_callable_aliases()
         self._validate_index_consistency()
+
+    def _merge_pre_final_fragment(self, fragment: RepositoryIndex) -> None:
+        """Merge one source-ordered file fragment before global finalization."""
+
+        for name in (
+            "modules",
+            "classes",
+            "callables",
+            "callable_variants",
+            "final_bindings",
+            "values",
+            "aliases",
+            "_descriptor_kinds_by_node",
+            "_descriptor_variants_by_node",
+            "_decorator_references_by_node",
+            "_class_alias_descriptor_kinds",
+        ):
+            getattr(self, name).update(getattr(fragment, name))
+        for name in ("class_variants", "_class_variant_bindings"):
+            destination = getattr(self, name)
+            for key, values in getattr(fragment, name).items():
+                destination[key].extend(values)
+        for name in (
+            "class_base_conflicts",
+            "typed_instance_aliases",
+            "unconditional_exports",
+            "unconditional_symbols",
+            "_unconditional_star_imports",
+        ):
+            getattr(self, name).update(getattr(fragment, name))
+        self._pending_method_aliases.extend(fragment._pending_method_aliases)
+        self.parse_errors.extend(fragment.parse_errors)
 
     def _validate_index_consistency(self) -> None:
         """Fail closed when representative and variant indexes drift apart."""
@@ -3685,7 +3871,8 @@ class RepositoryIndex:
                 ):
                     continue
 
-                source_variants = source.descriptor_variants or (source.descriptor_kind,)
+                source_variants: tuple[str | None, ...] = source.descriptor_variants or (source.descriptor_kind,)
+                installed_variants: tuple[str | None, ...]
                 if kind in {"classmethod", "property", "staticmethod"}:
                     installed_variants = (kind,)
                 elif source.owner is None:
@@ -3704,7 +3891,7 @@ class RepositoryIndex:
                         )
                     )
                 descriptor_kind = installed_variants[0] if len(installed_variants) == 1 else "unknown"
-                property_nodes = None
+                property_nodes: tuple[ast.AST | None, ast.AST | None, ast.AST | None] | None = None
                 if descriptor_kind == "property":
                     property_nodes = (source.node, None, None) if kind == "property" else source.property_accessor_nodes
                 variants.append(
@@ -3742,8 +3929,11 @@ class RepositoryIndex:
                 for candidate in variants
             }
             variants = [unique[key] for key in sorted(unique)]
-            class_info.methods.setdefault(member_name, variants[0].node)
-            class_info.method_variants[member_name] = tuple(candidate.node for candidate in variants)
+            variant_nodes = tuple(candidate.node for candidate in variants if candidate.node is not None)
+            if not variant_nodes:
+                continue
+            class_info.methods.setdefault(member_name, variant_nodes[0])
+            class_info.method_variants[member_name] = variant_nodes
             self.callables[qualified_name] = variants[0]
             self.callable_variants[qualified_name] = tuple(variants)
             if (
@@ -3768,11 +3958,19 @@ class RepositoryIndex:
     def canonical_name(self, qualified_name: str) -> str:
         result = qualified_name
         visited: set[str] = set()
+        visited_aliases: set[str] = set()
         while result not in visited:
             visited.add(result)
             replacement = None
             for alias in sorted(self.aliases, key=len, reverse=True):
                 if result == alias or result.startswith(f"{alias}."):
+                    if alias in visited_aliases:
+                        # An alias can only match again when another alias maps
+                        # back to it or when it expands into its own namespace.
+                        # Neither chain has one statically provable canonical
+                        # target, so fail closed instead of growing forever.
+                        return qualified_name
+                    visited_aliases.add(alias)
                     replacement = f"{self.aliases[alias]}{result[len(alias) :]}"
                     break
             if replacement is None or replacement == result:
@@ -3913,11 +4111,13 @@ class RepositoryIndex:
             )
         source_class = self.find_class(target)
         if source_class is not None:
-            return replace(
-                binding,
-                kind="class",
-                node=self.find_callable(source_class.qualified_name).node,
-            )
+            class_callable = self.find_callable(source_class.qualified_name)
+            if class_callable is not None:
+                return replace(
+                    binding,
+                    kind="class",
+                    node=class_callable.node,
+                )
         return binding
 
     def find_final_callable_variants(
@@ -4008,6 +4208,511 @@ class RepositoryIndex:
         return self.values.get(self.canonical_name(qualified_name))
 
 
+def _repository_fragment_batch(
+    args: tuple[str, str, tuple[str, ...], tuple[str, ...]],
+) -> list[tuple[str, RepositoryIndex]]:
+    repo_root_value, package_name, relative_files, ordinary_decorators = args
+    repo_root = Path(repo_root_value)
+    results: list[tuple[str, RepositoryIndex]] = []
+    for relative_file in relative_files:
+        path = repo_root.joinpath(*relative_file.split("/"))
+        results.append(
+            (
+                relative_file,
+                RepositoryIndex(
+                    repo_root,
+                    package_name,
+                    ordinary_descriptor_decorators=frozenset(ordinary_decorators),
+                    _source_paths=(path,),
+                    _finalize=False,
+                ),
+            )
+        )
+    return results
+
+
+def _repository_file_cache_identities(
+    repo_root: Path,
+    package_name: str,
+    source_version: str | None,
+    relative_files: Sequence[str],
+    ordinary_descriptor_decorators: frozenset[str],
+) -> tuple[dict[str, tuple[str, str]] | None, str | None]:
+    if not source_version:
+        return None, "source version is unavailable"
+    try:
+        dirty = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                package_name,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if dirty:
+            return None, f"{package_name} contains uncommitted source changes"
+        tree = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-tree", "-r", source_version, "--", package_name],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        return None, f"Git file-cache identity failed: {error}"
+
+    blob_ids: dict[str, str] = {}
+    modes: dict[str, str] = {}
+    for line in tree.splitlines():
+        metadata, separator, relative_file = line.partition("\t")
+        if not separator or not relative_file.endswith(".py"):
+            continue
+        parts = metadata.split()
+        if len(parts) == 3 and parts[1] == "blob":
+            blob_ids[relative_file] = parts[2]
+            modes[relative_file] = parts[0]
+    missing = sorted(set(relative_files) - blob_ids.keys())
+    if missing:
+        return None, f"Git file-cache identity is missing {len(missing)} Python files"
+
+    identities: dict[str, tuple[str, str]] = {}
+    for relative_file in relative_files:
+        symlink_chain: list[dict[str, str]] = []
+        current_file = relative_file
+        seen: set[str] = set()
+        while modes.get(current_file) == "120000":
+            if current_file in seen or len(seen) >= 16:
+                return None, f"Git symlink cycle detected at {current_file}"
+            seen.add(current_file)
+            try:
+                target_text = subprocess.run(
+                    ["git", "-C", str(repo_root), "cat-file", "blob", blob_ids[current_file]],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            except (OSError, subprocess.CalledProcessError) as error:
+                return None, f"Git symlink identity failed for {current_file}: {error}"
+            target_file = posixpath.normpath(posixpath.join(posixpath.dirname(current_file), target_text))
+            if (
+                posixpath.isabs(target_file)
+                or target_file == ".."
+                or target_file.startswith("../")
+                or target_file not in blob_ids
+            ):
+                return None, f"Git symlink target is outside indexed sources: {current_file}"
+            symlink_chain.append(
+                {
+                    "link": current_file,
+                    "target": target_file,
+                    "target_blob_sha": blob_ids[target_file],
+                }
+            )
+            current_file = target_file
+        identity = {
+            "cache_schema_version": REPOSITORY_FILE_FRAGMENT_CACHE_SCHEMA_VERSION,
+            "generator_version": GENERATOR_VERSION,
+            "python_cache_tag": sys.implementation.cache_tag,
+            "python_version": ".".join(str(item) for item in sys.version_info[:3]),
+            "repo_root": os.path.normcase(str(repo_root.resolve())),
+            "package_name": package_name,
+            "relative_file": relative_file,
+            "blob_sha": blob_ids[relative_file],
+            "git_mode": modes[relative_file],
+            "symlink_chain": symlink_chain,
+            "ordinary_descriptor_decorators": sorted(ordinary_descriptor_decorators),
+        }
+        serialized = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        identities[relative_file] = (
+            hashlib.sha256(serialized.encode()).hexdigest(),
+            serialized,
+        )
+    return identities, None
+
+
+def _sqlite_rows(
+    connection: sqlite3.Connection,
+    keys: Sequence[str],
+) -> Iterable[tuple[str, str, bytes]]:
+    for start in range(0, len(keys), 500):
+        batch = keys[start : start + 500]
+        placeholders = ",".join("?" for _ in batch)
+        yield from connection.execute(
+            f"SELECT cache_key, identity, payload FROM fragments WHERE cache_key IN ({placeholders})",  # noqa: S608
+            batch,
+        )
+
+
+def _repository_index_from_file_fragments(
+    repo_root: Path,
+    package_name: str,
+    *,
+    ordinary_descriptor_decorators: frozenset[str],
+    source_version: str | None,
+    cache_dir: Path | None,
+    index_workers: int,
+) -> tuple[RepositoryIndex, dict[str, object]]:
+    if index_workers < 1:
+        raise ValueError("index_workers must be at least 1")
+    repo_root = repo_root.resolve()
+    package_root = repo_root / package_name
+    paths = sorted(package_root.rglob("*.py"))
+    relative_files = tuple(path.relative_to(repo_root).as_posix() for path in paths)
+    status: dict[str, object] = {
+        "enabled": cache_dir is not None,
+        "status": "disabled",
+        "database": None,
+        "files_total": len(relative_files),
+        "cache_hits": 0,
+        "cache_misses": len(relative_files),
+        "invalid_entries": 0,
+        "workers_requested": index_workers,
+        "workers_used": 1,
+        "load_seconds": 0.0,
+        "build_seconds": 0.0,
+        "write_seconds": 0.0,
+        "merge_finalize_seconds": 0.0,
+        "database_bytes": None,
+        "hit_ratio": 0.0,
+        "commit_sha": source_version,
+        "reason": None,
+    }
+    identities: dict[str, tuple[str, str]] | None = None
+    connection: sqlite3.Connection | None = None
+    corrupt_database = False
+    fragments: dict[str, RepositoryIndex] = {}
+    load_started = time.perf_counter()
+    if cache_dir is not None:
+        identities, reason = _repository_file_cache_identities(
+            repo_root,
+            package_name,
+            source_version,
+            relative_files,
+            ordinary_descriptor_decorators,
+        )
+        if identities is None:
+            status.update(status="bypassed", reason=reason)
+        else:
+            database = cache_dir.resolve() / (
+                f"{package_name}-file-fragments-v{REPOSITORY_FILE_FRAGMENT_CACHE_SCHEMA_VERSION}.sqlite3"
+            )
+            status["database"] = str(database)
+            try:
+                database.parent.mkdir(parents=True, exist_ok=True)
+                connection = sqlite3.connect(database, timeout=30)
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS fragments ("
+                    "cache_key TEXT PRIMARY KEY, identity TEXT NOT NULL, payload BLOB NOT NULL)"
+                )
+                keys = [identities[name][0] for name in relative_files]
+                key_to_file = {identities[name][0]: name for name in relative_files}
+                for cache_key, identity, payload in _sqlite_rows(connection, keys):
+                    relative_file = key_to_file.get(cache_key)
+                    if relative_file is None or identity != identities[relative_file][1]:
+                        status["invalid_entries"] = cast(int, status["invalid_entries"]) + 1
+                        continue
+                    try:
+                        fragment = pickle.loads(payload)  # noqa: S301 - tool-owned private cache only.
+                    except Exception:
+                        status["invalid_entries"] = cast(int, status["invalid_entries"]) + 1
+                        continue
+                    if not isinstance(fragment, RepositoryIndex):
+                        status["invalid_entries"] = cast(int, status["invalid_entries"]) + 1
+                        continue
+                    fragment.repo_root = repo_root
+                    fragment.package_root = package_root
+                    fragments[relative_file] = fragment
+            except (OSError, sqlite3.DatabaseError) as error:
+                if connection is not None:
+                    connection.close()
+                    connection = None
+                status.update(status="corrupt", reason=f"{type(error).__name__}: {error}")
+                corrupt_database = True
+                try:
+                    database.unlink(missing_ok=True)
+                    connection = sqlite3.connect(database, timeout=30)
+                    connection.execute(
+                        "CREATE TABLE fragments ("
+                        "cache_key TEXT PRIMARY KEY, identity TEXT NOT NULL, payload BLOB NOT NULL)"
+                    )
+                except (OSError, sqlite3.DatabaseError) as rebuild_error:
+                    if connection is not None:
+                        connection.close()
+                        connection = None
+                    identities = None
+                    status.update(
+                        status="unavailable",
+                        reason=f"{type(rebuild_error).__name__}: {rebuild_error}",
+                    )
+    status["load_seconds"] = round(time.perf_counter() - load_started, 6)
+
+    missing_files = tuple(name for name in relative_files if name not in fragments)
+    status["cache_hits"] = len(fragments)
+    status["cache_misses"] = len(missing_files)
+    status["hit_ratio"] = round(len(fragments) / len(relative_files), 6) if relative_files else 1.0
+    build_started = time.perf_counter()
+    effective_workers = min(index_workers, len(missing_files)) if missing_files else 0
+    status["workers_used"] = effective_workers
+    if missing_files:
+        task_count = max(1, effective_workers * 4)
+        batch_size = max(1, min(64, (len(missing_files) + task_count - 1) // task_count))
+        tasks = [
+            (
+                str(repo_root),
+                package_name,
+                missing_files[start : start + batch_size],
+                tuple(sorted(ordinary_descriptor_decorators)),
+            )
+            for start in range(0, len(missing_files), batch_size)
+        ]
+        batches: Iterable[list[tuple[str, RepositoryIndex]]]
+        if effective_workers > 1:
+            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                batches = executor.map(_repository_fragment_batch, tasks)
+                for batch in batches:
+                    fragments.update(batch)
+        else:
+            for task in tasks:
+                fragments.update(_repository_fragment_batch(task))
+    status["build_seconds"] = round(time.perf_counter() - build_started, 6)
+
+    write_started = time.perf_counter()
+    if connection is not None and identities is not None and missing_files:
+        try:
+            with connection:
+                connection.executemany(
+                    "INSERT OR REPLACE INTO fragments(cache_key, identity, payload) VALUES (?, ?, ?)",
+                    [
+                        (
+                            identities[name][0],
+                            identities[name][1],
+                            pickle.dumps(fragments[name], protocol=pickle.HIGHEST_PROTOCOL),
+                        )
+                        for name in missing_files
+                    ],
+                )
+        except Exception as error:  # Cache serialization must not invalidate source analysis.
+            status.update(status="write_error", reason=f"{type(error).__name__}: {error}")
+    status["write_seconds"] = round(time.perf_counter() - write_started, 6)
+    if connection is not None:
+        connection.close()
+    if status["database"] is not None:
+        with contextlib.suppress(OSError):
+            status["database_bytes"] = Path(str(status["database"])).stat().st_size
+
+    merge_started = time.perf_counter()
+    combined = RepositoryIndex(
+        repo_root,
+        package_name,
+        ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+        _source_paths=(),
+        _finalize=False,
+    )
+    for relative_file in relative_files:
+        combined._merge_pre_final_fragment(fragments[relative_file])
+    combined._finalize_index()
+    status["merge_finalize_seconds"] = round(time.perf_counter() - merge_started, 6)
+    if cache_dir is not None and status["status"] not in {
+        "bypassed",
+        "unavailable",
+        "write_error",
+    }:
+        hits = cast(int, status["cache_hits"])
+        status["status"] = (
+            "corrupt_rebuilt"
+            if corrupt_database
+            else "hit"
+            if hits == len(relative_files)
+            else "partial_hit"
+            if hits
+            else "miss"
+        )
+    return combined, status
+
+
+def _repository_index_cache_identity(
+    repo_root: Path,
+    package_name: str,
+    source_version: str | None,
+    ordinary_descriptor_decorators: frozenset[str],
+) -> tuple[dict[str, object] | None, str | None]:
+    if not source_version:
+        return None, "source version is unavailable"
+    try:
+        dirty = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                package_name,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if dirty:
+            return None, f"{package_name} contains uncommitted source changes"
+        tree_sha = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", f"{source_version}:{package_name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        return None, f"Git cache identity failed: {error}"
+
+    return (
+        {
+            "cache_schema_version": REPOSITORY_INDEX_CACHE_SCHEMA_VERSION,
+            "generator_version": GENERATOR_VERSION,
+            "python_cache_tag": sys.implementation.cache_tag,
+            "python_version": ".".join(str(item) for item in sys.version_info[:3]),
+            "repo_root": os.path.normcase(str(repo_root.resolve())),
+            "package_name": package_name,
+            "source_version": source_version,
+            "tree_sha": tree_sha,
+            "ordinary_descriptor_decorators": sorted(ordinary_descriptor_decorators),
+        },
+        None,
+    )
+
+
+def _repository_index_with_cache(
+    repo_root: Path,
+    package_name: str,
+    *,
+    ordinary_descriptor_decorators: frozenset[str],
+    source_version: str | None,
+    cache_dir: Path | None,
+) -> tuple[RepositoryIndex, dict[str, object]]:
+    status: dict[str, object] = {
+        "enabled": cache_dir is not None,
+        "status": "disabled",
+        "commit_sha": source_version,
+        "key": None,
+        "path": None,
+        "reason": None,
+        "load_seconds": 0.0,
+        "build_seconds": 0.0,
+        "write_seconds": 0.0,
+        "saved_seconds": 0.0,
+    }
+    if cache_dir is None:
+        return (
+            RepositoryIndex(
+                repo_root,
+                package_name,
+                ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+            ),
+            status,
+        )
+
+    identity, reason = _repository_index_cache_identity(
+        repo_root,
+        package_name,
+        source_version,
+        ordinary_descriptor_decorators,
+    )
+    if identity is None:
+        status.update(status="bypassed", reason=reason)
+        return (
+            RepositoryIndex(
+                repo_root,
+                package_name,
+                ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+            ),
+            status,
+        )
+
+    serialized_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    cache_key = hashlib.sha256(serialized_identity.encode()).hexdigest()
+    cache_path = cache_dir.resolve() / f"{package_name}-{cache_key}.pickle"
+    status.update(key=cache_key, path=str(cache_path))
+    invalid_cache = False
+    load_started = time.perf_counter()
+    try:
+        if cache_path.is_file():
+            with cache_path.open("rb") as stream:
+                payload = pickle.load(stream)  # noqa: S301 - tool-owned private cache only.
+            if (
+                not isinstance(payload, dict)
+                or payload.get("magic") != "vllm-interface-repository-index"
+                or payload.get("identity") != identity
+            ):
+                raise ValueError("repository index cache identity does not match")
+            index = payload.get("index")
+            if not isinstance(index, RepositoryIndex):
+                raise ValueError("repository index cache payload has an invalid index")
+            index.repo_root = repo_root.resolve()
+            index.package_root = index.repo_root / package_name
+            status["status"] = "hit"
+            status["load_seconds"] = round(time.perf_counter() - load_started, 6)
+            cached_build_seconds = payload.get("build_seconds")
+            if isinstance(cached_build_seconds, (float, int)):
+                status["saved_seconds"] = round(
+                    max(0.0, float(cached_build_seconds) - cast(float, status["load_seconds"])),
+                    6,
+                )
+            return index, status
+    except Exception as error:  # Cache corruption must not invalidate source analysis.
+        invalid_cache = True
+        status.update(status="corrupt", reason=f"{type(error).__name__}: {error}")
+        with contextlib.suppress(OSError):
+            cache_path.unlink()
+
+    status["load_seconds"] = round(time.perf_counter() - load_started, 6)
+
+    build_started = time.perf_counter()
+    index = RepositoryIndex(
+        repo_root,
+        package_name,
+        ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+    )
+    status["build_seconds"] = round(time.perf_counter() - build_started, 6)
+    temporary_path: Path | None = None
+    write_started = time.perf_counter()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=cache_dir,
+            prefix=f".{package_name}-{cache_key}-",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            pickle.dump(
+                {
+                    "magic": "vllm-interface-repository-index",
+                    "identity": identity,
+                    "build_seconds": status["build_seconds"],
+                    "index": index,
+                },
+                stream,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, cache_path)
+        status["status"] = "invalid_rebuilt" if invalid_cache else "miss"
+    except Exception as error:  # A cache write failure must fall back to the fresh index.
+        status.update(status="write_error", reason=f"{type(error).__name__}: {error}")
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    status["write_seconds"] = round(time.perf_counter() - write_started, 6)
+    return index, status
+
+
 class InterfaceBoundaryGenerator:
     def __init__(
         self,
@@ -4016,27 +4721,51 @@ class InterfaceBoundaryGenerator:
         external_roots: dict[str, Path] | None = None,
         *,
         source_versions: dict[str, str] | None = None,
+        downstream_index_cache_dir: Path | None = None,
+        upstream_file_index_cache_dir: Path | None = None,
+        index_workers: int = 1,
     ):
         source_versions = source_versions or {}
         self.source_versions = dict(source_versions)
-        ordinary_descriptor_decorators = {
-            decorator
-            for package, version in source_versions.items()
-            for decorator in _PINNED_ORDINARY_DESCRIPTOR_DECORATORS.get(
-                (package, version),
-                (),
+        ordinary_descriptor_decorators = _KNOWN_ORDINARY_DESCRIPTOR_DECORATORS
+        self.repository_index_timings: dict[str, float] = {}
+        index_started = time.perf_counter()
+        if upstream_file_index_cache_dir is not None or index_workers > 1:
+            self.upstream, upstream_file_cache = _repository_index_from_file_fragments(
+                vllm_root,
+                "vllm",
+                ordinary_descriptor_decorators=frozenset(ordinary_descriptor_decorators),
+                source_version=source_versions.get("vllm"),
+                cache_dir=upstream_file_index_cache_dir,
+                index_workers=index_workers,
             )
-        }
-        self.upstream = RepositoryIndex(
-            vllm_root,
-            "vllm",
-            ordinary_descriptor_decorators=ordinary_descriptor_decorators,
-        )
-        self.downstream = RepositoryIndex(
+        else:
+            self.upstream = RepositoryIndex(
+                vllm_root,
+                "vllm",
+                ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+            )
+            upstream_file_cache = {
+                "enabled": False,
+                "status": "disabled",
+                "workers_requested": index_workers,
+                "workers_used": 1,
+            }
+        self.repository_index_timings["upstream"] = round(time.perf_counter() - index_started, 6)
+        index_started = time.perf_counter()
+        self.downstream, downstream_cache = _repository_index_with_cache(
             ascend_root,
             "vllm_ascend",
             ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+            source_version=source_versions.get("vllm_ascend"),
+            cache_dir=downstream_index_cache_dir,
         )
+        self.repository_index_timings["downstream"] = round(time.perf_counter() - index_started, 6)
+        self.repository_index_cache = {
+            "upstream_file_fragments": upstream_file_cache,
+            "downstream": downstream_cache,
+        }
+        index_started = time.perf_counter()
         self.externals = {
             package: RepositoryIndex(
                 root,
@@ -4045,6 +4774,7 @@ class InterfaceBoundaryGenerator:
             )
             for package, root in sorted((external_roots or {}).items())
         }
+        self.repository_index_timings["external"] = round(time.perf_counter() - index_started, 6)
         parse_errors = (
             [("vLLM", error) for error in self.upstream.parse_errors]
             + [("vllm-ascend", error) for error in self.downstream.parse_errors]
@@ -4055,7 +4785,12 @@ class InterfaceBoundaryGenerator:
             raise ValueError(f"Python source parsing failed: {details}")
         self.relations: list[Relation] = []
         self.findings: list[CandidateFinding] = []
+        self.historical_override_candidates: list[HistoricalOverrideCandidate] = []
         self._mro_cache: dict[str, MroResult] = {}
+        self._override_root_path_cache: dict[
+            tuple[str, str],
+            tuple[tuple[str, tuple[str, ...]], ...],
+        ] = {}
         self._private_helper_invocations: dict[str, tuple[PrivateHelperInvocation, ...]] = {}
         self._private_helper_definitions: dict[str, PrivateHelperDefinition] = {}
         self._private_helper_exports: dict[str, str] = {}
@@ -4072,6 +4807,8 @@ class InterfaceBoundaryGenerator:
             raise ValueError("override collection requires inheritance/MRO discovery")
         self.relations = []
         self.findings = []
+        self.historical_override_candidates = []
+        self._override_root_path_cache = {}
         self.phase_timings = {
             "inheritance_mro": None,
             "override": None,
@@ -4149,6 +4886,7 @@ class InterfaceBoundaryGenerator:
                 )
                 merged_signature_contracts[field_name] = merged_contract
                 conditional_signature_contract = conditional_signature_contract or conditional
+            override_paths = tuple(sorted({path for relation in occurrences for path in relation.override_paths}))
             merged_relation = replace(
                 first,
                 evidence=tuple(
@@ -4165,8 +4903,13 @@ class InterfaceBoundaryGenerator:
                         ),
                     )
                 ),
-                **merged_descriptor_kinds,
-                **merged_signature_contracts,
+                upstream_descriptor_kind=merged_descriptor_kinds["upstream_descriptor_kind"],
+                downstream_descriptor_kind=merged_descriptor_kinds["downstream_descriptor_kind"],
+                installed_descriptor_kind=merged_descriptor_kinds["installed_descriptor_kind"],
+                upstream_signature_contract=merged_signature_contracts["upstream_signature_contract"],
+                downstream_signature_contract=merged_signature_contracts["downstream_signature_contract"],
+                installed_signature_contract=merged_signature_contracts["installed_signature_contract"],
+                override_paths=override_paths,
             )
             deduplicated[key] = merged_relation
             if any(len(kinds) > 1 for kinds in descriptor_sets.values()):
@@ -4218,9 +4961,9 @@ class InterfaceBoundaryGenerator:
         )
         unique_findings: dict[object, CandidateFinding] = {}
         for finding in set(self.findings):
-            key: object = finding
+            finding_key: object = finding
             if finding.supplemental:
-                key = (
+                finding_key = (
                     finding.relation,
                     finding.downstream_file,
                     finding.downstream_owner,
@@ -4235,7 +4978,7 @@ class InterfaceBoundaryGenerator:
                     finding.downstream_descriptor_kind,
                     finding.installed_descriptor_kind,
                 )
-            previous = unique_findings.get(key)
+            previous = unique_findings.get(finding_key)
             if previous is None or (
                 finding.evidence_line,
                 finding.evidence_scope or "",
@@ -4245,7 +4988,7 @@ class InterfaceBoundaryGenerator:
                 previous.evidence_scope or "",
                 previous.evidence_guards,
             ):
-                unique_findings[key] = finding
+                unique_findings[finding_key] = finding
         self.findings = sorted(
             unique_findings.values(),
             key=lambda relation: (
@@ -4374,6 +5117,7 @@ class InterfaceBoundaryGenerator:
         descriptor_kind: str | None = None,
         binds_receiver: bool | None = None,
     ) -> SignatureContract:
+        """Derive the callable contract after statically known wrappers."""
         definition_signature = callable_info.signature
         runtime_entry_signature = definition_signature
         reported_signature = definition_signature
@@ -4381,9 +5125,7 @@ class InterfaceBoundaryGenerator:
         provenance = ["ast_definition"]
         forwarded_targets: list[str] = []
         protocol = (
-            "property_access"
-            if (descriptor_kind or callable_info.descriptor_kind) == "property"
-            else "python_call"
+            "property_access" if (descriptor_kind or callable_info.descriptor_kind) == "property" else "python_call"
         )
         node = callable_info.node
         decorators = tuple(node.decorator_list) if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) else ()
@@ -4397,22 +5139,16 @@ class InterfaceBoundaryGenerator:
             forwarded_target_variants = captured_targets
 
         repository = self._repository_for_callable(callable_info)
-        repository_source = (
-            (repository.package_name, self.source_versions.get(repository.package_name))
-            if repository is not None
-            else None
-        )
-        pinned_triton_source = repository_source in _PINNED_TRITON_KERNEL_SOURCES
         for decorator, reference, captured in reversed(tuple(zip(decorators, references, forwarded_target_variants))):
             expression = _expression_name(decorator.func if isinstance(decorator, ast.Call) else decorator)
             label = reference or expression or "<dynamic-decorator>"
-            if reference == _TRITON_JIT_DECORATOR and pinned_triton_source:
+            if reference == _TRITON_JIT_DECORATOR:
                 runtime_entry_signature = definition_signature
                 reported_signature = None
                 protocol = _TRITON_KERNEL_PROTOCOL
-                provenance.append(f"{label}:kernel_launch@{repository_source[1]}")
+                provenance.append(f"{label}:kernel_launch")
                 continue
-            if reference == _TRITON_HEURISTICS_DECORATOR and pinned_triton_source:
+            if reference == _TRITON_HEURISTICS_DECORATOR:
                 generated_names = self._triton_heuristic_names(decorator)
                 transformed_signature = (
                     self._triton_heuristics_signature(
@@ -4426,12 +5162,10 @@ class InterfaceBoundaryGenerator:
                     runtime_entry_signature = None
                     reported_signature = None
                     status = "unknown"
-                    provenance.append(f"{label}:unresolved_kernel_heuristics@{repository_source[1]}")
+                    provenance.append(f"{label}:unresolved_kernel_heuristics")
                 else:
                     runtime_entry_signature = transformed_signature
-                    provenance.append(
-                        f"{label}:generated={','.join(generated_names)}@{repository_source[1]}"
-                    )
+                    provenance.append(f"{label}:generated={','.join(generated_names or ())}")
                 continue
             if reference in _STDLIB_WRAPS_SIGNATURE_DECORATORS and not isinstance(decorator, ast.Call):
                 runtime_entry_signature = ["sync", [], [], "args", [], "kwargs"]
@@ -4472,38 +5206,14 @@ class InterfaceBoundaryGenerator:
                 provenance.append(label)
                 continue
 
-            pinned_version = next(
-                (
-                    version
-                    for package, version in self.source_versions.items()
-                    if reference
-                    in _PINNED_TRANSPARENT_SIGNATURE_DECORATORS.get(
-                        (package, version),
-                        (),
-                    )
-                ),
-                None,
-            )
-            if pinned_version is not None:
-                provenance.append(f"{label}@{pinned_version}")
+            if reference in _KNOWN_TRANSPARENT_SIGNATURE_DECORATORS:
+                provenance.append(label)
                 continue
 
-            pinned_wrapper_version = next(
-                (
-                    version
-                    for package, version in self.source_versions.items()
-                    if reference
-                    in _PINNED_WRAPS_SIGNATURE_DECORATORS.get(
-                        (package, version),
-                        (),
-                    )
-                ),
-                None,
-            )
-            if pinned_wrapper_version is not None and not isinstance(decorator, ast.Call):
+            if reference in _KNOWN_WRAPS_SIGNATURE_DECORATORS and not isinstance(decorator, ast.Call):
                 runtime_entry_signature = ["sync", [], [], "args", [], "kwargs"]
                 forwarded_targets.append(callable_info.qualified_name)
-                provenance.append(f"{label}:sha_wrapped@{pinned_wrapper_version}")
+                provenance.append(f"{label}:wrapped")
                 continue
 
             if expression is not None and expression.rsplit(".", 1)[-1] in {
@@ -4609,24 +5319,14 @@ class InterfaceBoundaryGenerator:
             return None
 
         first_generated = next(
-            (
-                index
-                for index, item in enumerate(positional_or_keyword)
-                if item[0] in generated
-            ),
+            (index for index, item in enumerate(positional_or_keyword) if item[0] in generated),
             None,
         )
         if first_generated is not None:
             trailing = positional_or_keyword[first_generated:]
             result[2] = positional_or_keyword[:first_generated]
-            result[4] = [
-                [name, False if name in generated else required]
-                for name, required in trailing
-            ] + keyword_only
-        result[4] = [
-            [name, False if name in generated else required]
-            for name, required in result[4]
-        ]
+            result[4] = [[name, False if name in generated else required] for name, required in trailing] + keyword_only
+        result[4] = [[name, False if name in generated else required] for name, required in result[4]]
         return result
 
     def _static_decorator_transform(
@@ -4636,9 +5336,9 @@ class InterfaceBoundaryGenerator:
         """Resolve a direct decorator that returns one local wrapper."""
 
         decorator = self._callable_info(reference)
-        node = decorator.node if decorator is not None else None
-        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+        if decorator is None or not isinstance(decorator.node, (ast.AsyncFunctionDef, ast.FunctionDef)):
             return None
+        node = decorator.node
         if node.decorator_list or node.args.vararg is not None or node.args.kwarg is not None:
             return None
         positional = [*node.args.posonlyargs, *node.args.args]
@@ -4835,7 +5535,7 @@ class InterfaceBoundaryGenerator:
             installed.bound_call_signature,
         )
         binds_receiver = relation.upstream_owner is not None
-        extra_views = ()
+        extra_views: tuple[tuple[str, str], ...] = ()
         if _TRITON_KERNEL_PROTOCOL not in {upstream.protocol, installed.protocol}:
             extra_views = (
                 ("reported", "reported_signature"),
@@ -5148,7 +5848,7 @@ class InterfaceBoundaryGenerator:
 
         sequences = [list(result.owners) for result in base_results]
         sequences.append(bases.copy())
-        result = [qualified_name]
+        linearized_owners = [qualified_name]
         while any(sequences):
             sequences = [sequence for sequence in sequences if sequence]
             candidate = next(
@@ -5157,19 +5857,19 @@ class InterfaceBoundaryGenerator:
             )
             if candidate is None:
                 incomplete_result = MroResult(
-                    owners=tuple(result),
+                    owners=tuple(linearized_owners),
                     complete=False,
                     reason=f"invalid or ambiguous MRO at {qualified_name}",
                 )
                 self._mro_cache[qualified_name] = incomplete_result
                 return incomplete_result
-            result.append(candidate)
+            linearized_owners.append(candidate)
             for sequence in sequences:
                 if sequence and sequence[0] == candidate:
                     sequence.pop(0)
 
         complete_result = MroResult(
-            owners=tuple(result),
+            owners=tuple(linearized_owners),
             complete=True,
         )
         self._mro_cache[qualified_name] = complete_result
@@ -5235,6 +5935,7 @@ class InterfaceBoundaryGenerator:
                 )
 
     def _collect_verified_overrides(self) -> None:
+        """Collect downstream overrides with a statically proven upstream owner."""
         for class_info in self.downstream.classes.values():
             if self._conditional_class_dependency(class_info.qualified_name) is not None:
                 continue
@@ -5302,6 +6003,30 @@ class InterfaceBoundaryGenerator:
                             )
                         )
                         continue
+                    historical_lookup_root = (
+                        next(
+                            (owner for owner in mro[1:] if owner.startswith("vllm.")),
+                            None,
+                        )
+                        if mro_result.complete
+                        and resolution.may_be_missing
+                        and not resolution.may_be_non_callable
+                        and not resolution.has_unresolved_value
+                        and not resolution.blocking_owners
+                        and not hasattr(object, method_name)
+                        else None
+                    )
+                    if historical_lookup_root is not None:
+                        self.historical_override_candidates.append(
+                            HistoricalOverrideCandidate(
+                                lookup_root=historical_lookup_root,
+                                downstream_file=class_info.file,
+                                downstream_owner=class_info.name,
+                                downstream_qualified_owner=class_info.qualified_name,
+                                downstream_name=method_name,
+                                evidence_line=getattr(method_node, "lineno", 0),
+                            )
+                        )
                     super_target = (
                         next(
                             (owner for owner in mro[1:] if owner.startswith("vllm.")),
@@ -5366,13 +6091,75 @@ class InterfaceBoundaryGenerator:
                         )
                     continue
                 for effective_owner in effective_owners:
-                    self._record_verified_override_owner(
-                        class_info,
-                        method_name,
-                        method_node,
+                    for root_owner, owner_path in self._override_root_paths(
                         effective_owner,
-                        mro,
+                        method_name,
+                    ):
+                        self._record_verified_override_owner(
+                            class_info,
+                            method_name,
+                            method_node,
+                            root_owner,
+                            mro,
+                            override_path=(downstream_name, *owner_path),
+                        )
+
+    def _override_root_paths(
+        self,
+        effective_owner: str,
+        method_name: str,
+        seen: frozenset[str] = frozenset(),
+    ) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        """Resolve a downstream-owned override to its ultimate source root.
+
+        Attribute lookup stops at the first effective implementation.  That
+        implementation can itself belong to another vllm-ascend subclass,
+        which still substitutes for the later vLLM method contract.  Follow
+        only total-callable lookup prefixes and reuse the existing MRO and
+        final-binding caches.  The full MRO may remain incomplete after a
+        callable owner has already stopped lookup; an ambiguous or blocked
+        intermediate owner is never guessed.
+        """
+
+        cache_key = (effective_owner, method_name)
+        result: tuple[tuple[str, tuple[str, ...]], ...]
+        if effective_owner in seen:
+            return ()
+        if cache_key in self._override_root_path_cache:
+            return self._override_root_path_cache[cache_key]
+
+        qualified_method = f"{effective_owner}.{method_name}"
+        if effective_owner.startswith("vllm.") or self._is_external_owner(
+            effective_owner,
+        ):
+            result = ((effective_owner, (qualified_method,)),)
+        elif not effective_owner.startswith("vllm_ascend."):
+            result = ()
+        else:
+            mro_result = self._linearized_mro(effective_owner)
+            resolution = self._effective_method_resolution(
+                mro_result.owners[1:],
+                method_name,
+            )
+            if not resolution.is_total_callable:
+                result = ()
+            else:
+                paths = {
+                    (
+                        root_owner,
+                        (qualified_method, *parent_path),
                     )
+                    for parent_owner in resolution.callable_owners
+                    for root_owner, parent_path in self._override_root_paths(
+                        parent_owner,
+                        method_name,
+                        frozenset((*seen, effective_owner)),
+                    )
+                }
+                result = tuple(sorted(paths))
+
+        self._override_root_path_cache[cache_key] = result
+        return result
 
     def _calls_same_method_on_super(
         self,
@@ -5420,7 +6207,10 @@ class InterfaceBoundaryGenerator:
         method_node: ast.AST,
         effective_owner: str,
         mro: Sequence[str],
+        *,
+        override_path: tuple[str, ...],
     ) -> None:
+        """Record one override after validating its owner and installed contract."""
         is_external = self._is_external_owner(effective_owner)
         if not effective_owner.startswith("vllm.") and not is_external:
             return
@@ -5556,6 +6346,7 @@ class InterfaceBoundaryGenerator:
             upstream_signature_contract=upstream_signature_contract,
             downstream_signature_contract=downstream_signature_contract,
             installed_signature_contract=downstream_signature_contract,
+            override_paths=(override_path,),
         )
         self.relations.append(relation)
         self._append_descriptor_finding(
@@ -5720,14 +6511,14 @@ class InterfaceBoundaryGenerator:
                 )
                 node_identities[id(node)] = identity
 
-        exports = {}
+        exports: dict[str, str] = {}
         for module_info in self.downstream.modules.values():
             for name, info in module_info.functions.items():
                 if not (name.startswith("_") and not name.startswith("__")):
                     continue
-                identity = node_identities.get(id(info.node))
-                if identity is not None:
-                    exports[info.qualified_name] = identity
+                export_identity = node_identities.get(id(info.node))
+                if export_identity is not None:
+                    exports[info.qualified_name] = export_identity
 
         self._private_helper_definitions = definitions
         self._private_helper_exports = exports
@@ -5911,6 +6702,7 @@ class InterfaceBoundaryGenerator:
             list[tuple[dict[str, set[str] | None], tuple[GuardFact, ...]]],
         ],
     ) -> PatchFlowResult:
+        """Propagate bindings and guards through private patch helper calls."""
         exits: list[PatchFlowExit] = []
         for node in statements:
             if isinstance(node, ast.Assert):
@@ -6628,23 +7420,23 @@ class InterfaceBoundaryGenerator:
             actuals.append((parameter.arg, actual, actual is None and has_kwargs))
 
         contexts: list[tuple[dict[str, set[str] | None], tuple[GuardFact, ...]]] = [({}, context.guards)]
-        for parameter, actual, forced_unknown in actuals:
+        for parameter_name, actual_node, forced_unknown in actuals:
             alternatives = (
                 None
                 if forced_unknown
                 else self._owner_argument_alternatives(
                     module_info,
-                    actual,
+                    actual_node,
                     context,
                     tag_guard_names,
                 )
             )
             if alternatives is None:
                 for arguments, _guards in contexts:
-                    arguments[parameter] = None
+                    arguments[parameter_name] = None
                 continue
 
-            expanded = []
+            expanded: list[tuple[dict[str, set[str] | None], tuple[GuardFact, ...]]] = []
             for arguments, guards in contexts:
                 for target, alternative_guards in alternatives:
                     merged_guards = self._merge_guard_paths(
@@ -6655,7 +7447,7 @@ class InterfaceBoundaryGenerator:
                         continue
                     expanded.append(
                         (
-                            {**arguments, parameter: {target}},
+                            {**arguments, parameter_name: {target}},
                             merged_guards,
                         )
                     )
@@ -6927,12 +7719,8 @@ class InterfaceBoundaryGenerator:
         owner_info = self.upstream.find_class(owner)
         if owner_info is None:
             return False
-        direct_alternatives = self._final_bindings(
-            self._canonical_reference(f"{owner_info.qualified_name}.{member}")
-        )
-        if direct_alternatives and all(
-            alternative.kind != "unbound" for alternative in direct_alternatives
-        ):
+        direct_alternatives = self._final_bindings(self._canonical_reference(f"{owner_info.qualified_name}.{member}"))
+        if direct_alternatives and all(alternative.kind != "unbound" for alternative in direct_alternatives):
             # A member bound directly on the target class wins before Python
             # consults any parent.  This fact remains exact even when an
             # external base prevents us from completing the rest of the MRO.
@@ -6959,6 +7747,7 @@ class InterfaceBoundaryGenerator:
         context: PatchScanContext,
         tag_guard_names: set[str],
     ) -> tuple[StaticValueAlternative, ...] | None:
+        """Resolve statically provable values together with their guards."""
         if node is None:
             return None
 
@@ -7184,7 +7973,7 @@ class InterfaceBoundaryGenerator:
 
     def _merge_guard_paths(
         self,
-        *paths: Sequence[GuardFact],
+        *paths: Sequence[GuardFact | str],
     ) -> tuple[GuardFact, ...] | None:
         predicates: dict[tuple[str, str, str], GuardFact] = {}
         for guard in (guard for path in paths for guard in path):
@@ -7406,14 +8195,12 @@ class InterfaceBoundaryGenerator:
                 function = _expression_name(manager.func)
                 function_targets = self._resolve_patch_references(module_info, function, context) if function else set()
                 if function_targets == {"contextlib.nullcontext"}:
-                    enter_value = (
-                        manager.args[0]
-                        if manager.args
-                        else next(
-                            (keyword.value for keyword in manager.keywords if keyword.arg == "enter_result"),
-                            None,
-                        )
-                    )
+                    enter_value: ast.expr | None = manager.args[0] if manager.args else None
+                    if enter_value is None:
+                        for keyword in manager.keywords:
+                            if keyword.arg == "enter_result":
+                                enter_value = keyword.value
+                                break
                     if enter_value is None or (isinstance(enter_value, ast.Constant) and enter_value.value is None):
                         known_none = True
                     elif expression := _expression_name(enter_value):
@@ -7518,6 +8305,7 @@ class InterfaceBoundaryGenerator:
         context: PatchScanContext,
         tag_guard_names: set[str],
     ) -> PatchFlowResult:
+        """Interpret patch statements while preserving control-flow evidence."""
         exits: list[PatchFlowExit] = []
         for node in statements:
             if isinstance(node, ast.Assert):
@@ -7619,7 +8407,7 @@ class InterfaceBoundaryGenerator:
                 )
                 self._clear_function_parameter_bindings(node, base_child)
                 helper_name = self._private_helper_node_identities.get(id(node))
-                invocations = self._private_helper_invocations.get(helper_name)
+                invocations = self._private_helper_invocations.get(helper_name) if helper_name is not None else None
                 if invocations:
                     for invocation in invocations:
                         guards = self._merge_guard_paths(
@@ -7752,11 +8540,11 @@ class InterfaceBoundaryGenerator:
             if isinstance(node, (ast.Assign, ast.AnnAssign)):
                 value = node.value
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    if isinstance(target, ast.Attribute):
+                for assignment_target in targets:
+                    if isinstance(assignment_target, ast.Attribute):
                         self._record_patch_node(
                             module_info,
-                            target,
+                            assignment_target,
                             value,
                             context,
                             getattr(node, "lineno", 0),
@@ -8099,11 +8887,7 @@ class InterfaceBoundaryGenerator:
                     context,
                 )
             )
-        return {
-            name
-            for name in names
-            if name == "vllm" or name.startswith("vllm.")
-        }
+        return {name for name in names if name == "vllm" or name.startswith("vllm.")}
 
     def _mro_selected_module_references(
         self,
@@ -8133,26 +8917,21 @@ class InterfaceBoundaryGenerator:
         ]
         if len(helpers) != 1:
             return set()
-        selector = self._mro_module_selector(helpers[0].node)
+        helper_node = helpers[0].node
+        if not isinstance(helper_node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            return set()
+        selector = self._mro_module_selector(helper_node)
         if selector is None:
             return set()
         receiver_parameter, selected_class_name = selector
-        positional = [*helpers[0].node.args.posonlyargs, *helpers[0].node.args.args]
+        positional = [*helper_node.args.posonlyargs, *helper_node.args.args]
         parameter_index = next(
-            (
-                index
-                for index, parameter in enumerate(positional)
-                if parameter.arg == receiver_parameter
-            ),
+            (index for index, parameter in enumerate(positional) if parameter.arg == receiver_parameter),
             None,
         )
         if parameter_index is None or any(isinstance(argument, ast.Starred) for argument in node.args):
             return set()
-        keyword_values = {
-            keyword.arg: keyword.value
-            for keyword in node.keywords
-            if keyword.arg is not None
-        }
+        keyword_values = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg is not None}
         if any(keyword.arg is None for keyword in node.keywords):
             return set()
         receiver = keyword_values.get(receiver_parameter)
@@ -8171,11 +8950,7 @@ class InterfaceBoundaryGenerator:
         mro = self._linearized_mro(next(iter(receiver_classes)))
         if not mro.complete:
             return set()
-        selected_owners = [
-            owner
-            for owner in mro.owners
-            if owner.rsplit(".", 1)[-1] == selected_class_name
-        ]
+        selected_owners = [owner for owner in mro.owners if owner.rsplit(".", 1)[-1] == selected_class_name]
         if len(selected_owners) != 1:
             return set()
         selected_owner = selected_owners[0]
@@ -8243,6 +9018,7 @@ class InterfaceBoundaryGenerator:
                 isinstance(node, ast.AnnAssign)
                 and isinstance(node.target, ast.Name)
                 and node.target.id == selected_name
+                and node.value is not None
             ):
                 assignments.append(node.value)
         if len(assignments) != 1:
@@ -8597,6 +9373,7 @@ class InterfaceBoundaryGenerator:
         *,
         evidence_target: str | None = None,
     ) -> None:
+        """Validate and record one resolved patch installation relation."""
         replacement = self._resolve_patch_replacement(
             module_info,
             replacement_node,
@@ -8864,6 +9641,7 @@ class InterfaceBoundaryGenerator:
         evidence_target: str | None,
         replacement: PatchReplacement,
     ) -> CandidateFinding | None:
+        """Build a review finding for a patch targeting a non-callable field."""
         if self._find_upstream_patch_target(target) is not None:
             return None
         upstream_value = self.upstream.find_value(target)
@@ -8980,6 +9758,7 @@ class InterfaceBoundaryGenerator:
         target: str,
         line: int,
     ) -> PatchReplacement:
+        """Resolve the callable or value installed by a patch statement."""
         kind = "replacement"
         installed_descriptor_kind: str | None = None
         if isinstance(node, ast.Call):
@@ -9104,15 +9883,15 @@ class InterfaceBoundaryGenerator:
             tuple[CallableInfo, str],
         ] = {}
         for reference in references:
-            candidate = self._find_downstream_patch_replacement(reference)
-            if candidate is None and reference.startswith(f"{module_info.name}."):
-                candidate = self.downstream.find_loose_function(
+            replacement_candidate = self._find_downstream_patch_replacement(reference)
+            if replacement_candidate is None and reference.startswith(f"{module_info.name}."):
+                replacement_candidate = self.downstream.find_loose_function(
                     module_info.name,
                     reference.rsplit(".", 1)[-1],
                 )
-            if candidate:
-                candidates[(candidate.file, candidate.owner, candidate.name)] = (
-                    candidate,
+            if replacement_candidate:
+                candidates[(replacement_candidate.file, replacement_candidate.owner, replacement_candidate.name)] = (
+                    replacement_candidate,
                     reference,
                 )
         if len(candidates) == 1:
@@ -9253,6 +10032,7 @@ class InterfaceBoundaryGenerator:
         target: str | None = None,
         line: int,
     ) -> PatchReplacement | None:
+        """Resolve a statically inspectable wrapper-factory result."""
         expression = _expression_name(node.func)
         if expression is None:
             return None
@@ -9277,9 +10057,9 @@ class InterfaceBoundaryGenerator:
         for reference in references:
             if not reference.startswith("vllm_ascend."):
                 continue
-            candidate = self._find_downstream_patch_replacement(reference)
-            if candidate is not None:
-                factories[(candidate.file, candidate.owner, candidate.name)] = candidate
+            factory_candidate = self._find_downstream_patch_replacement(reference)
+            if factory_candidate is not None:
+                factories[(factory_candidate.file, factory_candidate.owner, factory_candidate.name)] = factory_candidate
         if len(factories) != 1:
             return None
 
@@ -9374,11 +10154,15 @@ class InterfaceBoundaryGenerator:
                 origin_kind=kind,
                 descriptor_kind=descriptor_kind,
                 decorator_references=decorator_references,
-                decorator_forwarded_targets=self._capture_factory_forwarded_targets(
-                    returned_node,
-                    decorator_references,
-                    parameters,
-                    parameter_targets,
+                decorator_forwarded_targets=(
+                    self._capture_factory_forwarded_targets(
+                        returned_node,
+                        decorator_references,
+                        parameters,
+                        parameter_targets,
+                    )
+                    if isinstance(returned_node, (ast.AsyncFunctionDef, ast.FunctionDef))
+                    else None
                 ),
             ),
             kind=kind,
@@ -9668,10 +10452,8 @@ def _relation_payloads(
     )
 
 
-
 def _write_jsonl(path: Path, payloads: Iterable[dict[str, Any]]) -> None:
     _boundary_schema.write_jsonl(path, payloads)
-
 
 
 def _load_compact_relations(path: Path) -> list[Relation]:
@@ -9731,12 +10513,10 @@ def _relation_label(relation: Relation) -> dict[str, Any]:
     return _boundary_schema.relation_label(relation)
 
 
-
 def _downstream_label(
     key: tuple[str, str, str, str],
 ) -> dict[str, Any]:
     return _boundary_schema.downstream_label(key)
-
 
 
 def compare_relations(
@@ -9750,7 +10530,6 @@ def compare_relations(
         findings,
         signature_contract_payload=_signature_contract_payload,
     )
-
 
 
 def _git_head(repo_root: Path) -> str:
@@ -9847,6 +10626,7 @@ def _verified_external_sources(
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Run the legacy-compatible relation-generator command line."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--vllm-root", type=Path, required=True)
     parser.add_argument("--ascend-root", type=Path, required=True)

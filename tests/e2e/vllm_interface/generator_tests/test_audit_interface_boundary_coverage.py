@@ -142,6 +142,11 @@ class Child(Base):
         return value
 
 
+class GrandChild(Child):
+    def run(self, value):
+        return value
+
+
 class AliasChild(Base):
     run = alias_run
 
@@ -180,7 +185,7 @@ def test_independent_scanner_enumerates_supported_candidate_shapes(
 
     assert sum(candidate.relation == "monkey_patch" for candidate in candidates) == 3
     assert sum(candidate.relation == "inheritance" for candidate in candidates) == 3
-    assert sum(candidate.relation == "override" for candidate in candidates) == 2
+    assert sum(candidate.relation == "override" for candidate in candidates) == 3
     assert any(
         candidate.relation == "monkey_patch" and candidate.scope == "install_local_patch" for candidate in candidates
     )
@@ -405,9 +410,9 @@ def test_sha_mismatch_fails_before_reporting(
 def test_expected_shas_verify_mapping_and_exact_git_source_roots(
     tmp_path: Path,
 ) -> None:
-    vllm_root = tmp_path / "vllm-源码"
-    ascend_root = tmp_path / "ascend-源码"
-    external_root = tmp_path / "external-源码"
+    vllm_root = tmp_path / "vllm-src-é"
+    ascend_root = tmp_path / "ascend-src-é"
+    external_root = tmp_path / "external-src-é"
     _write(vllm_root, "vllm/__init__.py", "")
     _write(ascend_root, "vllm_ascend/__init__.py", "")
     _write(external_root, "external/__init__.py", "")
@@ -675,7 +680,7 @@ class Child(Combined):
     }
 
 
-def test_strict_c3_does_not_skip_a_downstream_effective_owner(
+def test_strict_c3_expands_a_downstream_effective_owner_to_the_root(
     tmp_path: Path,
 ) -> None:
     vllm_root = tmp_path / "vllm-repo"
@@ -717,9 +722,10 @@ class Child(Mid):
         "vllm_ascend.plugin.Mid",
         "vllm.base.Base",
     )
-    assert len(overrides) == 1
-    assert overrides[0].line == 6
-    assert overrides[0].targets == ("vllm.base.Base.run",)
+    assert {candidate.line for candidate in overrides} == {6, 11}
+    assert {candidate.targets for candidate in overrides} == {
+        ("vllm.base.Base.run",),
+    }
 
 
 def test_incomplete_mro_is_reported_without_selecting_an_owner(
@@ -1118,8 +1124,7 @@ def _replace_gpu_model_runner_function_wrapper(target_module_name):
     candidates = auditor.IndependentCandidateScanner(vllm_root, ascend_root).scan()
 
     assert not any(
-        candidate.relation == "monkey_patch"
-        and any(target.endswith(".graph_capture") for target in candidate.targets)
+        candidate.relation == "monkey_patch" and any(target.endswith(".graph_capture") for target in candidate.targets)
         for candidate in candidates
     )
 
@@ -1161,7 +1166,5 @@ def run():
     candidates = auditor.IndependentCandidateScanner(vllm_root, ascend_root).scan()
 
     assert not any(
-        candidate.relation == "monkey_patch"
-        and candidate.file == "vllm/capture.py"
-        for candidate in candidates
+        candidate.relation == "monkey_patch" and candidate.file == "vllm/capture.py" for candidate in candidates
     )

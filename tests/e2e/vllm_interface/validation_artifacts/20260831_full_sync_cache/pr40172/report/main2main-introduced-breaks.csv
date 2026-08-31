@@ -1,0 +1,1 @@
+﻿classification,priority,action,relation,contract_kind,direction,upstream_old,upstream_new,downstream,downstream_line,change,old_compatible,new_compatible,confidence,suggestion,call_shape,return_use,override_paths,upstream_old_return,upstream_new_return,downstream_return

@@ -34,14 +34,12 @@ python -m tools.vllm_interface_contracts analyze-range --help
 python -m tools.vllm_interface_contracts validate --help
 ```
 
-The main2main skill is intentionally only an adapter around this package.  It validates the requested SHAs, selects
-`new`, `legacy`, or `compare` mode, reuses an exact-input cache, and renders the Chinese report.  AST indexing, MRO,
+The main2main skill is intentionally only an adapter around this package. It validates the requested SHAs, selects
+`new`, `legacy`, or `compare` mode, passes cache controls to the engine, and renders the requested report. AST indexing, MRO,
 override, monkey-patch, import, callsite, signature, and return-contract decisions are owned by this package alone.
 
-For a Chinese explanation of why the generator grew from its early version to more than 10,000 lines, including the
-problem solved by every version from v0.3 to v0.36, see `接口映射生成器代码演进说明.md`.
-For the architecture audit, completed refactor, and byte-for-byte accuracy evidence, see
-`接口映射生成器架构评估与优化说明.md`.
+Local handoff notes retain the historical design discussion and validation evidence; this README documents the public
+CLI and analyzer behavior in English.
 
 `generate_interface_boundaries.py` rebuilds the low-noise subset of the mapping directly from a checked-out vLLM and
 vllm-ascend source pair. It currently discovers:
@@ -54,7 +52,8 @@ vllm-ascend source pair. It currently discovers:
 - direct inheritance from a statically resolved vLLM class;
 - verified overrides whose effective parent implementation is resolved through the combined MRO;
 - generated dataclass constructors, typed lazy exports, patch save/restore lifecycle, and field-mutation findings;
-- exact, source-pinned Triton `kernel[grid](...)` launch signatures, including literal heuristic-generated parameters;
+- exact Triton `kernel[grid](...)` launch signatures recognized by canonical decorator symbols, including literal
+  heuristic-generated parameters;
 - exact local helpers that select one literal-named class from a complete MRO, return its module, and patch that module
   through `sys.modules[name]` or `sys.modules.get(name)`;
 - direct `contextlib.contextmanager` wrappers, keeping the source/reporting contract separate from the wrapper's broad
@@ -125,8 +124,28 @@ python -m tools.vllm_interface_contracts analyze-range \
   --new <new-sha> \
   --expect-ascend-sha <ascend-sha> \
   --scenario main2main \
+  --cache-dir /path/to/private-cache-parent \
   --output-dir /path/to/report-dir
 ```
+
+## Local persistent cache
+
+The local CLI enables a private persistent cache by default. `--cache-dir` selects its parent directory, and the tool
+creates and reads only the `vllm-interface-contracts` child. `--no-cache` disables every persistent read and write.
+`python -m tools.vllm_interface_contracts cache clear --cache-dir <parent>` removes only that tool-owned child.
+
+The cache covers the downstream AST/symbol index, content-addressed upstream file fragments, generated inheritance,
+override, monkey-patch, direct-import, direct-call, and Triton-call dependencies, plus the lazily populated old/new Git
+snapshot indexes. Keys include normalized repository paths, exact commit SHAs, component and global cache schema
+versions, analyzer versions, the Python implementation/version, and analysis configuration. Committed-source caches are
+bypassed when the relevant package tree has uncommitted or untracked source changes.
+
+Cache entries use pickle because they contain Python AST objects. Pickle is unsafe for untrusted data. The analyzer does
+not accept an arbitrary pickle path and must read only entries it created under its private cache directory. Corrupt
+entries are deleted and rebuilt. Writes use a temporary file, `fsync`, an atomic replace, and a per-entry lock so an
+interrupted or concurrent writer cannot leave the authoritative entry partially written. Cache status, commit, hit,
+miss, bypass, corruption, load/build/write timings, and an estimated saved duration are recorded in report metadata and
+printed by the CLI.
 
 `--scenario` selects one of two fixed execution plans; it is not a collection of independent low-level switches:
 
@@ -147,7 +166,7 @@ Findings are separated into `introduced_break`, `compatibility_warning`, `preexi
 `analysis_unresolved`.  Unchanged verified relationships are omitted from the upgrade report.  By default the command
 only warns and exits successfully; `--fail-on introduced` is available for a future blocking CI, but is not the default.
 
-Range schema version 4 reports the selected scenario, fixed plan version, capability states, phase timings, and the
+Range schema version 10 reports the selected scenario, fixed plan version, capability states, cache events, phase timings, and the
 direct-call invocation kind in dependency evidence. It retains the four exact contract families introduced by schema
 2. Under the default `exact-contracts` profile, these families remain available without changing the generator JSONL
 schema or its fixed relation golden:

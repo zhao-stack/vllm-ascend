@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-AUDIT_VERSION = "0.7.0"
+AUDIT_VERSION = "0.8.0"
 RELATIONS = frozenset({"inheritance", "monkey_patch", "override"})
 STATUSES = frozenset({"verified", "risk", "expected", "excluded", "review"})
 STDLIB_STRUCTURAL_BASES: dict[str, tuple[str, ...]] = {
@@ -796,11 +796,7 @@ class IndependentCandidateScanner:
         expression = _expression_name(module_node)
         if expression is not None:
             names.update(self._resolve_expression(module, expression, state))
-        return {
-            name
-            for name in names
-            if name == "vllm" or name.startswith("vllm.")
-        }
+        return {name for name in names if name == "vllm" or name.startswith("vllm.")}
 
     def _mro_selected_module_references(
         self,
@@ -813,11 +809,7 @@ class IndependentCandidateScanner:
             return set()
         function_name = _expression_name(value.func)
         targets = self._resolve_expression(module, function_name, state)
-        records = [
-            self._functions[target]
-            for target in sorted(targets)
-            if target in self._functions
-        ]
+        records = [self._functions[target] for target in sorted(targets) if target in self._functions]
         if len(records) != 1:
             return set()
         selector = self._mro_module_selector(records[0].node)
@@ -829,20 +821,12 @@ class IndependentCandidateScanner:
             *records[0].node.args.args,
         ]
         parameter_index = next(
-            (
-                index
-                for index, parameter in enumerate(positional)
-                if parameter.arg == receiver_parameter
-            ),
+            (index for index, parameter in enumerate(positional) if parameter.arg == receiver_parameter),
             None,
         )
         if parameter_index is None or any(isinstance(argument, ast.Starred) for argument in value.args):
             return set()
-        keyword_values = {
-            keyword.arg: keyword.value
-            for keyword in value.keywords
-            if keyword.arg is not None
-        }
+        keyword_values = {keyword.arg: keyword.value for keyword in value.keywords if keyword.arg is not None}
         if any(keyword.arg is None for keyword in value.keywords):
             return set()
         receiver = keyword_values.get(receiver_parameter)
@@ -861,11 +845,7 @@ class IndependentCandidateScanner:
         mro = self._strict_mro(next(iter(receiver_classes)))
         if not mro.complete:
             return set()
-        selected_owners = [
-            owner
-            for owner in mro.owners
-            if owner.rsplit(".", 1)[-1] == selected_class_name
-        ]
+        selected_owners = [owner for owner in mro.owners if owner.rsplit(".", 1)[-1] == selected_class_name]
         if len(selected_owners) != 1 or not selected_owners[0].startswith("vllm."):
             return set()
         return {selected_owners[0].rsplit(".", 1)[0]}
@@ -885,9 +865,7 @@ class IndependentCandidateScanner:
             return set()
         expression = _expression_name(value)
         return {
-            reference
-            for reference in self._resolve_expression(module, expression, state)
-            if reference in self._classes
+            reference for reference in self._resolve_expression(module, expression, state) if reference in self._classes
         }
 
     @staticmethod
@@ -922,10 +900,7 @@ class IndependentCandidateScanner:
                 if isinstance(node, ast.AnnAssign)
                 else []
             )
-            if any(
-                isinstance(target, ast.Name) and target.id == selected_name
-                for target in targets
-            ):
+            if any(isinstance(target, ast.Name) and target.id == selected_name for target in targets):
                 assignments.append(node.value)
         if len(assignments) != 1:
             return None
@@ -1000,8 +975,7 @@ class IndependentCandidateScanner:
         records = [
             self._functions[target]
             for target in sorted(targets)
-            if target in self._functions
-            and self._package_role(target) == "downstream"
+            if target in self._functions and self._package_role(target) == "downstream"
         ]
         for record in records:
             qualified_name = f"{record.module}.{'.'.join(record.scope)}"
@@ -1014,8 +988,7 @@ class IndependentCandidateScanner:
             if len(call.args) > len(positional_parameters):
                 continue
             argument_nodes: dict[str, ast.AST] = {
-                parameter.arg: argument
-                for parameter, argument in zip(positional_parameters, call.args)
+                parameter.arg: argument for parameter, argument in zip(positional_parameters, call.args)
             }
             invalid_keywords = False
             parameter_names = {parameter.arg for parameter in positional_parameters}
@@ -1503,6 +1476,12 @@ class IndependentCandidateScanner:
                                 "missing_upstream_super_target",
                             )
                         continue
+                    effective_owner = self._ultimate_override_owner(
+                        effective_owner,
+                        method.name,
+                    )
+                    if effective_owner is None:
+                        continue
                     role = self._package_role(effective_owner)
                     if role not in {"upstream", "external"}:
                         continue
@@ -1531,6 +1510,30 @@ class IndependentCandidateScanner:
                         {f"{owner}.{method.name}" for owner in possible_owners},
                         "incomplete_mro",
                     )
+
+    def _ultimate_override_owner(
+        self,
+        effective_owner: str,
+        method_name: str,
+    ) -> str | None:
+        """Follow exact downstream owners until the vLLM/external root."""
+
+        seen: set[str] = set()
+        current = effective_owner
+        while self._package_role(current) == "downstream":
+            if current in seen:
+                return None
+            seen.add(current)
+            mro = self._strict_mro(current)
+            if not mro.complete:
+                return None
+            current = next(
+                (owner for owner in mro.owners[1:] if self._classes[owner].method(method_name)),
+                "",
+            )
+            if not current:
+                return None
+        return current if self._package_role(current) in {"upstream", "external"} else None
 
     def _add_candidate(
         self,

@@ -38,7 +38,7 @@ def relation_payloads(
     schema_version: int,
     generator_version: str,
     supported_relations: Iterable[str],
-    signature_contract_payload: Callable[[Any], dict[str, object] | None],
+    signature_contract_payload: Callable[[Any], object],
 ) -> list[dict[str, Any]]:
     """Encode normalized relations and findings in the compact JSONL schema."""
     grouped: dict[
@@ -228,7 +228,7 @@ def compare_relations(
     baseline: Sequence[Any],
     findings: Sequence[Any],
     *,
-    signature_contract_payload: Callable[[Any], dict[str, object] | None],
+    signature_contract_payload: Callable[[Any], object],
 ) -> dict[str, Any]:
     """Compare generated relations with one compact-table baseline."""
     finding_statuses = Counter(finding.status for finding in findings)
@@ -250,10 +250,7 @@ def compare_relations(
         for key in baseline_exact
         if any(alias in generated_exact_aliases for alias in baseline_exact[key].comparison_exact_keys())
     }
-    matched_relations = {
-        key: _first_exact_match(generated, baseline_exact[key])
-        for key in exact_matches
-    }
+    matched_relations = {key: _first_exact_match(generated, baseline_exact[key]) for key in exact_matches}
 
     descriptor_kind_changes = []
     for key in sorted(exact_matches):

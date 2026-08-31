@@ -1,3 +1,17 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
 """Exact static contracts for downstream calls and callable return values.
 
 This module intentionally lives in the shared engine.  The main2main skill is
@@ -14,7 +28,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from tools.vllm_interface_contracts.generator import (
+from .generator import (
     _TRITON_JIT_DECORATOR,
     _TRITON_KERNEL_PROTOCOL,
     InterfaceBoundaryGenerator,
@@ -115,6 +129,8 @@ class DirectCallDependency:
     receiver_type: str | None = None
     member: str | None = None
     invocation_kind: str = "python_call"
+    lookup_root: str | None = None
+    resolution_basis: str = "new_exact"
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -147,7 +163,13 @@ def call_shape(node: ast.Call) -> CallShape:
         ):
             # A dict literal resolves duplicate keys before ``**`` expansion;
             # duplicates across separate expansions still remain visible.
-            keyword_names.extend(dict.fromkeys(str(key.value) for key in keyword.value.keys))
+            keyword_names.extend(
+                dict.fromkeys(
+                    key.value
+                    for key in keyword.value.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                )
+            )
         else:
             dynamic_kwargs = True
     return CallShape(
@@ -230,7 +252,7 @@ def _annotation_shapes(
             return _ordered_shapes(variants)
         if base in {"tuple", "Tuple"}:
             if len(elements) == 2 and isinstance(elements[1], ast.Constant) and elements[1].value is Ellipsis:
-                return (ReturnShape("sequence"),)
+                return (ReturnShape("tuple_variadic"),)
             return (ReturnShape("tuple", arity=len(elements)),)
         if base in {"list", "List", "Sequence"}:
             return (ReturnShape("sequence"),)
@@ -348,7 +370,16 @@ def _expression_shapes(
     if isinstance(node, ast.Dict) and all(
         isinstance(key, ast.Constant) and isinstance(key.value, str) for key in node.keys
     ):
-        return (ReturnShape("mapping", keys=tuple(sorted(str(key.value) for key in node.keys))),)
+        return (
+            ReturnShape(
+                "mapping",
+                keys=tuple(
+                    sorted(
+                        key.value for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    )
+                ),
+            ),
+        )
     if isinstance(node, ast.Constant):
         return (ReturnShape("scalar", type_ref=f"builtins.{type(node.value).__name__}"),)
     if isinstance(node, ast.Name) and node.id not in seen_names:
@@ -376,7 +407,7 @@ def _expression_shapes(
         resolved = _resolved_name(node.func, resolver)
         short = (resolved or callee or "").rsplit(".", 1)[-1]
         if short == "tuple":
-            return (ReturnShape("sequence"),)
+            return (ReturnShape("tuple_variadic"),)
         if short == "list":
             return (ReturnShape("sequence"),)
         if short == "dict":
@@ -497,6 +528,17 @@ def infer_return_contract(
         return ReturnContract(protocol, (), "bottom", ("no_normal_return",))
     if observed_exact and observed:
         observed_variants = _ordered_shapes(observed)
+        if all(candidate.kind == "forward" for candidate in observed_variants):
+            # A transparent ``return super().same_method(...)`` override keeps
+            # following the selected upstream endpoint at each snapshot.  A
+            # stale annotation must not freeze the replacement to the old
+            # return shape and create a runtime false positive.
+            return ReturnContract(
+                protocol,
+                observed_variants,
+                exact_status("exact"),
+                (*provenance, "transparent_super_forward_precedes_annotation"),
+            )
         if declared is not None:
             # A precise annotation is the public contract.  Keep the body as
             # corroborating evidence, but do not turn value-level differences
@@ -564,7 +606,12 @@ def _replacement_shape_accepted(expected: ReturnShape, candidate: ReturnShape) -
     if expected.kind == "object" and expected.type_ref in {"builtins.object", "object"}:
         return candidate.kind != "none"
     if expected.kind == "sequence":
-        return candidate.kind in {"list", "sequence", "tuple"}
+        return candidate.kind in {"list", "sequence", "tuple", "tuple_variadic"}
+    if expected.kind == "tuple_variadic":
+        return candidate.kind in {"tuple", "tuple_variadic"}
+    if candidate.kind == "tuple_variadic":
+        # A variable-length tuple cannot promise any one fixed outer arity.
+        return False if expected.kind == "tuple" else None
     if expected.kind != candidate.kind:
         return False
     if expected.kind in {"list", "tuple"}:
@@ -617,15 +664,15 @@ def _use_shape_compatible(shape: ReturnShape, use: ReturnUse) -> bool | None:
         return None
     if use.kind == "unpack":
         if shape.kind not in {"list", "tuple"}:
-            return None if shape.kind == "sequence" else False
+            return None if shape.kind in {"sequence", "tuple_variadic"} else False
         if use.arity is not None:
             return shape.arity == use.arity
         return shape.arity is not None and shape.arity >= (use.minimum_arity or 0)
     if use.kind == "iterate":
-        return shape.kind in {"list", "mapping", "sequence", "tuple"}
+        return shape.kind in {"list", "mapping", "sequence", "tuple", "tuple_variadic"}
     if use.kind == "subscript_index":
         if shape.kind not in {"list", "tuple"}:
-            return None if shape.kind == "sequence" else False
+            return None if shape.kind in {"sequence", "tuple_variadic"} else False
         if shape.arity is None or use.index is None:
             return None
         return -shape.arity <= use.index < shape.arity
@@ -811,6 +858,7 @@ class DirectCallDetector:
 
     def __init__(self, engine: InterfaceBoundaryGenerator):
         self.engine = engine
+        self.historical_candidates: list[DirectCallDependency] = []
         self._candidate_roots: dict[tuple[str, int], frozenset[str]] = {}
         self._constructed_instances: dict[
             tuple[str, int],
@@ -1051,7 +1099,7 @@ class DirectCallDetector:
         node: ast.Call,
         parents: dict[int, ast.AST],
         module: str,
-    ) -> tuple[str, str, str, str] | None:
+    ) -> tuple[str, str, str, str, str | None, str] | None:
         if not isinstance(node.func, ast.Attribute):
             return None
         is_super = (
@@ -1085,21 +1133,55 @@ class DirectCallDetector:
         owners = mro.owners[1:] if is_super else mro.owners
         resolution = self.engine._effective_method_resolution(owners, node.func.attr)
         if (
-            len(resolution.callable_owners) != 1
-            or resolution.may_be_missing
-            or resolution.may_be_non_callable
-            or resolution.has_unresolved_value
+            len(resolution.callable_owners) == 1
+            and not resolution.may_be_missing
+            and not resolution.may_be_non_callable
+            and not resolution.has_unresolved_value
         ):
+            target = f"{resolution.callable_owners[0]}.{node.func.attr}"
+            return (
+                (
+                    target,
+                    "instance",
+                    class_name,
+                    node.func.attr,
+                    None,
+                    "new_exact",
+                )
+                if target.startswith("vllm.")
+                else None
+            )
+        definitely_missing = (
+            not resolution.callable_owners
+            and resolution.may_be_missing
+            and not resolution.may_be_non_callable
+            and not resolution.has_unresolved_value
+            and not resolution.blocking_owners
+            and not hasattr(object, node.func.attr)
+        )
+        if not definitely_missing:
             return None
-        target = f"{resolution.callable_owners[0]}.{node.func.attr}"
-        return (target, "instance", class_name, node.func.attr) if target.startswith("vllm.") else None
+        lookup_root = next(
+            (owner for owner in owners if owner.startswith("vllm.")),
+            None,
+        )
+        if lookup_root is None:
+            return None
+        return (
+            f"{lookup_root}.{node.func.attr}",
+            "instance",
+            class_name,
+            node.func.attr,
+            lookup_root,
+            "old_fallback_super" if is_super else "old_fallback_self",
+        )
 
     def _annotated_instance_target(
         self,
         node: ast.Call,
         function: ast.AsyncFunctionDef | ast.FunctionDef | None,
         module_info: ModuleInfo,
-    ) -> tuple[str, str, str, str] | None:
+    ) -> tuple[str, str, str, str, str | None, str] | None:
         if function is None or not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
             return None
         root = node.func.value.id
@@ -1120,7 +1202,7 @@ class DirectCallDetector:
         if resolved is None:
             return None
         target = f"{resolved}.{node.func.attr}"
-        return (target, "instance", resolved, node.func.attr)
+        return (target, "instance", resolved, node.func.attr, None, "new_exact")
 
     def _resolve_in_scope(
         self,
@@ -1161,7 +1243,7 @@ class DirectCallDetector:
         node: ast.Call,
         function: ast.AsyncFunctionDef | ast.FunctionDef | None,
         module_info: ModuleInfo,
-    ) -> tuple[str, str, str, str] | None:
+    ) -> tuple[str, str, str, str, str | None, str] | None:
         if not isinstance(node.func, ast.Attribute):
             return None
         annotation_reference: str | None = None
@@ -1177,7 +1259,7 @@ class DirectCallDetector:
             # This remains a candidate receiver path, not proof that the
             # symbol is a class.  Old/new endpoint resolution must each prove
             # the class and inherited member independently.
-            return (f"{reference}.{node.func.attr}", "instance", reference, node.func.attr)
+            return (f"{reference}.{node.func.attr}", "instance", reference, node.func.attr, None, "new_exact")
         if function is not None and isinstance(node.func.value, ast.Name):
             root = node.func.value.id
             binding = self._constructed_instance_bindings(function, module_info).get(root)
@@ -1219,7 +1301,7 @@ class DirectCallDetector:
                     )
                 if reference is None:
                     return None
-                return (f"{reference}.{node.func.attr}", "instance", reference, node.func.attr)
+                return (f"{reference}.{node.func.attr}", "instance", reference, node.func.attr, None, "new_exact")
         if annotation_reference is None:
             return None
         try:
@@ -1234,7 +1316,7 @@ class DirectCallDetector:
         if reference is None:
             return None
         target = f"{reference}.{node.func.attr}"
-        return (target, "instance", reference, node.func.attr)
+        return (target, "instance", reference, node.func.attr, None, "new_exact")
 
     def _resolved_access_kind(
         self,
@@ -1268,7 +1350,9 @@ class DirectCallDetector:
         return callable_info is not None and callable_info.decorator_references == (_TRITON_JIT_DECORATOR,)
 
     def discover(self) -> list[DirectCallDependency]:
+        """Discover exact downstream calls and constrained return uses."""
         dependencies: list[DirectCallDependency] = []
+        self.historical_candidates = []
         for module_info in self.engine.downstream.modules.values():
             tree = module_info.tree
             parents = _parents(tree)
@@ -1282,7 +1366,7 @@ class DirectCallDetector:
                     callable_node = node.func.value
                 function_node = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
                 function = function_node if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
-                special = None
+                special: tuple[str, str, str, str, str | None, str] | None = None
                 if invocation_kind == "python_call":
                     special = self._self_or_super_target(node, parents, module_info.name)
                     special = special or self._annotated_instance_target(node, function, module_info)
@@ -1306,11 +1390,17 @@ class DirectCallDetector:
                 )
                 if special is None and may_be_constructed:
                     special = self._constructed_instance_target(node, function, module_info)
+                receiver_type: str | None
+                member: str | None
+                lookup_root: str | None
+                access_kind: str
                 if special is not None:
                     targets = {special[0]}
                     access_kind = special[1]
                     receiver_type = special[2]
                     member = special[3]
+                    lookup_root = special[4]
+                    resolution_basis = special[5]
                 else:
                     if root not in candidate_roots:
                         continue
@@ -1325,38 +1415,45 @@ class DirectCallDetector:
                     if invocation_kind == _TRITON_KERNEL_PROTOCOL and not self._triton_launch_target(resolved):
                         continue
                     targets = {resolved}
-                    access_kind = self._resolved_access_kind(
+                    resolved_access_kind = self._resolved_access_kind(
                         node,
                         resolved,
                         function,
                         module_info,
                     )
-                    if access_kind is None:
+                    if resolved_access_kind is None:
                         continue
+                    access_kind = resolved_access_kind
                     receiver_type = None
                     member = callable_node.attr if isinstance(callable_node, ast.Attribute) else None
+                    lookup_root = None
+                    resolution_basis = "new_exact"
                 target = next(iter(targets))
                 if not target.startswith("vllm."):
                     continue
                 scope_node = function or tree
                 owner = self._class_name(node, parents, module_info.name)
-                dependencies.append(
-                    DirectCallDependency(
-                        target=target,
-                        access_kind=access_kind,
-                        file=module_info.file,
-                        line=getattr(node, "lineno", 0),
-                        column=getattr(node, "col_offset", 0),
-                        owner=owner.rsplit(".", 1)[-1] if owner else None,
-                        scope=function.name if function is not None else None,
-                        callee=ast.unparse(node.func),
-                        call_shape=call_shape(node),
-                        return_use=infer_return_use(node, parents, scope_node),
-                        receiver_type=receiver_type,
-                        member=member,
-                        invocation_kind=invocation_kind,
-                    )
+                dependency = DirectCallDependency(
+                    target=target,
+                    access_kind=access_kind,
+                    file=module_info.file,
+                    line=getattr(node, "lineno", 0),
+                    column=getattr(node, "col_offset", 0),
+                    owner=owner.rsplit(".", 1)[-1] if owner else None,
+                    scope=function.name if function is not None else None,
+                    callee=ast.unparse(node.func),
+                    call_shape=call_shape(node),
+                    return_use=infer_return_use(node, parents, scope_node),
+                    receiver_type=receiver_type,
+                    member=member,
+                    invocation_kind=invocation_kind,
+                    lookup_root=lookup_root,
+                    resolution_basis=resolution_basis,
                 )
+                if lookup_root is not None:
+                    self.historical_candidates.append(dependency)
+                else:
+                    dependencies.append(dependency)
         unique = {
             (
                 item.file,

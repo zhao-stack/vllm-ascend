@@ -1,0 +1,6 @@
+[vllm-interface] cache enabled: C:\Users\20202\Documents\main2main����\.tmp\main2main-full-sync-cache-cache\vllm-interface-contracts
+[vllm-interface] cache downstream_direct_calls commit=3b75c4ecf8ef471fc751ce34af806e1be407f397 status=miss load=0.008s write=0.030s saved=0.000s
+[vllm-interface] cache downstream_direct_imports commit=3b75c4ecf8ef471fc751ce34af806e1be407f397 status=hit load=0.004s write=0.000s saved=11.040s
+[vllm-interface] cache downstream_relations commit=3b75c4ecf8ef471fc751ce34af806e1be407f397 status=miss load=0.000s write=0.030s saved=0.000s
+[vllm-interface] cache upstream_snapshot commit=1f486d96a17303ce8db8e02be39545b2be338446 status=miss load=0.000s write=0.586s saved=0.000s
+[vllm-interface] cache upstream_snapshot commit=e5588e49bc2642670116664a7fc4096e27adb179 status=miss load=0.000s write=0.606s saved=0.000s

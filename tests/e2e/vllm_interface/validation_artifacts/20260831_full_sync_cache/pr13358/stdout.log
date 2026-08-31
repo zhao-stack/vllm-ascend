@@ -1,0 +1,222 @@
+{
+  "metadata": {
+    "range_analyzer_version": "2.0.1",
+    "generator_version": "0.44.0",
+    "profile": "exact-contracts",
+    "scenario": "main2main",
+    "analysis_plan": {
+      "scenario": "main2main",
+      "plan_version": 2,
+      "report_style": "main2main-full",
+      "capabilities": {
+        "inheritance_mro": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "override": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "monkey_patch": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_import": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_call": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "generator_findings": {
+          "state": "included",
+          "produces_findings": true
+        }
+      }
+    },
+    "vllm_old_sha": "d02df748bf9efd99022f1a062597dc3cb3808485",
+    "vllm_new_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+    "vllm_ascend_sha": "97f72b814140520e7a20622dc76b2d2fcdca0f7a",
+    "external_sources": {},
+    "execution": {
+      "analysis_workers_requested": 2,
+      "analysis_workers_used": 2,
+      "parallel_branches": true,
+      "branches": [
+        "relation_comparison",
+        "direct_import_analysis",
+        "direct_call_analysis"
+      ]
+    },
+    "repository_index_cache": {
+      "upstream_file_fragments": {
+        "enabled": true,
+        "status": "miss",
+        "database": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts\\repository-index\\upstream-fragments\\vllm-file-fragments-v2.sqlite3",
+        "files_total": 2148,
+        "cache_hits": 0,
+        "cache_misses": 2148,
+        "invalid_entries": 0,
+        "workers_requested": 2,
+        "workers_used": 2,
+        "load_seconds": 1.108067,
+        "build_seconds": 320.293295,
+        "write_seconds": 6.163148,
+        "merge_finalize_seconds": 22.679501,
+        "database_bytes": 753496064,
+        "hit_ratio": 0.0,
+        "commit_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+        "reason": null
+      },
+      "downstream": {
+        "enabled": true,
+        "status": "miss",
+        "commit_sha": "97f72b814140520e7a20622dc76b2d2fcdca0f7a",
+        "key": "edc9d224e341456ff73f422b0455d326f5c09e7b060b5134989ee53dc0141c3f",
+        "path": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts\\repository-index\\downstream\\vllm_ascend-edc9d224e341456ff73f422b0455d326f5c09e7b060b5134989ee53dc0141c3f.pickle",
+        "reason": null,
+        "load_seconds": 0.000193,
+        "build_seconds": 18.37296,
+        "write_seconds": 1.372278,
+        "saved_seconds": 0.0
+      }
+    },
+    "persistent_cache": {
+      "enabled": true,
+      "root": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts",
+      "upstream_source_state": "clean",
+      "downstream_source_state": "clean",
+      "estimated_saved_seconds": 0.0,
+      "events": [
+        {
+          "component": "downstream_direct_calls",
+          "enabled": true,
+          "status": "miss",
+          "commit_sha": "97f72b814140520e7a20622dc76b2d2fcdca0f7a",
+          "key": "044a22a2caf24963960840996327921628a5323c8c749f652b24e0d161d1272d",
+          "path": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts\\schema-4\\downstream_direct_calls\\044a22a2caf24963960840996327921628a5323c8c749f652b24e0d161d1272d.pickle",
+          "reason": null,
+          "load_seconds": 0.008655,
+          "write_seconds": 0.030004,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "downstream_direct_imports",
+          "enabled": true,
+          "status": "miss",
+          "commit_sha": "97f72b814140520e7a20622dc76b2d2fcdca0f7a",
+          "key": "45a9800b329b7c7649ee0e0b944153eddfafe6c24567cab764911687437477c6",
+          "path": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts\\schema-4\\downstream_direct_imports\\45a9800b329b7c7649ee0e0b944153eddfafe6c24567cab764911687437477c6.pickle",
+          "reason": null,
+          "load_seconds": 0.000233,
+          "write_seconds": 0.01594,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "downstream_relations",
+          "enabled": true,
+          "status": "miss",
+          "commit_sha": "97f72b814140520e7a20622dc76b2d2fcdca0f7a",
+          "key": "78c37d162ced3e0ad4c6a912dc623003efbf6d40c7d5989482cd2900787e228f",
+          "path": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts\\schema-4\\downstream_relations\\78c37d162ced3e0ad4c6a912dc623003efbf6d40c7d5989482cd2900787e228f.pickle",
+          "reason": null,
+          "load_seconds": 0.000146,
+          "write_seconds": 0.026353,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "upstream_snapshot",
+          "enabled": true,
+          "status": "miss",
+          "commit_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+          "key": "f83f46748efe68b19367576866f06fef9cda2b41a2575b4f435e1ddf4ce22649",
+          "path": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts\\schema-4\\upstream_snapshot\\f83f46748efe68b19367576866f06fef9cda2b41a2575b4f435e1ddf4ce22649.pickle",
+          "reason": null,
+          "load_seconds": 0.000112,
+          "write_seconds": 0.748958,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "upstream_snapshot",
+          "enabled": true,
+          "status": "miss",
+          "commit_sha": "d02df748bf9efd99022f1a062597dc3cb3808485",
+          "key": "6e84e85ce94d8da05a7184ef300419a618883a0766b274b58d25e5fdfc4e52e3",
+          "path": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\main2main-full-sync-cache-cache\\vllm-interface-contracts\\schema-4\\upstream_snapshot\\6e84e85ce94d8da05a7184ef300419a618883a0766b274b58d25e5fdfc4e52e3.pickle",
+          "reason": null,
+          "load_seconds": 0.000118,
+          "write_seconds": 0.580816,
+          "saved_seconds": 0.0
+        }
+      ]
+    },
+    "stage_timings_seconds": {
+      "downstream_scanning_parsing": 19.880214,
+      "downstream_relation_generation": 159.680017,
+      "monkey_patch_generation": 208.506495,
+      "upstream_old_new_snapshot_index": 86.61571,
+      "contract_comparison": 242.514072,
+      "report_generation": 0.075925,
+      "total": 990.426824,
+      "total_with_report": 990.502749
+    },
+    "timings_seconds": {
+      "input_verification": 0.272245,
+      "repository_indexing": 370.471646,
+      "repository_indexing.upstream": 350.412376,
+      "repository_indexing.downstream": 19.880214,
+      "repository_indexing.external": 7e-06,
+      "relation_generation.inheritance_mro": 10.605395,
+      "relation_generation.override": 149.074622,
+      "relation_generation.monkey_patch": 208.506495,
+      "relation_generation.relation_finalization": 0.063355,
+      "relation_comparison": 90.704202,
+      "direct_import_analysis": 96.540508,
+      "direct_call_discovery": 72.549438,
+      "direct_call_comparison": 50.896635,
+      "generator_finding_conversion": 4.372727,
+      "cache_estimated_saved": 0.0,
+      "total": 990.426824
+    }
+  },
+  "summary": {
+    "relations": 1062,
+    "relations_collected": 1062,
+    "direct_call_dependencies": 4992,
+    "generator_findings": 218,
+    "total": 265,
+    "by_relation": {
+      "direct_call": 52,
+      "direct_import": 1,
+      "inheritance": 3,
+      "monkey_patch": 34,
+      "override": 175
+    },
+    "by_contract": {
+      "analysis_evidence": 190,
+      "call_arguments": 67,
+      "call_target_presence": 5,
+      "replacement_return": 1,
+      "symbol_presence": 1,
+      "target_presence": 1
+    },
+    "actionable_introduced_break": 8,
+    "by_action": {
+      "dismiss": 2,
+      "modify": 8,
+      "review": 255
+    },
+    "introduced_break": 15,
+    "compatibility_warning": 15,
+    "preexisting": 6,
+    "fixed": 0,
+    "analysis_unresolved": 229
+  },
+  "outputs": {
+    "json": "tests\\e2e\\vllm_interface\\validation_artifacts\\20260831_full_sync_cache\\pr13358\\report\\main2main-range-report.json",
+    "all_csv": "tests\\e2e\\vllm_interface\\validation_artifacts\\20260831_full_sync_cache\\pr13358\\report\\main2main-all-findings.csv",
+    "introduced_csv": "tests\\e2e\\vllm_interface\\validation_artifacts\\20260831_full_sync_cache\\pr13358\\report\\main2main-introduced-breaks.csv",
+    "markdown": "tests\\e2e\\vllm_interface\\validation_artifacts\\20260831_full_sync_cache\\pr13358\\report\\main2main-range-report.md"
+  }
+}

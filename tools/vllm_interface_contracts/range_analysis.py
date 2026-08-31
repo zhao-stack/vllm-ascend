@@ -1,3 +1,17 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# This file is a part of the vllm-ascend project.
 """Analyze an exact vLLM commit range against live vllm-ascend dependencies.
 
 The dependency graph is generated consumer-first from the selected source pair.
@@ -13,21 +27,25 @@ import csv
 import hashlib
 import json
 import os
+import posixpath
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tools.vllm_interface_contracts.analysis_plans import (
+from .analysis_plans import (
     MAIN2MAIN_SCENARIO,
     AnalysisPlan,
     resolve_analysis_plan,
 )
-from tools.vllm_interface_contracts.call_contracts import (
+from .cache import CacheResult, PersistentCache, build_identity, git_source_state, normalized_repo_path
+from .call_contracts import (
     DirectCallDependency,
     DirectCallDetector,
     ReturnContract,
@@ -38,12 +56,17 @@ from tools.vllm_interface_contracts.call_contracts import (
     return_contract_from_dict,
     return_use_compatible,
 )
-from tools.vllm_interface_contracts.generator import (
+from .generator import (
+    _KNOWN_TRANSPARENT_SIGNATURE_DECORATORS,
+    _KNOWN_WRAPS_SIGNATURE_DECORATORS,
     _TRITON_JIT_DECORATOR,
     _TRITON_KERNEL_PROTOCOL,
     GENERATOR_VERSION,
+    STDLIB_STRUCTURAL_BASES,
+    HistoricalOverrideCandidate,
     InterfaceBoundaryGenerator,
     Relation,
+    RelationEvidence,
     SignatureContract,
     _accepts_signature_contract,
     _expression_name,
@@ -52,14 +75,18 @@ from tools.vllm_interface_contracts.generator import (
     _scope_final_bindings,
     _tag_guard_names,
 )
-from tools.vllm_interface_contracts.models import (
+from .models import (
     CompatibilityState,
     RangeFinding,
     SourceEndpoint,
 )
 
-RANGE_SCHEMA_VERSION = 4
-RANGE_ANALYZER_VERSION = "1.3.0"
+RANGE_SCHEMA_VERSION = 10
+RANGE_ANALYZER_VERSION = "2.0.1"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 2
+RELATION_CACHE_SCHEMA_VERSION = 1
+DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
+DIRECT_CALL_CACHE_SCHEMA_VERSION = 1
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -81,6 +108,17 @@ def _diagnostic_timing(
     if os.environ.get("VLLM_INTERFACE_TIMINGS") == "1":
         print(f"[vllm-interface] {label}: {elapsed:.3f}s", file=sys.stderr, flush=True)
     return now
+
+
+def _record_diagnostic_timing(
+    label: str,
+    elapsed: float,
+    timings: dict[str, float | None],
+) -> None:
+    rounded = round(elapsed, 6)
+    timings[label] = rounded
+    if os.environ.get("VLLM_INTERFACE_TIMINGS") == "1":
+        print(f"[vllm-interface] {label}: {rounded:.3f}s", file=sys.stderr, flush=True)
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> str:
@@ -166,7 +204,7 @@ def _signature_status(
         "contextlib.contextmanager",
         "typing.override",
         "typing_extensions.override",
-    }
+    } | _KNOWN_TRANSPARENT_SIGNATURE_DECORATORS
     builtin_descriptors = {"builtins.classmethod", "builtins.property", "builtins.staticmethod"}
     for item in node.decorator_list:
         raw = _decorator_name(item)
@@ -175,6 +213,7 @@ def _signature_status(
             resolved in builtin_descriptors
             or (resolver is None and raw in {"classmethod", "property", "staticmethod"})
             or resolved in known
+            or (resolved in _KNOWN_WRAPS_SIGNATURE_DECORATORS and not isinstance(item, ast.Call))
         ):
             continue
         return "unknown"
@@ -231,6 +270,13 @@ class _QualifiedBinding:
     node: ast.AST | None
     status: str
     fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
+class _ResolvedCallBinding:
+    binding: _QualifiedBinding
+    dispatch_kind: str
+    receiver_class: str | None = None
 
 
 def _body_named_binding(body: list[ast.stmt], name: str) -> _NamedBinding:
@@ -326,6 +372,8 @@ def _bound_signature(
         return None
     positional_only = result[1]
     positional_or_keyword = result[2]
+    if not isinstance(positional_only, list) or not isinstance(positional_or_keyword, list):
+        return None
     if positional_only:
         positional_only.pop(0)
     elif positional_or_keyword:
@@ -333,6 +381,113 @@ def _bound_signature(
     elif result[3] is None:
         return None
     return result
+
+
+def _signature_parameters(signature: list[object] | None) -> tuple[dict[str, object], ...] | None:
+    if not isinstance(signature, list) or len(signature) != 6:
+        return None
+    parameters: list[dict[str, object]] = []
+    for group_index, kind in ((1, "positional_only"), (2, "positional_or_keyword"), (4, "keyword_only")):
+        group = signature[group_index]
+        if not isinstance(group, list):
+            return None
+        for position, raw in enumerate(group):
+            if (
+                not isinstance(raw, list)
+                or len(raw) != 2
+                or not isinstance(raw[0], str)
+                or not isinstance(raw[1], bool)
+            ):
+                return None
+            parameters.append(
+                {
+                    "name": raw[0],
+                    "kind": kind,
+                    "required": raw[1],
+                    "position": position,
+                }
+            )
+    names = [str(item["name"]) for item in parameters]
+    return tuple(parameters) if len(names) == len(set(names)) else None
+
+
+def _signature_delta(
+    old_signature: list[object] | None,
+    new_signature: list[object] | None,
+) -> dict[str, object] | None:
+    old_parameters = _signature_parameters(old_signature)
+    new_parameters = _signature_parameters(new_signature)
+    if old_parameters is None or new_parameters is None or old_signature is None or new_signature is None:
+        return None
+    old_by_name = {str(item["name"]): item for item in old_parameters}
+    new_by_name = {str(item["name"]): item for item in new_parameters}
+    old_names = [str(item["name"]) for item in old_parameters]
+    new_names = [str(item["name"]) for item in new_parameters]
+    shared_names = set(old_names) & set(new_names)
+    changed = [
+        {
+            "name": name,
+            "old_kind": old_by_name[name]["kind"],
+            "new_kind": new_by_name[name]["kind"],
+            "old_required": old_by_name[name]["required"],
+            "new_required": new_by_name[name]["required"],
+        }
+        for name in old_names
+        if name in shared_names
+        and (
+            old_by_name[name]["kind"] != new_by_name[name]["kind"]
+            or old_by_name[name]["required"] != new_by_name[name]["required"]
+        )
+    ]
+    return {
+        "added": [dict(item) for item in new_parameters if str(item["name"]) not in old_by_name],
+        "removed": [dict(item) for item in old_parameters if str(item["name"]) not in new_by_name],
+        "changed": changed,
+        "shared_order_changed": (
+            [name for name in old_names if name in shared_names] != [name for name in new_names if name in shared_names]
+        ),
+        "async_changed": old_signature[0] != new_signature[0],
+        "vararg_changed": old_signature[3] != new_signature[3],
+        "kwarg_changed": old_signature[5] != new_signature[5],
+    }
+
+
+def _signature_delta_changed(delta: dict[str, object] | None) -> bool:
+    if delta is None:
+        return False
+    return bool(
+        delta["added"]
+        or delta["removed"]
+        or delta["changed"]
+        or delta["shared_order_changed"]
+        or delta["async_changed"]
+        or delta["vararg_changed"]
+        or delta["kwarg_changed"]
+    )
+
+
+def _optional_only_signature_additions(delta: dict[str, object] | None) -> tuple[str, ...]:
+    if delta is None or not delta["added"]:
+        return ()
+    if (
+        delta["removed"]
+        or delta["changed"]
+        or delta["shared_order_changed"]
+        or delta["async_changed"]
+        or delta["vararg_changed"]
+        or delta["kwarg_changed"]
+    ):
+        return ()
+    added = delta["added"]
+    if not isinstance(added, list) or any(
+        item.get("required") is not False or item.get("kind") not in {"positional_or_keyword", "keyword_only"}
+        for item in added
+        if isinstance(item, dict)
+    ):
+        return ()
+    if any(not isinstance(item, dict) for item in added):
+        return ()
+    return tuple(str(item["name"]) for item in added)
 
 
 def _relation_symbol_presence(endpoint: SourceEndpoint) -> bool | None:
@@ -417,46 +572,100 @@ def _ambiguous_binding_changed(old: SourceEndpoint, new: SourceEndpoint) -> bool
 
 class GitSnapshot:
     def __init__(self, root: Path, revision: str):
-        self.root = root
+        self.root = root.resolve()
         self.revision = revision
+        self.cache_work_seconds = 0.0
+        self._lock = threading.RLock()
         self._files: set[str] | None = None
+        self._tree_entries: dict[str, tuple[str, str]] | None = None
         self._source: dict[str, str | None] = {}
         self._trees: dict[str, ast.Module | None] = {}
         self._bindings: dict[str, dict[str, str]] = {}
+        self._keyword_call_candidates: dict[
+            tuple[tuple[str, ...], str],
+            list[tuple[str, ast.Call, str | None, str]],
+        ] = {}
+        self._keyword_call_resolutions: dict[
+            tuple[tuple[str, ...], str, int, int],
+            _ResolvedCallBinding | None,
+        ] = {}
+
+    def __getstate__(self) -> dict[str, object]:
+        state = dict(self.__dict__)
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self.root = Path(self.root).resolve()
+        self._lock = threading.RLock()
 
     @property
     def files(self) -> set[str]:
-        if self._files is None:
-            output = _git(self.root, "ls-tree", "-r", "--name-only", self.revision)
-            self._files = {line.strip() for line in output.splitlines() if line.strip()}
-        return self._files
+        with self._lock:
+            if self._files is None:
+                started = time.perf_counter()
+                output = _git(self.root, "ls-tree", "-r", self.revision)
+                entries: dict[str, tuple[str, str]] = {}
+                for line in output.splitlines():
+                    metadata, separator, file_name = line.partition("\t")
+                    parts = metadata.split()
+                    if separator and len(parts) == 3:
+                        entries[file_name] = (parts[0], parts[2])
+                self._tree_entries = entries
+                self._files = set(entries)
+                self.cache_work_seconds += time.perf_counter() - started
+            return self._files
+
+    def _source_at(self, normalized: str, seen: frozenset[str]) -> str | None:
+        if normalized in self._source:
+            return self._source[normalized]
+        if normalized in seen or len(seen) >= 16 or normalized not in self.files:
+            self._source[normalized] = None
+            return None
+        assert self._tree_entries is not None
+        mode, _blob_sha = self._tree_entries[normalized]
+        raw = subprocess.run(
+            ["git", "-C", str(self.root), "show", f"{self.revision}:{normalized}"],
+            check=True,
+            capture_output=True,
+        ).stdout
+        decoded = raw.decode("utf-8", errors="replace")
+        if mode != "120000":
+            self._source[normalized] = decoded
+            return decoded
+        target = posixpath.normpath(posixpath.join(posixpath.dirname(normalized), decoded.strip()))
+        if posixpath.isabs(target) or target == ".." or target.startswith("../"):
+            self._source[normalized] = None
+            return None
+        resolved = self._source_at(target, seen | {normalized})
+        self._source[normalized] = resolved
+        return resolved
 
     def source(self, file_name: str) -> str | None:
         normalized = file_name.replace("\\", "/")
-        if normalized not in self._source:
-            if normalized not in self.files:
-                self._source[normalized] = None
-            else:
-                raw = subprocess.run(
-                    ["git", "-C", str(self.root), "show", f"{self.revision}:{normalized}"],
-                    check=True,
-                    capture_output=True,
-                ).stdout
-                self._source[normalized] = raw.decode("utf-8", errors="replace")
-        return self._source[normalized]
+        with self._lock:
+            if normalized not in self._source:
+                started = time.perf_counter()
+                self._source_at(normalized, frozenset())
+                self.cache_work_seconds += time.perf_counter() - started
+            return self._source[normalized]
 
     def tree(self, file_name: str) -> ast.Module | None:
         normalized = file_name.replace("\\", "/")
-        if normalized not in self._trees:
-            source = self.source(normalized)
-            if source is None:
-                self._trees[normalized] = None
-            else:
-                try:
-                    self._trees[normalized] = ast.parse(source, filename=normalized)
-                except SyntaxError:
+        with self._lock:
+            if normalized not in self._trees:
+                started = time.perf_counter()
+                source = self.source(normalized)
+                if source is None:
                     self._trees[normalized] = None
-        return self._trees[normalized]
+                else:
+                    try:
+                        self._trees[normalized] = ast.parse(source, filename=normalized)
+                    except SyntaxError:
+                        self._trees[normalized] = None
+                self.cache_work_seconds += time.perf_counter() - started
+            return self._trees[normalized]
 
     def resolve_module(self, module: str) -> str | None:
         return next((candidate for candidate in _module_file(module) if candidate in self.files), None)
@@ -633,6 +842,12 @@ class GitSnapshot:
         base = self._base_reference(resolved.file, class_node.bases[0])
         if base == "builtins.object":
             return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
+        if base in STDLIB_STRUCTURAL_BASES:
+            # The generator models these stdlib marker bases as structural
+            # MRO nodes with no interface members.  Mirror that exact model in
+            # snapshot lookup so an otherwise complete vLLM chain does not
+            # become unknown merely because it terminates at ``abc.ABC``.
+            return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
         if base is None or not base.startswith("vllm."):
             return _QualifiedBinding(
                 resolved.file,
@@ -689,6 +904,197 @@ class GitSnapshot:
             return f"{module}.{expression}"
 
         return resolve
+
+    @staticmethod
+    def _call_binding_key(
+        binding: _QualifiedBinding | None,
+    ) -> tuple[str, str | None, str] | None:
+        if binding is None or binding.status != "exact":
+            return None
+        if isinstance(binding.node, ast.ClassDef):
+            owner = ".".join(item for item in (binding.owner, binding.node.name) if item)
+            return binding.file, owner, "__init__"
+        if isinstance(binding.node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            return binding.file, binding.owner, binding.name
+        return None
+
+    def _call_binding(
+        self,
+        file_name: str,
+        node: ast.Call,
+        class_reference: str | None,
+    ) -> _ResolvedCallBinding | None:
+        function = node.func
+        if isinstance(function, ast.Attribute) and isinstance(function.value, ast.Name):
+            if function.value.id in {"self", "cls"} and class_reference is not None:
+                binding = self._effective_member(class_reference, function.attr)
+                return _ResolvedCallBinding(binding, "self_member", class_reference) if binding is not None else None
+        if (
+            isinstance(function, ast.Attribute)
+            and isinstance(function.value, ast.Call)
+            and isinstance(function.value.func, ast.Name)
+            and function.value.func.id == "super"
+            and not function.value.args
+            and not function.value.keywords
+            and class_reference is not None
+        ):
+            current = self._resolve_qualified_node(class_reference)
+            if (
+                current is None
+                or current.status != "exact"
+                or not isinstance(current.node, ast.ClassDef)
+                or len(current.node.bases) != 1
+            ):
+                return None
+            base = self._base_reference(current.file, current.node.bases[0])
+            if base is None or not base.startswith("vllm."):
+                return None
+            binding = self._effective_member(base, function.attr)
+            return _ResolvedCallBinding(binding, "super_member", class_reference) if binding is not None else None
+        expression = _expression_name(function)
+        if expression is None:
+            return None
+        target = self._return_resolver(file_name)(expression)
+        if target is None or not target.startswith("vllm."):
+            return None
+        binding = self._resolve_qualified_node(target)
+        if binding is None:
+            return None
+        return _ResolvedCallBinding(
+            binding,
+            "direct_constructor" if isinstance(binding.node, ast.ClassDef) else "direct_callable",
+        )
+
+    def _keyword_call_candidate_index(
+        self,
+        files: tuple[str, ...],
+        parameters: set[str],
+    ) -> dict[str, list[tuple[str, ast.Call, str | None, str]]]:
+        normalized_files = tuple(sorted(file_name.replace("\\", "/") for file_name in files))
+        index: dict[str, list[tuple[str, ast.Call, str | None, str]]] = {}
+
+        class KeywordCallVisitor(ast.NodeVisitor):
+            def __init__(
+                self,
+                file_name: str,
+                parameter: str,
+                candidates: list[tuple[str, ast.Call, str | None, str]],
+            ):
+                self.file_name = file_name
+                self.parameter = parameter
+                self.candidates = candidates
+                self.module, _ = _file_module(file_name)
+                self.class_path: list[str] = []
+                self.scope_path: list[str] = []
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                self.class_path.append(node.name)
+                self.scope_path.append(node.name)
+                self.generic_visit(node)
+                self.scope_path.pop()
+                self.class_path.pop()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.scope_path.append(node.name)
+                self.generic_visit(node)
+                self.scope_path.pop()
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                self.scope_path.append(node.name)
+                self.generic_visit(node)
+                self.scope_path.pop()
+
+            def visit_Call(self, node: ast.Call) -> None:
+                keywords = sorted(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+                if self.parameter in keywords:
+                    class_reference = ".".join((self.module, *self.class_path)) if self.class_path else None
+                    scope = ".".join((self.module, *self.scope_path))
+                    self.candidates.append((self.file_name, node, class_reference, scope))
+                self.generic_visit(node)
+
+        changed_file_set = set(normalized_files)
+        revision_prefix = f"{self.revision}:"
+        for parameter in sorted(parameters):
+            cache_key = (normalized_files, parameter)
+            if cache_key not in self._keyword_call_candidates:
+                grep_output = _git(
+                    self.root,
+                    "grep",
+                    "-l",
+                    "-F",
+                    "-e",
+                    parameter,
+                    self.revision,
+                    "--",
+                    ":(glob)**/*.py",
+                    check=False,
+                )
+                matched_files = {
+                    line.removeprefix(revision_prefix).replace("\\", "/")
+                    for line in grep_output.splitlines()
+                    if line.strip()
+                }
+                candidates: list[tuple[str, ast.Call, str | None, str]] = []
+                for file_name in sorted(matched_files & changed_file_set):
+                    if file_name not in self.files:
+                        continue
+                    tree = self.tree(file_name)
+                    if tree is not None:
+                        KeywordCallVisitor(file_name, parameter, candidates).visit(tree)
+                self._keyword_call_candidates[cache_key] = candidates
+            index[parameter] = self._keyword_call_candidates[cache_key]
+        return index
+
+    def exact_keyword_call_evidence(
+        self,
+        endpoint: SourceEndpoint,
+        parameter_names: Iterable[str],
+        changed_files: tuple[str, ...],
+    ) -> list[dict[str, object]]:
+        if endpoint.file is None or endpoint.owner is None or endpoint.name is None:
+            return []
+        expected = (endpoint.file.replace("\\", "/"), endpoint.owner, endpoint.name)
+        parameters = set(parameter_names)
+        evidence: list[dict[str, object]] = []
+        normalized_files = tuple(sorted(file_name.replace("\\", "/") for file_name in changed_files))
+        candidate_index = self._keyword_call_candidate_index(normalized_files, parameters)
+        candidates = {
+            (file_name, node.lineno, node.col_offset): (file_name, node, class_reference, scope)
+            for parameter in parameters
+            for file_name, node, class_reference, scope in candidate_index.get(parameter, [])
+        }
+        for candidate_key, (file_name, node, class_reference, scope) in sorted(candidates.items()):
+            cache_key = (normalized_files, *candidate_key)
+            if cache_key not in self._keyword_call_resolutions:
+                self._keyword_call_resolutions[cache_key] = self._call_binding(
+                    file_name,
+                    node,
+                    class_reference,
+                )
+            resolved_call = self._keyword_call_resolutions[cache_key]
+            if resolved_call is None:
+                continue
+            key = self._call_binding_key(resolved_call.binding)
+            if key != expected:
+                continue
+            keywords = sorted(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+            matched = sorted(parameters & set(keywords))
+            if not matched:
+                continue
+            evidence.append(
+                {
+                    "file": file_name,
+                    "line": node.lineno,
+                    "column": node.col_offset,
+                    "scope": scope,
+                    "target": ".".join(item for item in (key[1], key[2]) if item),
+                    "keywords": keywords,
+                    "matched_parameters": matched,
+                    "dispatch_kind": resolved_call.dispatch_kind,
+                    "receiver_class": resolved_call.receiver_class,
+                }
+            )
+        return evidence
 
     def endpoint(self, file_name: str, owner: str | None, name: str) -> SourceEndpoint:
         tree = self.tree(file_name)
@@ -889,7 +1295,7 @@ class GitSnapshot:
             descriptor=descriptor,
             access_kind=effective_access_kind,
         )
-        contract = infer_return_contract(node, resolver=self._return_resolver(file_name))
+        return_contract = infer_return_contract(node, resolver=self._return_resolver(file_name))
         return SourceEndpoint(
             file=file_name,
             owner=owner,
@@ -904,7 +1310,7 @@ class GitSnapshot:
                 invocation_kind,
             ),
             analysis_fingerprint=resolved.fingerprint,
-            return_contract=contract.as_dict() if contract is not None else None,
+            return_contract=return_contract.as_dict() if return_contract is not None else None,
         )
 
     def expression_endpoint(self, expression: str) -> SourceEndpoint | None:
@@ -978,6 +1384,20 @@ def _rename_maps(root: Path, old: str, new: str) -> tuple[dict[str, str], dict[s
             old_to_new[old_path] = new_path
             new_to_old[new_path] = old_path
     return old_to_new, new_to_old
+
+
+def _changed_python_files(root: Path, old: str, new: str) -> tuple[str, ...]:
+    output = _git(
+        root,
+        "diff",
+        "--name-only",
+        "--diff-filter=ACMRT",
+        old,
+        new,
+    )
+    return tuple(
+        sorted(line.strip().replace("\\", "/") for line in output.splitlines() if line.strip().endswith(".py"))
+    )
 
 
 def _state(
@@ -1154,24 +1574,38 @@ def _change_text(
 
 def _suggestion(relation: str, classification: str, old: SourceEndpoint, new: SourceEndpoint) -> str:
     if classification == "preexisting":
-        return "作为历史问题单独处理，不归因于本次上游升级。"
+        return "Track this as a preexisting issue; do not attribute it to this upstream upgrade."
     if classification == "fixed":
-        return "上游已经恢复兼容，确认下游兼容代码是否仍需保留。"
+        return "Upstream compatibility was restored; review whether the downstream compatibility code is still needed."
     if new.file is None:
-        return "更新下游依赖目标；若上游已删除该能力，需要移除 patch/继承并补充替代实现。"
+        return (
+            "Update the downstream target. If upstream removed the capability, remove the patch or inheritance edge "
+            "and add an alternative implementation."
+        )
     if old.name != new.name:
-        return f"把下游依赖从 {old.name} 更新到 {new.name}，并重新核对参数转发。"
+        return f"Update the downstream dependency from {old.name} to {new.name}, then recheck argument forwarding."
     if relation == "monkey_patch":
-        return "调整 replacement 签名，使其接受上游新调用方式，并确认 patch 安装路径仍生效。"
+        return (
+            "Update the replacement signature for the new upstream call contract and verify that the patch "
+            "installation path is still active."
+        )
     if relation == "override":
-        return "同步 override 参数并检查 super() 调用和关键字转发。"
+        return "Synchronize the override parameters and check super() calls and keyword forwarding."
     if relation == "inheritance":
-        return "核对新基类路径和 MRO；不要在继承链不完整时猜测替代类。"
+        return (
+            "Review the new base-class path and MRO; do not guess a replacement when the inheritance chain "
+            "is incomplete."
+        )
     if relation == "direct_import":
-        return "更新 import 模块或符号路径，并补充导入边界测试。"
+        return "Update the imported module or symbol path and add an import-boundary regression test."
     if relation == "direct_call":
-        return "同步下游调用参数或返回值消费方式，并为该调用点补充接口级回归测试。"
-    return "根据上下游精确契约差异调整依赖，并补充接口级回归测试。"
+        return (
+            "Update downstream arguments or return-value consumption and add an interface regression test "
+            "for this callsite."
+        )
+    return (
+        "Update the dependency for the exact upstream/downstream contract delta and add an interface regression test."
+    )
 
 
 def _finding_id(*parts: object) -> str:
@@ -1216,6 +1650,14 @@ def _relation_downstream_endpoint(
     node = callable_info.node if callable_info is not None else None
 
     def resolve(expression: str) -> str | None:
+        if (
+            expression in {"classmethod", "property", "staticmethod"}
+            and relation.installed_descriptor_kind == expression
+        ):
+            # Descriptor discovery has already proven this bare decorator is
+            # the corresponding builtin.  Preserve that proof for return
+            # inference instead of treating it as an unknown runtime transform.
+            return f"builtins.{expression}"
         return engine.downstream.resolve_reference(module, expression)
 
     return_contract = infer_return_contract(
@@ -1262,13 +1704,251 @@ def _finding_action(classification: str, gates: dict[str, bool]) -> str:
     return "dismiss" if classification in {"preexisting", "fixed"} else "review"
 
 
+def _override_details(relation: Relation) -> dict[str, Any]:
+    if relation.relation != "override" or not relation.override_paths:
+        return {}
+    paths = [list(path) for path in relation.override_paths]
+    return {
+        "override_paths": paths,
+        "override_depth": max(len(path) - 1 for path in relation.override_paths),
+        "impact_kind": (
+            "transitive_subclass_override"
+            if any(len(path) > 2 for path in relation.override_paths)
+            else "direct_override"
+        ),
+    }
+
+
+def _function_body_nodes(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
+    nodes: list[ast.AST] = []
+
+    class BodyVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is function:
+                for statement in node.body:
+                    self.visit(statement)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is function:
+                for statement in node.body:
+                    self.visit(statement)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+        def generic_visit(self, node: ast.AST) -> None:
+            nodes.append(node)
+            super().generic_visit(node)
+
+    BodyVisitor().visit(function)
+    return nodes
+
+
+def _resolved_local_expression(
+    expression: ast.AST,
+    bindings: dict[str, str],
+    *,
+    module: str,
+    module_symbols: set[str],
+) -> str | None:
+    raw = _expression_name(expression)
+    if raw is None:
+        return None
+    root, separator, remainder = raw.partition(".")
+    if root in bindings:
+        return f"{bindings[root]}.{remainder}" if separator else bindings[root]
+    if root in module_symbols:
+        return f"{module}.{raw}"
+    if raw.startswith(("vllm.", "vllm_ascend.")):
+        return raw
+    return None
+
+
+def _registered_oot_overrides(
+    engine: InterfaceBoundaryGenerator,
+) -> dict[tuple[str, str], list[dict[str, object]]]:
+    """Prove exact ``CustomOp.register_oot`` name-to-class registrations.
+
+    This is intentionally narrow.  A dict literal is accepted only when the
+    same function iterates that dict and forwards its key/value variables to
+    ``CustomOp.register_oot(name=..., _decorated_op_cls=...)``.
+    """
+
+    registrations: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for module_info in engine.downstream.modules.values():
+        module_symbols = {*module_info.classes, *module_info.functions}
+        for function in (
+            node for node in ast.walk(module_info.tree) if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        ):
+            body_nodes = _function_body_nodes(function)
+            local_bindings = dict(module_info.imports)
+            for node in body_nodes:
+                if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                    continue
+                for alias in node.names:
+                    local_name = alias.asname or (
+                        alias.name.split(".", 1)[0] if isinstance(node, ast.Import) else alias.name
+                    )
+                    target = _import_binding_reference(
+                        node,
+                        local_name,
+                        module=module_info.name,
+                        is_package=module_info.is_package,
+                    )
+                    if target is not None:
+                        local_bindings[local_name] = target
+
+            registered_dicts: set[str] = set()
+            registration_lines: dict[str, int] = {}
+            for node in body_nodes:
+                if not isinstance(node, ast.For):
+                    continue
+                if not (
+                    isinstance(node.target, (ast.List, ast.Tuple))
+                    and len(node.target.elts) == 2
+                    and all(isinstance(item, ast.Name) for item in node.target.elts)
+                    and isinstance(node.iter, ast.Call)
+                    and not node.iter.args
+                    and not node.iter.keywords
+                    and isinstance(node.iter.func, ast.Attribute)
+                    and node.iter.func.attr == "items"
+                    and isinstance(node.iter.func.value, ast.Name)
+                ):
+                    continue
+                key_target, value_target = node.target.elts
+                if not isinstance(key_target, ast.Name) or not isinstance(value_target, ast.Name):
+                    continue
+                key_name = key_target.id
+                value_name = value_target.id
+                registry_name = node.iter.func.value.id
+                for call in (
+                    child for statement in node.body for child in ast.walk(statement) if isinstance(child, ast.Call)
+                ):
+                    if not (
+                        isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "register_oot"
+                        and _resolved_local_expression(
+                            call.func.value,
+                            local_bindings,
+                            module=module_info.name,
+                            module_symbols=module_symbols,
+                        )
+                        == "vllm.model_executor.custom_op.CustomOp"
+                    ):
+                        continue
+                    keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg is not None}
+                    name_keyword = keywords.get("name")
+                    class_keyword = keywords.get("_decorated_op_cls")
+                    if (
+                        isinstance(name_keyword, ast.Name)
+                        and name_keyword.id == key_name
+                        and isinstance(class_keyword, ast.Name)
+                        and class_keyword.id == value_name
+                    ):
+                        registered_dicts.add(registry_name)
+                        registration_lines[registry_name] = call.lineno
+
+            if not registered_dicts:
+                continue
+            for node in body_nodes:
+                dictionary: ast.Dict | None = None
+                target_name: str | None = None
+                if (
+                    isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and isinstance(node.value, ast.Dict)
+                ):
+                    target_name = node.targets[0].id
+                    dictionary = node.value
+                elif (
+                    isinstance(node, ast.AnnAssign)
+                    and isinstance(node.target, ast.Name)
+                    and isinstance(node.value, ast.Dict)
+                ):
+                    target_name = node.target.id
+                    dictionary = node.value
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "update"
+                    and isinstance(node.func.value, ast.Name)
+                    and len(node.args) == 1
+                    and isinstance(node.args[0], ast.Dict)
+                    and not node.keywords
+                ):
+                    target_name = node.func.value.id
+                    dictionary = node.args[0]
+                if target_name not in registered_dicts or dictionary is None:
+                    continue
+                for key, value in zip(dictionary.keys, dictionary.values, strict=True):
+                    if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                        continue
+                    downstream_target = _resolved_local_expression(
+                        value,
+                        local_bindings,
+                        module=module_info.name,
+                        module_symbols=module_symbols,
+                    )
+                    if downstream_target is None:
+                        continue
+                    evidence = {
+                        "file": module_info.file,
+                        "line": getattr(value, "lineno", getattr(node, "lineno", 0)),
+                        "scope": f"{module_info.name}.{function.name}",
+                        "registry": target_name,
+                        "registration_line": registration_lines[target_name],
+                        "upstream_class_name": key.value,
+                        "downstream_target": downstream_target,
+                    }
+                    registrations.setdefault((key.value, downstream_target), []).append(evidence)
+    return registrations
+
+
+def _optional_override_dispatch_evidence(
+    relation: Relation,
+    endpoint: SourceEndpoint,
+    candidates: list[dict[str, object]],
+    registered_overrides: dict[tuple[str, str], list[dict[str, object]]],
+) -> list[dict[str, object]]:
+    """Keep only calls whose dispatch can reach this exact downstream override."""
+
+    if endpoint.file is None or endpoint.owner is None or endpoint.name is None:
+        return []
+    if endpoint.name != "__init__":
+        module, _ = _file_module(endpoint.file)
+        defining_class = f"{module}.{endpoint.owner}"
+        return [
+            item
+            for item in candidates
+            if item.get("dispatch_kind") == "self_member" and item.get("receiver_class") == defining_class
+        ]
+
+    downstream_module, _ = _file_module(relation.downstream_file)
+    downstream_target = ".".join(item for item in (downstream_module, relation.downstream_owner) if item)
+    registration_evidence = registered_overrides.get(
+        (endpoint.owner.rsplit(".", 1)[-1], downstream_target),
+        [],
+    )
+    if not registration_evidence:
+        return []
+    return [
+        {**item, "dispatch_proof": registration_evidence}
+        for item in candidates
+        if item.get("dispatch_kind") == "direct_constructor"
+    ]
+
+
 def _relation_findings(
     relation: Relation,
     engine: InterfaceBoundaryGenerator,
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
     new_to_old: dict[str, str],
+    changed_upstream_files: tuple[str, ...],
+    registered_overrides: dict[tuple[str, str], list[dict[str, object]]],
 ) -> list[RangeFinding]:
+    """Compare one verified replacement relation across the selected range."""
     old_endpoint, new_endpoint = _relation_endpoints(
         relation,
         old_snapshot,
@@ -1319,13 +1999,90 @@ def _relation_findings(
                 relation.relation in {"monkey_patch", "override"} and old_exists is False and new_exists is True
             ),
         )
+        parameter_delta = (
+            _signature_delta(old_endpoint.signature, new_endpoint.signature)
+            if old_endpoint.signature_status == "exact" and new_endpoint.signature_status == "exact"
+            else None
+        )
+        optional_parameters = (
+            _optional_only_signature_additions(parameter_delta)
+            if relation.relation == "override"
+            and classification == "introduced_break"
+            and old_state.compatible is True
+            and new_state.compatible is False
+            else ()
+        )
+        candidate_upstream_call_evidence = (
+            new_snapshot.exact_keyword_call_evidence(
+                new_endpoint,
+                optional_parameters,
+                changed_upstream_files,
+            )
+            if optional_parameters
+            else []
+        )
+        upstream_call_evidence = _optional_override_dispatch_evidence(
+            relation,
+            new_endpoint,
+            candidate_upstream_call_evidence,
+            registered_overrides,
+        )
+        optional_contract_review = bool(optional_parameters and not upstream_call_evidence)
+        masked_preexisting_delta = bool(
+            relation.relation == "override"
+            and classification == "preexisting"
+            and _signature_delta_changed(parameter_delta)
+        )
         gates = {
             "relationship_verified": True,
             "contract_changed": contract_changed,
             "runtime_reachable": True,
             "version_lane_matches": True,
         }
-        action = _finding_action(classification, gates)
+        action = (
+            "review" if optional_contract_review or masked_preexisting_delta else _finding_action(classification, gates)
+        )
+        if optional_contract_review:
+            suggestion = (
+                "Review whether the new optional parameter can reach this downstream override at runtime. "
+                "If it can, update the override signature and handle the new argument."
+            )
+        elif masked_preexisting_delta:
+            suggestion = (
+                "Upstream introduced another exact parameter delta while downstream was already incompatible at old. "
+                "Review this delta separately instead of treating it as a confirmed upgrade regression."
+            )
+        else:
+            suggestion = _suggestion(
+                relation.relation,
+                classification,
+                old_endpoint,
+                new_endpoint,
+            )
+        review_details: dict[str, object] = {}
+        if optional_parameters:
+            review_details.update(
+                {
+                    "optional_contract_only": True,
+                    "new_optional_parameters": list(optional_parameters),
+                    "upstream_call_evidence": upstream_call_evidence,
+                    "candidate_upstream_call_evidence": candidate_upstream_call_evidence,
+                    "actionability_reason": (
+                        "exact_upstream_call_and_dispatch_proof_pass_new_optional_parameter"
+                        if upstream_call_evidence
+                        else "strict_optional_contract_without_proven_downstream_dispatch"
+                    ),
+                    "parameter_delta": parameter_delta,
+                }
+            )
+        if masked_preexisting_delta:
+            review_details.update(
+                {
+                    "new_delta_on_preexisting_break": True,
+                    "actionability_reason": "new_delta_masked_by_preexisting_incompatibility",
+                    "parameter_delta": parameter_delta,
+                }
+            )
         findings.append(
             RangeFinding(
                 finding_id=_finding_id(
@@ -1355,12 +2112,14 @@ def _relation_findings(
                 ),
                 evidence=evidence,
                 gates=gates,
-                suggestion=_suggestion(relation.relation, classification, old_endpoint, new_endpoint),
+                suggestion=suggestion,
                 contract_kind=contract_kind,
                 direction="upstream_contract_to_downstream_implementation",
                 details={
                     "installed_signature": downstream.signature,
                     "installed_descriptor": downstream.descriptor,
+                    **review_details,
+                    **_override_details(relation),
                 },
             )
         )
@@ -1407,13 +2166,17 @@ def _relation_findings(
                 change=_change_text(old_endpoint, new_endpoint, "replacement_return"),
                 evidence=evidence,
                 gates=gates,
-                suggestion="同步 patch/override 的返回协议，使其满足上游新接口约定，并补充返回值回归测试。",
+                suggestion=(
+                    "Update the patch or override return protocol for the new upstream contract "
+                    "and add a return-value regression test."
+                ),
                 contract_kind="replacement_return",
                 direction="upstream_contract_to_downstream_implementation",
                 details={
                     "upstream_old_return": old_endpoint.return_contract,
                     "upstream_new_return": new_endpoint.return_contract,
                     "downstream_return": downstream.return_contract,
+                    **_override_details(relation),
                 },
             )
         )
@@ -1536,9 +2299,10 @@ def _import_findings(
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
     old_to_new: dict[str, str],
+    references: Iterable[ImportReference] | None = None,
 ) -> list[RangeFinding]:
     findings: list[RangeFinding] = []
-    for reference in discover_imports(ascend_root):
+    for reference in discover_imports(ascend_root) if references is None else references:
         old_file = old_snapshot.resolve_module(reference.module)
         new_file = new_snapshot.resolve_module(reference.module)
         # For ``import vllm; vllm.a.b.symbol`` resolve the longest module prefix.
@@ -1641,20 +2405,22 @@ def _direct_call_findings(
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
 ) -> tuple[list[RangeFinding], list[DirectCallDependency]]:
+    """Compare exact downstream call and return-use contracts at both SHAs."""
     findings: list[RangeFinding] = []
     exact_dependencies: list[DirectCallDependency] = []
     for dependency in dependencies:
+        endpoint_receiver = dependency.lookup_root or dependency.receiver_type
         old_endpoint = old_snapshot.call_endpoint(
             dependency.target,
             dependency.access_kind,
-            receiver_type=dependency.receiver_type,
+            receiver_type=endpoint_receiver,
             member=dependency.member,
             invocation_kind=dependency.invocation_kind,
         )
         new_endpoint = new_snapshot.call_endpoint(
             dependency.target,
             dependency.access_kind,
-            receiver_type=dependency.receiver_type,
+            receiver_type=endpoint_receiver,
             member=dependency.member,
             invocation_kind=dependency.invocation_kind,
         )
@@ -1732,6 +2498,8 @@ def _direct_call_findings(
                         "receiver_type": dependency.receiver_type,
                         "member": dependency.member,
                         "invocation_kind": dependency.invocation_kind,
+                        "lookup_root": dependency.lookup_root,
+                        "resolution_basis": dependency.resolution_basis,
                         "call_shape": dependency.call_shape.as_dict(),
                         "scope": dependency.scope,
                     },
@@ -1785,7 +2553,10 @@ def _direct_call_findings(
                 change=_change_text(old_endpoint, new_endpoint, "return_usage"),
                 evidence=[dependency.as_dict()],
                 gates=gates,
-                suggestion="同步下游对上游返回值的解包、下标或协议使用，并补充该调用点回归测试。",
+                suggestion=(
+                    "Update downstream unpacking, indexing, or protocol use for the upstream return value "
+                    "and add a callsite regression test."
+                ),
                 source="direct_call_detector",
                 contract_kind="return_usage",
                 direction="downstream_call_to_upstream",
@@ -1799,6 +2570,130 @@ def _direct_call_findings(
             )
         )
     return findings, exact_dependencies
+
+
+def _verified_historical_direct_calls(
+    candidates: Iterable[DirectCallDependency],
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+) -> list[DirectCallDependency]:
+    """Promote only old-proven/new-missing self or super call candidates.
+
+    The checked-out downstream tree proves the callsite and a complete new MRO
+    proves that the member is absent.  The range still needs old-side evidence
+    before this is a dependency: otherwise a dynamic downstream ``self.foo()``
+    could be mistaken for a deleted upstream method merely because it shares a
+    class with some vLLM base.
+    """
+
+    verified: list[DirectCallDependency] = []
+    for candidate in candidates:
+        if candidate.lookup_root is None or candidate.member is None:
+            continue
+        old_endpoint = old_snapshot.call_endpoint(
+            candidate.target,
+            candidate.access_kind,
+            receiver_type=candidate.lookup_root,
+            member=candidate.member,
+            invocation_kind=candidate.invocation_kind,
+        )
+        new_endpoint = new_snapshot.call_endpoint(
+            candidate.target,
+            candidate.access_kind,
+            receiver_type=candidate.lookup_root,
+            member=candidate.member,
+            invocation_kind=candidate.invocation_kind,
+        )
+        if old_endpoint.symbol_kind == "callable" and new_endpoint.symbol_kind == "missing":
+            verified.append(candidate)
+    return verified
+
+
+def _verified_historical_override_relations(
+    candidates: Iterable[HistoricalOverrideCandidate],
+    engine: InterfaceBoundaryGenerator,
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+    old_to_new: dict[str, str],
+) -> list[Relation]:
+    """Promote old-proven override targets that are absent from the new MRO."""
+
+    relations: list[Relation] = []
+    seen: set[tuple[str, str, str]] = set()
+    for candidate in candidates:
+        key = (
+            candidate.downstream_qualified_owner,
+            candidate.downstream_name,
+            candidate.lookup_root,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        target = f"{candidate.lookup_root}.{candidate.downstream_name}"
+        old_endpoint = old_snapshot.call_endpoint(
+            target,
+            "instance",
+            receiver_type=candidate.lookup_root,
+            member=candidate.downstream_name,
+        )
+        new_endpoint = new_snapshot.call_endpoint(
+            target,
+            "instance",
+            receiver_type=candidate.lookup_root,
+            member=candidate.downstream_name,
+        )
+        if (
+            old_endpoint.symbol_kind != "callable"
+            or old_endpoint.file is None
+            or old_endpoint.owner is None
+            or old_endpoint.name is None
+            or new_endpoint.symbol_kind != "missing"
+        ):
+            continue
+        downstream_name = f"{candidate.downstream_qualified_owner}.{candidate.downstream_name}"
+        downstream_callable = engine.downstream.find_callable(downstream_name)
+        if downstream_callable is None:
+            continue
+        downstream_descriptor = downstream_callable.descriptor_kind
+        downstream_contract = engine._signature_contract(
+            downstream_callable,
+            descriptor_kind=downstream_descriptor,
+        )
+        old_module, _ = _file_module(old_endpoint.file)
+        old_qualified_owner = ".".join(item for item in (old_module, old_endpoint.owner) if item)
+        old_qualified_name = f"{old_qualified_owner}.{old_endpoint.name}"
+        relations.append(
+            Relation(
+                relation="override",
+                upstream_file=old_to_new.get(old_endpoint.file, old_endpoint.file),
+                upstream_owner=old_endpoint.owner,
+                upstream_name=old_endpoint.name,
+                upstream_signature=old_endpoint.signature,
+                downstream_file=candidate.downstream_file,
+                downstream_owner=candidate.downstream_owner,
+                downstream_name=candidate.downstream_name,
+                downstream_signature=downstream_callable.signature,
+                evidence_file=candidate.downstream_file,
+                evidence_line=candidate.evidence_line,
+                evidence=(
+                    RelationEvidence(
+                        file=candidate.downstream_file,
+                        line=candidate.evidence_line,
+                        target_expression=old_qualified_name,
+                        installed_descriptor_kind=downstream_descriptor,
+                    ),
+                ),
+                upstream_descriptor_kind=old_endpoint.descriptor,
+                downstream_descriptor_kind=downstream_descriptor,
+                installed_descriptor_kind=downstream_descriptor,
+                downstream_property_accessors=downstream_callable.property_accessors,
+                installed_property_accessors=downstream_callable.property_accessors,
+                downstream_signature_contract=downstream_contract,
+                installed_signature_contract=downstream_contract,
+                override_paths=((downstream_name, old_qualified_name),),
+            )
+        )
+    return relations
 
 
 def validate_current_contracts(
@@ -1906,6 +2801,77 @@ def validate_current_contracts(
     return dependencies, ordered
 
 
+def _cache_bypass_event(component: str, commit_sha: str, reason: str) -> CacheResult:
+    return CacheResult(
+        component=component,
+        enabled=True,
+        status="bypassed",
+        commit_sha=commit_sha,
+        reason=reason,
+    )
+
+
+def _snapshot_cache_identity(
+    root: Path,
+    revision: str,
+) -> dict[str, object]:
+    return build_identity(
+        component="upstream_snapshot",
+        repo_root=root,
+        commit_sha=revision,
+        analyzer_version=RANGE_ANALYZER_VERSION,
+        component_schema=SNAPSHOT_CACHE_SCHEMA_VERSION,
+        config={
+            "known_transparent_decorators": sorted(_KNOWN_TRANSPARENT_SIGNATURE_DECORATORS),
+            "known_wrapped_decorators": sorted(_KNOWN_WRAPS_SIGNATURE_DECORATORS),
+        },
+    )
+
+
+def _load_snapshot(
+    cache: PersistentCache,
+    root: Path,
+    revision: str,
+    *,
+    cache_safe: bool,
+    unsafe_reason: str,
+) -> tuple[GitSnapshot, CacheResult]:
+    identity = _snapshot_cache_identity(root, revision)
+    if not cache_safe and cache.enabled:
+        result = _cache_bypass_event("upstream_snapshot", revision, unsafe_reason)
+        cache.events.append(result)
+        return GitSnapshot(root, revision), result
+    payload, result = cache.load(
+        "upstream_snapshot",
+        identity,
+        validator=lambda item: (
+            isinstance(item, GitSnapshot) and item.revision == revision and item.root == root.resolve()
+        ),
+    )
+    if isinstance(payload, GitSnapshot):
+        payload.cache_work_seconds = 0.0
+        return payload, result
+    return GitSnapshot(root, revision), result
+
+
+def _store_snapshot(
+    cache: PersistentCache,
+    snapshot: GitSnapshot,
+    result: CacheResult,
+    *,
+    cache_safe: bool,
+) -> None:
+    if not cache_safe or result.status == "hit":
+        return
+    cache.store(
+        "upstream_snapshot",
+        _snapshot_cache_identity(snapshot.root, snapshot.revision),
+        snapshot,
+        build_seconds=snapshot.cache_work_seconds,
+        result=result,
+    )
+
+
 def analyze_range(
     *,
     vllm_root: Path,
@@ -1917,11 +2883,22 @@ def analyze_range(
     external_shas: dict[str, str] | None = None,
     profile: str = "exact-contracts",
     scenario: str = MAIN2MAIN_SCENARIO,
+    analysis_workers: int = 3,
+    downstream_index_cache_dir: Path | None = None,
+    upstream_file_index_cache_dir: Path | None = None,
+    index_workers: int = 1,
+    cache_dir: Path | None = None,
+    cache_enabled: bool = True,
 ) -> dict[str, Any]:
+    """Run the selected source-analysis plan for an exact vLLM range."""
     analysis_started = time.perf_counter()
     phase_started = time.perf_counter()
     timings: dict[str, float | None] = {}
     plan = resolve_analysis_plan(scenario)
+    if analysis_workers < 1:
+        raise ValueError("analysis_workers must be at least 1")
+    if index_workers < 1:
+        raise ValueError("index_workers must be at least 1")
     if profile not in {"exact-contracts", "expanded"}:
         raise ValueError(f"unsupported profile: {profile}")
     if scenario != MAIN2MAIN_SCENARIO and profile != "exact-contracts":
@@ -1937,60 +2914,301 @@ def analyze_range(
         verify_head(f"external {package}", root, external_shas[package])
     phase_started = _diagnostic_timing("input_verification", phase_started, timings)
 
+    persistent_cache = PersistentCache(cache_dir, enabled=cache_enabled)
+    upstream_cache_safe, upstream_cache_reason = git_source_state(vllm_root, "vllm")
+    downstream_cache_safe, downstream_cache_reason = git_source_state(
+        ascend_root,
+        "vllm_ascend",
+    )
+    if not cache_enabled:
+        downstream_index_cache_dir = None
+        upstream_file_index_cache_dir = None
+    elif persistent_cache.enabled and persistent_cache.root is not None:
+        downstream_index_cache_dir = downstream_index_cache_dir or (
+            persistent_cache.root / "repository-index" / "downstream"
+        )
+        upstream_file_index_cache_dir = upstream_file_index_cache_dir or (
+            persistent_cache.root / "repository-index" / "upstream-fragments"
+        )
+
     generator = InterfaceBoundaryGenerator(
         vllm_root,
         ascend_root,
         external_roots,
         source_versions={"vllm": new_sha, "vllm_ascend": ascend_sha, **external_shas},
+        downstream_index_cache_dir=downstream_index_cache_dir,
+        upstream_file_index_cache_dir=upstream_file_index_cache_dir,
+        index_workers=index_workers,
     )
     phase_started = _diagnostic_timing("repository_indexing", phase_started, timings)
-    relations, generator_findings = generator.generate(plan)
+    timings.update(
+        {f"repository_indexing.{name}": duration for name, duration in generator.repository_index_timings.items()}
+    )
+    relation_identity = build_identity(
+        component="downstream_relations",
+        repo_root=ascend_root,
+        commit_sha=ascend_sha,
+        analyzer_version=GENERATOR_VERSION,
+        component_schema=RELATION_CACHE_SCHEMA_VERSION,
+        config={
+            "analysis_plan": plan.as_dict(),
+            "vllm_repo_root": normalized_repo_path(vllm_root),
+            "vllm_new_sha": new_sha,
+            "external_roots": {package: normalized_repo_path(root) for package, root in sorted(external_roots.items())},
+            "external_shas": dict(sorted(external_shas.items())),
+        },
+    )
+    relation_cache_safe = upstream_cache_safe and downstream_cache_safe
+    if relation_cache_safe or not persistent_cache.enabled:
+        relation_payload, relation_cache_result = persistent_cache.load(
+            "downstream_relations",
+            relation_identity,
+            validator=lambda item: (
+                isinstance(item, dict)
+                and isinstance(item.get("relations"), list)
+                and isinstance(item.get("findings"), list)
+                and isinstance(item.get("historical_override_candidates"), list)
+            ),
+        )
+    else:
+        relation_payload = None
+        relation_cache_result = _cache_bypass_event(
+            "downstream_relations",
+            ascend_sha,
+            f"upstream: {upstream_cache_reason}; downstream: {downstream_cache_reason}",
+        )
+        persistent_cache.events.append(relation_cache_result)
+    if isinstance(relation_payload, dict):
+        relations = relation_payload["relations"]
+        generator_findings = relation_payload["findings"]
+        generator.historical_override_candidates = relation_payload["historical_override_candidates"]
+        cached_phase_timings = relation_payload.get("phase_timings")
+        if isinstance(cached_phase_timings, dict):
+            generator.phase_timings = cached_phase_timings
+    else:
+        relation_started = time.perf_counter()
+        relations, generator_findings = generator.generate(plan)
+        relation_build_seconds = time.perf_counter() - relation_started
+        if relation_cache_safe:
+            persistent_cache.store(
+                "downstream_relations",
+                relation_identity,
+                {
+                    "relations": relations,
+                    "findings": generator_findings,
+                    "historical_override_candidates": generator.historical_override_candidates,
+                    "phase_timings": generator.phase_timings,
+                },
+                build_seconds=relation_build_seconds,
+                result=relation_cache_result,
+            )
     timings.update({f"relation_generation.{name}": duration for name, duration in generator.phase_timings.items()})
     phase_started = time.perf_counter()
-    old_snapshot = GitSnapshot(vllm_root, old_sha)
-    new_snapshot = GitSnapshot(vllm_root, new_sha)
+    old_snapshot, old_snapshot_cache = _load_snapshot(
+        persistent_cache,
+        vllm_root,
+        old_sha,
+        cache_safe=upstream_cache_safe,
+        unsafe_reason=upstream_cache_reason,
+    )
+    new_snapshot, new_snapshot_cache = _load_snapshot(
+        persistent_cache,
+        vllm_root,
+        new_sha,
+        cache_safe=upstream_cache_safe,
+        unsafe_reason=upstream_cache_reason,
+    )
     old_to_new, new_to_old = _rename_maps(vllm_root, old_sha, new_sha)
-
-    findings = [
-        finding
-        for relation in relations
-        if relation.upstream_package == "vllm" and relation.relation in plan.relation_types
-        for finding in _relation_findings(
-            relation,
+    changed_upstream_files = _changed_python_files(vllm_root, old_sha, new_sha)
+    registered_overrides = _registered_oot_overrides(generator)
+    relations.extend(
+        _verified_historical_override_relations(
+            generator.historical_override_candidates,
             generator,
             old_snapshot,
             new_snapshot,
-            new_to_old,
+            old_to_new,
         )
-    ]
-    phase_started = _diagnostic_timing("relation_comparison", phase_started, timings)
-    if plan.analyze_direct_imports:
-        import_started = time.perf_counter()
-        findings.extend(_import_findings(ascend_root, old_snapshot, new_snapshot, old_to_new))
-        _diagnostic_timing("direct_import_analysis", import_started, timings)
-    else:
-        timings["direct_import_analysis"] = None
+    )
 
-    direct_call_dependencies: list[DirectCallDependency] = []
-    if plan.analyze_direct_calls:
-        direct_started = time.perf_counter()
-        discovered_direct_calls = DirectCallDetector(generator).discover()
-        comparison_started = _diagnostic_timing(
-            "direct_call_discovery",
-            direct_started,
-            timings,
+    import_identity = build_identity(
+        component="downstream_direct_imports",
+        repo_root=ascend_root,
+        commit_sha=ascend_sha,
+        analyzer_version=RANGE_ANALYZER_VERSION,
+        component_schema=DIRECT_IMPORT_CACHE_SCHEMA_VERSION,
+        config={"analysis_plan": plan.as_dict()},
+    )
+    direct_call_identity = build_identity(
+        component="downstream_direct_calls",
+        repo_root=ascend_root,
+        commit_sha=ascend_sha,
+        analyzer_version=f"{GENERATOR_VERSION}/{RANGE_ANALYZER_VERSION}",
+        component_schema=DIRECT_CALL_CACHE_SCHEMA_VERSION,
+        config={
+            "analysis_plan": plan.as_dict(),
+            "vllm_repo_root": normalized_repo_path(vllm_root),
+            "vllm_new_sha": new_sha,
+        },
+    )
+
+    def analyze_relations() -> tuple[list[RangeFinding], float]:
+        started = time.perf_counter()
+        branch_findings = [
+            finding
+            for relation in relations
+            if relation.upstream_package == "vllm" and relation.relation in plan.relation_types
+            for finding in _relation_findings(
+                relation,
+                generator,
+                old_snapshot,
+                new_snapshot,
+                new_to_old,
+                changed_upstream_files,
+                registered_overrides,
+            )
+        ]
+        return branch_findings, time.perf_counter() - started
+
+    def analyze_imports() -> tuple[list[RangeFinding], float]:
+        started = time.perf_counter()
+        if downstream_cache_safe or not persistent_cache.enabled:
+            cached_imports, import_cache_result = persistent_cache.load(
+                "downstream_direct_imports",
+                import_identity,
+                validator=lambda item: (
+                    isinstance(item, list) and all(isinstance(reference, ImportReference) for reference in item)
+                ),
+            )
+        else:
+            cached_imports = None
+            import_cache_result = _cache_bypass_event(
+                "downstream_direct_imports",
+                ascend_sha,
+                downstream_cache_reason,
+            )
+            persistent_cache.events.append(import_cache_result)
+        if isinstance(cached_imports, list):
+            import_references = cached_imports
+        else:
+            discovery_started = time.perf_counter()
+            import_references = discover_imports(ascend_root)
+            discovery_seconds = time.perf_counter() - discovery_started
+            if downstream_cache_safe:
+                persistent_cache.store(
+                    "downstream_direct_imports",
+                    import_identity,
+                    import_references,
+                    build_seconds=discovery_seconds,
+                    result=import_cache_result,
+                )
+        branch_findings = _import_findings(
+            ascend_root,
+            old_snapshot,
+            new_snapshot,
+            old_to_new,
+            import_references,
         )
-        direct_call_findings, direct_call_dependencies = _direct_call_findings(
+        return branch_findings, time.perf_counter() - started
+
+    def analyze_direct_calls() -> tuple[
+        list[RangeFinding],
+        list[DirectCallDependency],
+        float,
+        float,
+    ]:
+        discovery_started = time.perf_counter()
+        if relation_cache_safe or not persistent_cache.enabled:
+            cached_calls, direct_call_cache_result = persistent_cache.load(
+                "downstream_direct_calls",
+                direct_call_identity,
+                validator=lambda item: (
+                    isinstance(item, dict)
+                    and isinstance(item.get("dependencies"), list)
+                    and all(isinstance(dependency, DirectCallDependency) for dependency in item.get("dependencies", []))
+                    and isinstance(item.get("historical_candidates"), list)
+                ),
+            )
+        else:
+            cached_calls = None
+            direct_call_cache_result = _cache_bypass_event(
+                "downstream_direct_calls",
+                ascend_sha,
+                f"upstream: {upstream_cache_reason}; downstream: {downstream_cache_reason}",
+            )
+            persistent_cache.events.append(direct_call_cache_result)
+        if isinstance(cached_calls, dict):
+            discovered_direct_calls = cached_calls["dependencies"]
+            historical_candidates = cached_calls["historical_candidates"]
+        else:
+            direct_call_detector = DirectCallDetector(generator)
+            discovered_direct_calls = direct_call_detector.discover()
+            historical_candidates = direct_call_detector.historical_candidates
+            if relation_cache_safe:
+                persistent_cache.store(
+                    "downstream_direct_calls",
+                    direct_call_identity,
+                    {
+                        "dependencies": discovered_direct_calls,
+                        "historical_candidates": historical_candidates,
+                    },
+                    build_seconds=time.perf_counter() - discovery_started,
+                    result=direct_call_cache_result,
+                )
+        discovered_direct_calls.extend(
+            _verified_historical_direct_calls(
+                historical_candidates,
+                old_snapshot,
+                new_snapshot,
+            )
+        )
+        discovery_elapsed = time.perf_counter() - discovery_started
+        comparison_started = time.perf_counter()
+        branch_findings, dependencies = _direct_call_findings(
             discovered_direct_calls,
             old_snapshot,
             new_snapshot,
         )
-        findings.extend(direct_call_findings)
-        _diagnostic_timing(
-            "direct_call_comparison",
-            comparison_started,
-            timings,
+        return (
+            branch_findings,
+            dependencies,
+            discovery_elapsed,
+            time.perf_counter() - comparison_started,
         )
+
+    branch_count = 1 + int(plan.analyze_direct_imports) + int(plan.analyze_direct_calls)
+    effective_workers = min(analysis_workers, branch_count)
+    if effective_workers > 1:
+        with ThreadPoolExecutor(
+            max_workers=effective_workers,
+            thread_name_prefix="vllm-interface",
+        ) as executor:
+            relation_future = executor.submit(analyze_relations)
+            import_future = executor.submit(analyze_imports) if plan.analyze_direct_imports else None
+            direct_call_future = executor.submit(analyze_direct_calls) if plan.analyze_direct_calls else None
+            relation_result = relation_future.result()
+            import_result = import_future.result() if import_future is not None else None
+            direct_call_result = direct_call_future.result() if direct_call_future is not None else None
+    else:
+        relation_result = analyze_relations()
+        import_result = analyze_imports() if plan.analyze_direct_imports else None
+        direct_call_result = analyze_direct_calls() if plan.analyze_direct_calls else None
+
+    findings, relation_elapsed = relation_result
+    _record_diagnostic_timing("relation_comparison", relation_elapsed, timings)
+    if import_result is not None:
+        import_findings, import_elapsed = import_result
+        findings.extend(import_findings)
+        _record_diagnostic_timing("direct_import_analysis", import_elapsed, timings)
+    else:
+        timings["direct_import_analysis"] = None
+
+    direct_call_dependencies: list[DirectCallDependency] = []
+    if direct_call_result is not None:
+        direct_call_findings, direct_call_dependencies, discovery_elapsed, comparison_elapsed = direct_call_result
+        findings.extend(direct_call_findings)
+        _record_diagnostic_timing("direct_call_discovery", discovery_elapsed, timings)
+        _record_diagnostic_timing("direct_call_comparison", comparison_elapsed, timings)
     else:
         timings["direct_call_discovery"] = None
         timings["direct_call_comparison"] = None
@@ -2062,7 +3280,10 @@ def analyze_range(
                         new_endpoint,
                     )
                     if verified_removal
-                    else "静态证据不足，先人工确认目标绑定或补充分析规则，不要直接修改下游代码。"
+                    else (
+                        "Static evidence is insufficient. Confirm the target binding or extend the analysis rule "
+                        "before changing downstream code."
+                    )
                 ),
                 source="generator_finding",
                 contract_kind="target_presence" if verified_removal else "analysis_evidence",
@@ -2091,12 +3312,67 @@ def analyze_range(
         ),
     )
     counts = Counter(item.classification for item in ordered)
+    action_counts = Counter(item.action for item in ordered)
     relation_counts = Counter(item.relation for item in ordered)
     contract_counts = Counter(item.contract_kind for item in ordered)
     analyzed_relation_count = sum(
         relation.upstream_package == "vllm" and relation.relation in plan.relation_types for relation in relations
     )
+    _store_snapshot(
+        persistent_cache,
+        old_snapshot,
+        old_snapshot_cache,
+        cache_safe=upstream_cache_safe,
+    )
+    _store_snapshot(
+        persistent_cache,
+        new_snapshot,
+        new_snapshot_cache,
+        cache_safe=upstream_cache_safe,
+    )
+    ordered_cache_events = sorted(
+        persistent_cache.events,
+        key=lambda event: (event.component, event.commit_sha or "", event.key or ""),
+    )
+    cache_events = [event.as_dict() for event in ordered_cache_events]
+    cache_saved_seconds = round(sum(event.saved_seconds for event in ordered_cache_events), 6)
+    timings["cache_estimated_saved"] = cache_saved_seconds
     timings["total"] = round(time.perf_counter() - analysis_started, 6)
+
+    def timing_value(name: str) -> float:
+        value = timings.get(name)
+        return float(value) if isinstance(value, (float, int)) else 0.0
+
+    relation_cache_hit = relation_cache_result.status == "hit"
+    stage_timings = {
+        "downstream_scanning_parsing": timing_value("repository_indexing.downstream"),
+        "downstream_relation_generation": round(
+            relation_cache_result.load_seconds
+            if relation_cache_hit
+            else timing_value("relation_generation.inheritance_mro") + timing_value("relation_generation.override"),
+            6,
+        ),
+        "monkey_patch_generation": round(
+            0.0 if relation_cache_hit else timing_value("relation_generation.monkey_patch"),
+            6,
+        ),
+        "upstream_old_new_snapshot_index": round(
+            old_snapshot_cache.load_seconds
+            + new_snapshot_cache.load_seconds
+            + old_snapshot.cache_work_seconds
+            + new_snapshot.cache_work_seconds,
+            6,
+        ),
+        "contract_comparison": round(
+            timing_value("relation_comparison")
+            + timing_value("direct_import_analysis")
+            + timing_value("direct_call_comparison")
+            + timing_value("generator_finding_conversion"),
+            6,
+        ),
+        "report_generation": None,
+        "total": timings["total"],
+    }
     return {
         "schema_version": RANGE_SCHEMA_VERSION,
         "metadata": {
@@ -2109,6 +3385,26 @@ def analyze_range(
             "vllm_new_sha": new_sha,
             "vllm_ascend_sha": ascend_sha,
             "external_sources": dict(sorted(external_shas.items())),
+            "execution": {
+                "analysis_workers_requested": analysis_workers,
+                "analysis_workers_used": effective_workers,
+                "parallel_branches": effective_workers > 1,
+                "branches": [
+                    "relation_comparison",
+                    *(["direct_import_analysis"] if plan.analyze_direct_imports else []),
+                    *(["direct_call_analysis"] if plan.analyze_direct_calls else []),
+                ],
+            },
+            "repository_index_cache": generator.repository_index_cache,
+            "persistent_cache": {
+                "enabled": persistent_cache.enabled,
+                "root": str(persistent_cache.root) if persistent_cache.root is not None else None,
+                "upstream_source_state": upstream_cache_reason,
+                "downstream_source_state": downstream_cache_reason,
+                "estimated_saved_seconds": cache_saved_seconds,
+                "events": cache_events,
+            },
+            "stage_timings_seconds": stage_timings,
             "timings_seconds": timings,
         },
         "summary": {
@@ -2119,6 +3415,10 @@ def analyze_range(
             "total": len(ordered),
             "by_relation": dict(sorted(relation_counts.items())),
             "by_contract": dict(sorted(contract_counts.items())),
+            "actionable_introduced_break": sum(
+                item.classification == "introduced_break" and item.action == "modify" for item in ordered
+            ),
+            "by_action": dict(sorted(action_counts.items())),
             **{name: counts[name] for name in CLASSIFICATIONS},
         },
         "findings": [item.as_dict() for item in ordered],
@@ -2150,6 +3450,7 @@ def _csv_rows(findings: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
             "suggestion": item["suggestion"],
             "call_shape": json.dumps(item.get("details", {}).get("call_shape"), ensure_ascii=False),
             "return_use": json.dumps(item.get("details", {}).get("return_use"), ensure_ascii=False),
+            "override_paths": json.dumps(item.get("details", {}).get("override_paths"), ensure_ascii=False),
             "upstream_old_return": json.dumps(old.get("return_contract"), ensure_ascii=False),
             "upstream_new_return": json.dumps(new.get("return_contract"), ensure_ascii=False),
             "downstream_return": json.dumps(downstream.get("return_contract"), ensure_ascii=False),
@@ -2174,6 +3475,7 @@ CSV_FIELDS = [
     "suggestion",
     "call_shape",
     "return_use",
+    "override_paths",
     "upstream_old_return",
     "upstream_new_return",
     "downstream_return",
@@ -2192,49 +3494,90 @@ def _markdown(report: dict[str, Any]) -> str:
     meta = report["metadata"]
     summary = report["summary"]
     lines = [
-        "# vLLM main2main 接口兼容报告",
+        "# vLLM main2main Interface Compatibility Report",
         "",
-        f"- vLLM 区间：`{meta['vllm_old_sha']}` → `{meta['vllm_new_sha']}`",
-        f"- vllm-ascend 基线：`{meta['vllm_ascend_sha']}`",
-        f"- 本次升级引入：{summary['introduced_break']}",
-        f"- 兼容性提醒：{summary['compatibility_warning']}",
-        f"- 历史问题：{summary['preexisting']}",
-        f"- 无法静态确认：{summary['analysis_unresolved']}",
+        f"- vLLM range: `{meta['vllm_old_sha']}` → `{meta['vllm_new_sha']}`",
+        f"- vllm-ascend baseline: `{meta['vllm_ascend_sha']}`",
+        f"- Required downstream changes: {summary['actionable_introduced_break']}",
+        f"- Strict contract incompatibilities, including review items: {summary['introduced_break']}",
+        f"- Compatibility warnings: {summary['compatibility_warning']}",
+        f"- Preexisting issues: {summary['preexisting']}",
+        f"- Statically unresolved: {summary['analysis_unresolved']}",
         "",
-        "## 本次升级需要处理",
+        "## Required Upgrade Work",
         "",
     ]
-    introduced = [item for item in report["findings"] if item["classification"] == "introduced_break"]
+    introduced = [
+        item
+        for item in report["findings"]
+        if item["classification"] == "introduced_break" and item["action"] == "modify"
+    ]
     if not introduced:
-        lines.append("没有发现能够确认由本次区间引入的接口 break。")
+        lines.append("No interface break was proven to be introduced by this range.")
     for item in introduced:
         downstream = item["downstream"]
         contract_labels = {
-            "call_arguments": "调用参数",
-            "call_target_presence": "调用目标",
-            "return_usage": "返回值消费",
-            "replacement_return": "替代实现返回协议",
-            "symbol_presence": "导入符号",
-            "target_presence": "上游目标",
-            "base_presence": "继承目标",
+            "call_arguments": "call arguments",
+            "call_target_presence": "call target",
+            "return_usage": "return-value use",
+            "replacement_return": "replacement return protocol",
+            "symbol_presence": "imported symbol",
+            "target_presence": "upstream target",
+            "base_presence": "base class",
         }
-        contract_label = contract_labels.get(item.get("contract_kind"), item.get("contract_kind", "接口契约"))
+        contract_label = contract_labels.get(item.get("contract_kind"), item.get("contract_kind", "interface contract"))
         lines.extend(
             [
-                f"### {item['relation']} / {contract_label}：{downstream['file']}:{downstream['line'] or ''}",
+                f"### {item['relation']} / {contract_label}: {downstream['file']}:{downstream['line'] or ''}",
                 "",
-                f"- 变化：{item['change']}",
-                f"- 下游接口：`{downstream['owner'] or ''}.{downstream['name'] or ''}`",
-                f"- 建议：{item['suggestion']}",
+                f"- Change: {item['change']}",
+                f"- Downstream interface: `{downstream['owner'] or ''}.{downstream['name'] or ''}`",
+                f"- Suggested action: {item['suggestion']}",
+                "",
+            ]
+        )
+    reviews = [
+        item
+        for item in report["findings"]
+        if item["action"] == "review"
+        and (
+            item.get("details", {}).get("optional_contract_only")
+            or item.get("details", {}).get("new_delta_on_preexisting_break")
+        )
+    ]
+    lines.extend(["## Manual Review", ""])
+    if not reviews:
+        lines.append("No optional-contract delta or masked preexisting incompatibility was proven.")
+    for item in reviews:
+        details = item.get("details", {})
+        downstream = item["downstream"]
+        if details.get("optional_contract_only"):
+            optional_parameters = details.get("new_optional_parameters") or []
+            parameter_names = ", ".join(f"`{name}`" for name in optional_parameters)
+            parameter_label = "parameter" if len(optional_parameters) == 1 else "parameters"
+            parameter_reference = "that parameter" if len(optional_parameters) == 1 else "those parameters"
+            reason = (
+                f"The downstream override does not accept the new optional {parameter_label} {parameter_names}, "
+                f"and no evidence proves that runtime dispatch passes {parameter_reference} to this implementation."
+            )
+        else:
+            reason = "Downstream was already incompatible at old, but this range adds another exact parameter delta."
+        lines.extend(
+            [
+                f"### {item['relation']} / review: {downstream['file']}:{downstream['line'] or ''}",
+                "",
+                f"- Reason: {reason}",
+                f"- Suggested action: {item['suggestion']}",
                 "",
             ]
         )
     lines.extend(
         [
-            "## 说明",
+            "## Notes",
             "",
-            "`preexisting` 表示 old 和 new 都不兼容，不归因于这次升级；"
-            "`analysis_unresolved` 表示证据不足，脚本没有猜测。",
+            "`preexisting` means old and new are both incompatible and is not attributed to this upgrade. "
+            "`analysis_unresolved` means the available static evidence was insufficient and the analyzer did not "
+            "guess.",
             "",
         ]
     )
@@ -2248,6 +3591,19 @@ def _upstream_pr_findings(report: dict[str, Any]) -> list[dict[str, Any]]:
         if item["classification"] == "introduced_break"
         and item["action"] == "modify"
         and item["relation"] in {"override", "direct_call", "direct_import"}
+    ]
+
+
+def _upstream_pr_review_findings(report: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in report["findings"]
+        if item["action"] == "review"
+        and item["relation"] in {"override", "direct_call", "direct_import"}
+        and (
+            item.get("details", {}).get("optional_contract_only")
+            or item.get("details", {}).get("new_delta_on_preexisting_break")
+        )
     ]
 
 
@@ -2271,26 +3627,82 @@ def _root_cause_key(item: dict[str, Any]) -> tuple[object, ...]:
 
 def _upstream_pr_payload(report: dict[str, Any]) -> dict[str, Any]:
     findings = _upstream_pr_findings(report)
+    review_findings = _upstream_pr_review_findings(report)
     relation_counts = Counter(item["relation"] for item in findings)
     contract_counts = Counter(item.get("contract_kind", "") for item in findings)
+    review_reason_counts = Counter(item.get("details", {}).get("actionability_reason", "") for item in review_findings)
     return {
         "schema_version": report["schema_version"],
         "metadata": report["metadata"],
         "summary": {
             "introduced_breaks": len(findings),
             "root_causes": len({_root_cause_key(item) for item in findings}),
+            "review_findings": len(review_findings),
+            "review_root_causes": len({_root_cause_key(item) for item in review_findings}),
             "by_relation": dict(sorted(relation_counts.items())),
             "by_contract": dict(sorted(contract_counts.items())),
+            "review_by_reason": dict(sorted(review_reason_counts.items())),
         },
         "findings": findings,
+        "review_findings": review_findings,
     }
+
+
+def _upstream_pr_finding_lines(
+    item: dict[str, Any],
+    index: int,
+    *,
+    review: bool,
+) -> list[str]:
+    details = item.get("details", {})
+    upstream = details.get("root_upstream") or item["upstream"]["new"]
+    if not upstream.get("file"):
+        upstream = item["upstream"]["old"]
+    downstream = item["downstream"]
+    override_paths = details.get("override_paths") or []
+    path_lines = [f"- Override path: `{' -> '.join(path)}`" for path in override_paths if len(path) > 2]
+    call_lines = [
+        "- Upstream call evidence: "
+        f"`{evidence['file']}:{evidence['line']}` passes "
+        f"`{', '.join(evidence['matched_parameters'])}`"
+        for evidence in details.get("upstream_call_evidence", [])
+    ]
+    upstream_name = ".".join(value for value in (upstream.get("owner"), upstream.get("name")) if value)
+    reason_lines: list[str] = []
+    if review:
+        if details.get("optional_contract_only"):
+            optional_parameters = details.get("new_optional_parameters") or []
+            parameter_names = ", ".join(f"`{name}`" for name in optional_parameters)
+            parameter_label = "parameter" if len(optional_parameters) == 1 else "parameters"
+            parameter_reference = "it" if len(optional_parameters) == 1 else "them"
+            reason = (
+                f"The downstream override does not accept the new optional {parameter_label} {parameter_names}, "
+                f"and the analyzer found no upstream call in this range that passes {parameter_reference} "
+                "to that override."
+            )
+        else:
+            reason = "new exact delta masked by a preexisting incompatibility"
+        reason_lines.append(f"- Review reason: {reason}")
+    return [
+        f"### {index}. {item['priority']} {item['relation']} / {item.get('contract_kind', '')}",
+        "",
+        f"- Upstream: `{upstream.get('file') or ''}:{upstream_name}`",
+        f"- Downstream: `{downstream.get('file') or ''}:{downstream.get('line') or ''}`",
+        *path_lines,
+        *call_lines,
+        *reason_lines,
+        f"- Change: {item['change']}",
+        f"- Suggested action: {item['suggestion']}",
+        "",
+    ]
 
 
 def _upstream_pr_markdown(payload: dict[str, Any]) -> str:
     meta = payload["metadata"]
     summary = payload["summary"]
     findings = payload["findings"]
-    result = "PASS" if not findings else "BREAKS FOUND"
+    review_findings = payload["review_findings"]
+    result = "BREAKS FOUND" if findings else "REVIEW" if review_findings else "PASS"
     lines = [
         "# vLLM Interface Compatibility",
         "",
@@ -2301,8 +3713,11 @@ def _upstream_pr_markdown(payload: dict[str, Any]) -> str:
         "- Scope: downstream imports, overrides, and direct upstream-call contracts",
         "- Monkey patches, inheritance-only findings, generator reviews, "
         "and historical incompatibilities are intentionally excluded.",
+        "- Exact new deltas masked by historical incompatibilities are retained as review input.",
         f"- Introduced breaks: {summary['introduced_breaks']}",
         f"- Root causes: {summary['root_causes']}",
+        f"- Review findings: {summary['review_findings']}",
+        f"- Review root causes: {summary['review_root_causes']}",
         "",
         "## Introduced breaks",
         "",
@@ -2310,22 +3725,12 @@ def _upstream_pr_markdown(payload: dict[str, Any]) -> str:
     if not findings:
         lines.append("No new downstream interface break was introduced by this range.")
     for index, item in enumerate(findings, start=1):
-        upstream = item.get("details", {}).get("root_upstream") or item["upstream"]["new"]
-        if not upstream.get("file"):
-            upstream = item["upstream"]["old"]
-        downstream = item["downstream"]
-        upstream_name = ".".join(value for value in (upstream.get("owner"), upstream.get("name")) if value)
-        lines.extend(
-            [
-                f"### {index}. {item['priority']} {item['relation']} / {item.get('contract_kind', '')}",
-                "",
-                f"- Upstream: `{upstream.get('file') or ''}:{upstream_name}`",
-                f"- Downstream: `{downstream.get('file') or ''}:{downstream.get('line') or ''}`",
-                f"- Change: {item['change']}",
-                f"- Suggested action: {item['suggestion']}",
-                "",
-            ]
-        )
+        lines.extend(_upstream_pr_finding_lines(item, index, review=False))
+    lines.extend(["## Review findings", ""])
+    if not review_findings:
+        lines.append("No exact optional-contract or masked-delta review was found.")
+    for index, item in enumerate(review_findings, start=1):
+        lines.extend(_upstream_pr_finding_lines(item, index, review=True))
     return "\n".join(lines)
 
 
@@ -2351,6 +3756,8 @@ def _write_upstream_pr_reports(
                 "metadata": report["metadata"],
                 "introduced_breaks": payload["summary"]["introduced_breaks"],
                 "root_causes": payload["summary"]["root_causes"],
+                "review_findings": payload["summary"]["review_findings"],
+                "review_root_causes": payload["summary"]["review_root_causes"],
             },
             ensure_ascii=False,
             indent=2,
@@ -2367,23 +3774,66 @@ def _write_upstream_pr_reports(
 
 
 def write_reports(report: dict[str, Any], output_dir: Path) -> dict[str, str]:
+    started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     if report.get("metadata", {}).get("scenario") == "vllm-interface":
-        return _write_upstream_pr_reports(report, output_dir)
-    json_path = output_dir / "main2main-range-report.json"
-    all_csv = output_dir / "main2main-all-findings.csv"
-    introduced_csv = output_dir / "main2main-introduced-breaks.csv"
-    markdown_path = output_dir / "main2main-range-report.md"
-    json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _write_csv(all_csv, report["findings"])
-    _write_csv(
-        introduced_csv,
-        [item for item in report["findings"] if item["classification"] == "introduced_break"],
-    )
-    markdown_path.write_text(_markdown(report), encoding="utf-8")
-    return {
-        "json": str(json_path),
-        "all_csv": str(all_csv),
-        "introduced_csv": str(introduced_csv),
-        "markdown": str(markdown_path),
-    }
+        outputs = _write_upstream_pr_reports(report, output_dir)
+    else:
+        json_path = output_dir / "main2main-range-report.json"
+        all_csv = output_dir / "main2main-all-findings.csv"
+        introduced_csv = output_dir / "main2main-introduced-breaks.csv"
+        markdown_path = output_dir / "main2main-range-report.md"
+        json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_csv(all_csv, report["findings"])
+        _write_csv(
+            introduced_csv,
+            [
+                item
+                for item in report["findings"]
+                if item["classification"] == "introduced_break" and item["action"] == "modify"
+            ],
+        )
+        markdown_path.write_text(_markdown(report), encoding="utf-8")
+        outputs = {
+            "json": str(json_path),
+            "all_csv": str(all_csv),
+            "introduced_csv": str(introduced_csv),
+            "markdown": str(markdown_path),
+        }
+
+    report_seconds = round(time.perf_counter() - started, 6)
+    stage_timings = report.get("metadata", {}).get("stage_timings_seconds")
+    if isinstance(stage_timings, dict):
+        stage_timings["report_generation"] = report_seconds
+        analysis_total = stage_timings.get("total")
+        if isinstance(analysis_total, (float, int)):
+            stage_timings["total_with_report"] = round(float(analysis_total) + report_seconds, 6)
+
+    if report.get("metadata", {}).get("scenario") == "vllm-interface":
+        payload = _upstream_pr_payload(report)
+        Path(outputs["json"]).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        Path(outputs["metadata_json"]).write_text(
+            json.dumps(
+                {
+                    "schema_version": report["schema_version"],
+                    "metadata": report["metadata"],
+                    "introduced_breaks": payload["summary"]["introduced_breaks"],
+                    "root_causes": payload["summary"]["root_causes"],
+                    "review_findings": payload["summary"]["review_findings"],
+                    "review_root_causes": payload["summary"]["review_root_causes"],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    else:
+        Path(outputs["json"]).write_text(
+            json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return outputs
