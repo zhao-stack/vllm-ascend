@@ -150,7 +150,7 @@ def _validate(args: argparse.Namespace) -> int:
     )
     relations, findings = engine.generate(plan)
     visible_generator_findings = findings if plan.include_generator_findings else []
-    direct_calls, contract_findings = validate_current_contracts(
+    direct_calls, direct_attributes, contract_findings = validate_current_contracts(
         engine,
         relations,
         GitSnapshot(args.vllm_root, vllm_sha),
@@ -174,6 +174,7 @@ def _validate(args: argparse.Namespace) -> int:
             ),
             "relations_collected": len(relations),
             "direct_call_dependencies": len(direct_calls),
+            "direct_attribute_dependencies": len(direct_attributes),
             "findings": len(visible_generator_findings) + len(contract_findings),
             "generator_findings": len(visible_generator_findings),
             "contract_findings": len(contract_findings),

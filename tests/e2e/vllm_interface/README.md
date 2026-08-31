@@ -17,6 +17,8 @@ The test checks:
 - downstream patch and override endpoint boundaries;
 - direct calls for missing/extra positional parameters and unsupported/missing keywords, including exact Triton
   `kernel[grid](...)` launches;
+- full-main2main member reads whose exact upstream module, class, property, dataclass, slot, or initialized instance
+  attribute is removed;
 - direct inheritance edges.
 
 For monkey-patched callables, direct calls are checked against the replacement signature. The test parses Python source
@@ -135,10 +137,10 @@ creates and reads only the `vllm-interface-contracts` child. `--no-cache` disabl
 `python -m tools.vllm_interface_contracts cache clear --cache-dir <parent>` removes only that tool-owned child.
 
 The cache covers the downstream AST/symbol index, content-addressed upstream file fragments, generated inheritance,
-override, monkey-patch, direct-import, direct-call, and Triton-call dependencies, plus the lazily populated old/new Git
-snapshot indexes. Keys include normalized repository paths, exact commit SHAs, component and global cache schema
-versions, analyzer versions, the Python implementation/version, and analysis configuration. Committed-source caches are
-bypassed when the relevant package tree has uncommitted or untracked source changes.
+override, monkey-patch, direct-import, direct-call, direct-attribute, and Triton-call dependencies, plus the lazily
+populated old/new Git snapshot indexes. Keys include normalized repository paths, exact commit SHAs, component and
+global cache schema versions, analyzer versions, the Python implementation/version, and analysis configuration.
+Committed-source caches are bypassed when the relevant package tree has uncommitted or untracked source changes.
 
 Cache entries use pickle because they contain Python AST objects. Pickle is unsafe for untrusted data. The analyzer does
 not accept an arbitrary pickle path and must read only entries it created under its private cache directory. Corrupt
@@ -150,7 +152,7 @@ printed by the CLI.
 `--scenario` selects one of two fixed execution plans; it is not a collection of independent low-level switches:
 
 - `main2main` (default) runs the full exact-contract analysis: patch, override, inheritance, direct import, direct call,
-  return protocol, and generator findings. It preserves the existing report names and behavior.
+  direct attribute, return protocol, and generator findings. It preserves the existing report names and behavior.
 - `vllm-interface` is the upstream PR awareness plan. It analyzes direct imports, overrides, and exact downstream-call
   contracts. Inheritance/MRO discovery still runs as an override prerequisite, but it does not emit inheritance
   findings. Monkey-patch collection and patch-oriented generator-finding conversion are skipped before execution. This
@@ -166,10 +168,9 @@ Findings are separated into `introduced_break`, `compatibility_warning`, `preexi
 `analysis_unresolved`.  Unchanged verified relationships are omitted from the upgrade report.  By default the command
 only warns and exits successfully; `--fail-on introduced` is available for a future blocking CI, but is not the default.
 
-Range schema version 10 reports the selected scenario, fixed plan version, capability states, cache events, phase timings, and the
-direct-call invocation kind in dependency evidence. It retains the four exact contract families introduced by schema
-2. Under the default `exact-contracts` profile, these families remain available without changing the generator JSONL
-schema or its fixed relation golden:
+Range schema version 11 adds full-main2main `direct_attribute / attribute_presence` findings and their cache/timing
+metadata. It retains the exact call and return contract families without changing the generator JSONL schema or its
+fixed relation golden:
 
 - downstream-to-upstream calls: uniquely resolved module functions, constructors, class/static methods, annotated or
   provably constructed instances are checked by binding each concrete `args`/`kwargs` shape independently at old and
@@ -178,7 +179,11 @@ schema or its fixed relation golden:
   iteration, context-manager use, and `await` are checked separately against the old/new return protocols;
 - upstream-to-downstream implementations: each generator-proven patch or override keeps the existing installed-input
   substitutability check, while exact return annotations or statically proven return paths are checked covariantly
-  against the old and new upstream return protocols.
+  against the old and new upstream return protocols;
+- downstream member reads: direct module/class values, properties, dataclass fields, literal slots, annotated or
+  constructed instances, and `self`/`super` reads through a complete pinned MRO are compared for old/new presence.
+  Unresolved multiple/external inheritance, dynamic attribute providers, dynamic `setattr`, and conditional field
+  initialization fail closed. Reads protected by `hasattr`, `AttributeError`, or `vllm_version_is` are excluded.
 
 Triton subscript launches are handled as a direct-call protocol, not as an ordinary Python subscript. The detector
 resolves the callable inside `kernel[grid]`, keeps the arguments from the outer `(...)`, and binds them independently
@@ -206,6 +211,6 @@ Calls nested under any `if` condition containing a call named `vllm_version_is` 
 on both branches. These dynamic exact call contracts are different from the historical static `call_protocol` mapping
 table, which remains an opt-in `expanded`/legacy review asset.
 
-`validate` applies the same detector to the checked-out source pair and includes current direct-call and
-patch/override-return risks in `contract_findings`.  `analyze-range` remains the command that attributes a compatibility
-transition specifically to `old -> new`.
+`validate` applies the same enabled detectors to the checked-out source pair and includes current direct-call,
+direct-attribute, and patch/override-return risks in `contract_findings`. `analyze-range` remains the command that
+attributes a compatibility transition specifically to `old -> new`.

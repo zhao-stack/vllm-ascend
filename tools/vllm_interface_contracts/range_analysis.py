@@ -46,6 +46,8 @@ from .analysis_plans import (
 )
 from .cache import CacheResult, PersistentCache, build_identity, git_source_state, normalized_repo_path
 from .call_contracts import (
+    DirectAttributeDependency,
+    DirectAttributeDetector,
     DirectCallDependency,
     DirectCallDetector,
     ReturnContract,
@@ -70,6 +72,7 @@ from .generator import (
     SignatureContract,
     _accepts_signature_contract,
     _expression_name,
+    _function_scope_nodes,
     _import_binding_reference,
     _jsonable_signature,
     _scope_final_bindings,
@@ -81,12 +84,13 @@ from .models import (
     SourceEndpoint,
 )
 
-RANGE_SCHEMA_VERSION = 10
-RANGE_ANALYZER_VERSION = "2.0.1"
-SNAPSHOT_CACHE_SCHEMA_VERSION = 2
+RANGE_SCHEMA_VERSION = 11
+RANGE_ANALYZER_VERSION = "2.1.0"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 3
 RELATION_CACHE_SCHEMA_VERSION = 1
 DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
 DIRECT_CALL_CACHE_SCHEMA_VERSION = 1
+DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 3
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -581,6 +585,7 @@ class GitSnapshot:
         self._source: dict[str, str | None] = {}
         self._trees: dict[str, ast.Module | None] = {}
         self._bindings: dict[str, dict[str, str]] = {}
+        self._attribute_endpoints: dict[tuple[str, str, str | None, str | None], SourceEndpoint] = {}
         self._keyword_call_candidates: dict[
             tuple[tuple[str, ...], str],
             list[tuple[str, ast.Call, str | None, str]],
@@ -598,6 +603,8 @@ class GitSnapshot:
     def __setstate__(self, state: dict[str, object]) -> None:
         self.__dict__.update(state)
         self.root = Path(self.root).resolve()
+        if not hasattr(self, "_attribute_endpoints"):
+            self._attribute_endpoints = {}
         self._lock = threading.RLock()
 
     @property
@@ -858,6 +865,414 @@ class GitSnapshot:
                 _node_fingerprint(class_node),
             )
         return self._effective_member(base, member, frozenset((*seen, receiver_type)))
+
+    @staticmethod
+    def _instance_assignment(
+        statement: ast.stmt,
+        receiver: str,
+        member: str,
+    ) -> ast.AST | None:
+        targets: Iterable[ast.AST] = ()
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            targets = (statement.target,)
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and target.attr == member
+                and isinstance(target.value, ast.Name)
+                and target.value.id == receiver
+            ):
+                return statement
+        call = statement.value if isinstance(statement, ast.Expr) else None
+        if (
+            isinstance(call, ast.Call)
+            and (_expression_name(call.func) or "").rsplit(".", 1)[-1] == "setattr"
+            and len(call.args) >= 3
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == receiver
+            and isinstance(call.args[1], ast.Constant)
+            and call.args[1].value == member
+        ):
+            return statement
+        return None
+
+    @staticmethod
+    def _function_may_assign_instance_member(
+        function: ast.AsyncFunctionDef | ast.FunctionDef,
+        receiver: str,
+        member: str,
+    ) -> bool:
+        for candidate in _function_scope_nodes(function):
+            if (
+                isinstance(candidate, ast.Attribute)
+                and isinstance(candidate.ctx, (ast.Del, ast.Store))
+                and candidate.attr == member
+                and isinstance(candidate.value, ast.Name)
+                and candidate.value.id == receiver
+            ):
+                return True
+            if (
+                isinstance(candidate, ast.Attribute)
+                and candidate.attr == "__dict__"
+                and isinstance(candidate.value, ast.Name)
+                and candidate.value.id == receiver
+            ):
+                return True
+            if (
+                isinstance(candidate, ast.Call)
+                and (_expression_name(candidate.func) or "").rsplit(".", 1)[-1] == "setattr"
+                and candidate.args
+                and isinstance(candidate.args[0], ast.Name)
+                and candidate.args[0].id == receiver
+                and (
+                    len(candidate.args) < 2
+                    or not isinstance(candidate.args[1], ast.Constant)
+                    or candidate.args[1].value == member
+                )
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _calls_super_init(function: ast.AsyncFunctionDef | ast.FunctionDef) -> bool:
+        return any(
+            isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+            and statement.value.func.attr == "__init__"
+            and isinstance(statement.value.func.value, ast.Call)
+            and isinstance(statement.value.func.value.func, ast.Name)
+            and statement.value.func.value.func.id == "super"
+            and not statement.value.func.value.args
+            and not statement.value.func.value.keywords
+            for statement in function.body
+        )
+
+    @staticmethod
+    def _slot_binding(class_node: ast.ClassDef, member: str) -> tuple[bool | None, ast.AST | None]:
+        binding = _body_named_binding(class_node.body, "__slots__")
+        if binding.status == "missing":
+            return False, None
+        if binding.status != "non_callable" or not isinstance(binding.node, (ast.Assign, ast.AnnAssign)):
+            return None, binding.node
+        value = binding.node.value
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            names = (value.value,)
+        elif isinstance(value, (ast.List, ast.Set, ast.Tuple)) and all(
+            isinstance(item, ast.Constant) and isinstance(item.value, str) for item in value.elts
+        ):
+            names = tuple(item.value for item in value.elts if isinstance(item, ast.Constant))
+        else:
+            return None, binding.node
+        return member in names, binding.node
+
+    def _supported_dataclass(self, file_name: str, class_node: ast.ClassDef) -> bool:
+        if not class_node.decorator_list:
+            return False
+        resolver = self._return_resolver(file_name)
+        references = {resolver(raw) for decorator in class_node.decorator_list if (raw := _decorator_name(decorator))}
+        return references == {"dataclasses.dataclass"}
+
+    @staticmethod
+    def _annotation_only_field(node: ast.AST | None) -> bool:
+        return isinstance(node, ast.AnnAssign) and node.value is None
+
+    def _classvar_or_initvar(self, file_name: str, node: ast.AST | None) -> bool:
+        if not isinstance(node, ast.AnnAssign):
+            return False
+        annotation = node.annotation
+        root = annotation.value if isinstance(annotation, ast.Subscript) else annotation
+        reference = _expression_name(root)
+        resolved = self._return_resolver(file_name)(reference) if reference else None
+        return (resolved or "").rsplit(".", 1)[-1] in {"ClassVar", "InitVar"}
+
+    def _effective_instance_field(
+        self,
+        receiver_type: str,
+        member: str,
+        seen: frozenset[str] = frozenset(),
+    ) -> _QualifiedBinding | None:
+        if receiver_type in seen:
+            return _QualifiedBinding("", None, member, None, "unknown")
+        resolved = self._resolve_qualified_node(receiver_type)
+        if resolved is None:
+            return None
+        if resolved.status != "exact" or not isinstance(resolved.node, ast.ClassDef):
+            return _QualifiedBinding(
+                resolved.file,
+                resolved.owner,
+                member,
+                None,
+                "unknown",
+                resolved.fingerprint,
+            )
+        class_node = resolved.node
+        actual_owner = ".".join(item for item in (resolved.owner, class_node.name) if item)
+        supported_dataclass = self._supported_dataclass(resolved.file, class_node)
+        if (class_node.decorator_list and not supported_dataclass) or class_node.keywords:
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                None,
+                "unknown",
+                _node_fingerprint(class_node),
+            )
+
+        if supported_dataclass:
+            dataclass_fields = [
+                statement
+                for statement in class_node.body
+                if isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+                and statement.target.id == member
+                and not self._classvar_or_initvar(resolved.file, statement)
+            ]
+            if len(dataclass_fields) == 1:
+                field = dataclass_fields[0]
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    field,
+                    "non_callable",
+                    _node_fingerprint(field),
+                )
+            if len(dataclass_fields) > 1:
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    None,
+                    "unknown",
+                    _node_fingerprint(class_node),
+                )
+
+        direct = _body_named_binding(class_node.body, member)
+        if direct.status == "unknown":
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                direct.node,
+                "unknown",
+                direct.fingerprint,
+            )
+        if direct.status in {"exact", "non_callable"}:
+            annotation_only = self._annotation_only_field(direct.node)
+            ignored_dataclass_field = self._classvar_or_initvar(resolved.file, direct.node)
+            if not annotation_only or supported_dataclass and not ignored_dataclass_field:
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    direct.node,
+                    direct.status,
+                    direct.fingerprint,
+                )
+
+        slot_present, slot_node = self._slot_binding(class_node, member)
+        if slot_present is True:
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                slot_node,
+                "non_callable",
+                _node_fingerprint(slot_node) if slot_node is not None else None,
+            )
+        if slot_present is None:
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                slot_node,
+                "unknown",
+                _node_fingerprint(slot_node) if slot_node is not None else None,
+            )
+
+        for dynamic_name in ("__getattr__", "__getattribute__"):
+            if _body_named_binding(class_node.body, dynamic_name).status != "missing":
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    None,
+                    "unknown",
+                    _node_fingerprint(class_node),
+                )
+
+        initializer = _body_named_binding(class_node.body, "__init__")
+        recurse_to_base = initializer.status == "missing"
+        if initializer.status == "unknown" or initializer.status == "non_callable":
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                initializer.node,
+                "unknown",
+                initializer.fingerprint,
+            )
+        if initializer.status == "exact":
+            if not isinstance(initializer.node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    initializer.node,
+                    "unknown",
+                    initializer.fingerprint,
+                )
+            positional = [*initializer.node.args.posonlyargs, *initializer.node.args.args]
+            receiver = positional[0].arg if positional else None
+            if receiver is None:
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    initializer.node,
+                    "unknown",
+                    initializer.fingerprint,
+                )
+            assignment = next(
+                (
+                    candidate
+                    for statement in initializer.node.body
+                    if (candidate := self._instance_assignment(statement, receiver, member)) is not None
+                ),
+                None,
+            )
+            if assignment is not None:
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    assignment,
+                    "non_callable",
+                    _node_fingerprint(assignment),
+                )
+            if self._function_may_assign_instance_member(initializer.node, receiver, member):
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    initializer.node,
+                    "unknown",
+                    initializer.fingerprint,
+                )
+            recurse_to_base = self._calls_super_init(initializer.node)
+
+        for statement in class_node.body:
+            if not isinstance(statement, (ast.AsyncFunctionDef, ast.FunctionDef)) or statement.name == "__init__":
+                continue
+            positional = [*statement.args.posonlyargs, *statement.args.args]
+            receiver = positional[0].arg if positional else None
+            if receiver is not None and self._function_may_assign_instance_member(statement, receiver, member):
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    statement,
+                    "unknown",
+                    _node_fingerprint(statement),
+                )
+
+        if not recurse_to_base or not class_node.bases:
+            return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
+        if len(class_node.bases) != 1:
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                None,
+                "unknown",
+                _node_fingerprint(class_node),
+            )
+        base = self._base_reference(resolved.file, class_node.bases[0])
+        if base == "builtins.object" or base in STDLIB_STRUCTURAL_BASES:
+            return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
+        if base is None or not base.startswith("vllm."):
+            return _QualifiedBinding(
+                resolved.file,
+                actual_owner,
+                member,
+                None,
+                "unknown",
+                _node_fingerprint(class_node),
+            )
+        return self._effective_instance_field(base, member, frozenset((*seen, receiver_type)))
+
+    def attribute_endpoint(
+        self,
+        expression: str,
+        access_kind: str,
+        *,
+        receiver_type: str | None = None,
+        member: str | None = None,
+    ) -> SourceEndpoint:
+        cache_key = (expression, access_kind, receiver_type, member)
+        with self._lock:
+            cached = self._attribute_endpoints.get(cache_key)
+        if cached is not None:
+            return cached
+        endpoint = self._attribute_endpoint_uncached(
+            expression,
+            access_kind,
+            receiver_type=receiver_type,
+            member=member,
+        )
+        with self._lock:
+            self._attribute_endpoints[cache_key] = endpoint
+        return endpoint
+
+    def _attribute_endpoint_uncached(
+        self,
+        expression: str,
+        access_kind: str,
+        *,
+        receiver_type: str | None = None,
+        member: str | None = None,
+    ) -> SourceEndpoint:
+        endpoint = self.call_endpoint(
+            expression,
+            access_kind,
+            receiver_type=receiver_type,
+            member=member,
+        )
+        if (
+            endpoint.symbol_kind not in {"missing", "unknown"}
+            or access_kind != "instance"
+            or receiver_type is None
+            or member is None
+        ):
+            return endpoint
+        binding = self._effective_instance_field(receiver_type, member)
+        if binding is None:
+            return SourceEndpoint(None, None, member, symbol_kind="unknown")
+        if binding.status in {"exact", "non_callable"}:
+            return SourceEndpoint(
+                file=binding.file or None,
+                owner=binding.owner,
+                name=binding.name,
+                line=getattr(binding.node, "lineno", None),
+                descriptor=(
+                    _descriptor(binding.node, self._return_resolver(binding.file))
+                    if binding.file and binding.status == "exact" and binding.node is not None
+                    else "instance_attribute"
+                ),
+                symbol_kind="attribute",
+                analysis_fingerprint=binding.fingerprint,
+            )
+        return SourceEndpoint(
+            file=binding.file or None,
+            owner=binding.owner,
+            name=binding.name,
+            symbol_kind=binding.status,
+            signature_status="unknown" if binding.status == "unknown" else None,
+            analysis_fingerprint=binding.fingerprint,
+        )
 
     def _constructor_class_safe(
         self,
@@ -1476,6 +1891,14 @@ def _direct_call_state(upstream: SourceEndpoint, dependency: DirectCallDependenc
         return CompatibilityState(True, None, "upstream runtime signature transform could not be proven")
     compatible, reason = bind_call_shape(upstream.signature, dependency.call_shape)
     return CompatibilityState(True, compatible, reason)
+
+
+def _direct_attribute_state(upstream: SourceEndpoint) -> CompatibilityState:
+    if upstream.symbol_kind in {None, "unknown"}:
+        return CompatibilityState(None, None, "upstream member binding could not be proven")
+    if upstream.file is None or upstream.symbol_kind == "missing":
+        return CompatibilityState(False, False, "upstream member does not exist")
+    return CompatibilityState(True, True, "upstream member exists")
 
 
 def _replacement_return_state(
@@ -2572,6 +2995,95 @@ def _direct_call_findings(
     return findings, exact_dependencies
 
 
+def _direct_attribute_findings(
+    dependencies: Iterable[DirectAttributeDependency],
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+) -> tuple[list[RangeFinding], list[DirectAttributeDependency]]:
+    """Compare exact downstream member-read presence at both SHAs."""
+
+    findings: list[RangeFinding] = []
+    exact_dependencies: list[DirectAttributeDependency] = []
+    for dependency in dependencies:
+        endpoint_receiver = dependency.lookup_root or dependency.receiver_type
+        old_endpoint = old_snapshot.attribute_endpoint(
+            dependency.target,
+            dependency.access_kind,
+            receiver_type=endpoint_receiver,
+            member=dependency.member,
+        )
+        new_endpoint = new_snapshot.attribute_endpoint(
+            dependency.target,
+            dependency.access_kind,
+            receiver_type=endpoint_receiver,
+            member=dependency.member,
+        )
+        exact_dependencies.append(dependency)
+        old_state = _direct_attribute_state(old_endpoint)
+        new_state = _direct_attribute_state(new_endpoint)
+        contract_changed = old_state.exists != new_state.exists or old_state.compatible != new_state.compatible
+        if not contract_changed:
+            continue
+        classification = _classify(old_state, new_state, contract_changed)
+        gates = {
+            "relationship_verified": True,
+            "contract_changed": True,
+            "runtime_reachable": True,
+            "version_lane_matches": True,
+        }
+        action = _finding_action(classification, gates)
+        findings.append(
+            RangeFinding(
+                finding_id=_finding_id(
+                    "direct_attribute",
+                    "attribute_presence",
+                    dependency.file,
+                    dependency.line,
+                    dependency.column,
+                    dependency.target,
+                    old_snapshot.revision,
+                    new_snapshot.revision,
+                ),
+                classification=classification,
+                relation="direct_attribute",
+                priority="P1" if action == "modify" else "P2",
+                action=action,
+                confidence="high" if classification != "analysis_unresolved" else "medium",
+                upstream_old=old_endpoint,
+                upstream_new=new_endpoint,
+                downstream=SourceEndpoint(
+                    file=dependency.file,
+                    owner=dependency.owner,
+                    name=dependency.expression,
+                    line=dependency.line,
+                    symbol_kind="attribute_read",
+                ),
+                old_state=old_state,
+                new_state=new_state,
+                change=_change_text(old_endpoint, new_endpoint, "attribute_presence"),
+                evidence=[dependency.as_dict()],
+                gates=gates,
+                suggestion=(
+                    "Update the downstream member read for the new upstream object layout and add an "
+                    "attribute-presence regression test."
+                ),
+                source="direct_attribute_detector",
+                contract_kind="attribute_presence",
+                direction="downstream_attribute_read_to_upstream",
+                details={
+                    "target": dependency.target,
+                    "access_kind": dependency.access_kind,
+                    "receiver_type": dependency.receiver_type,
+                    "member": dependency.member,
+                    "lookup_root": dependency.lookup_root,
+                    "resolution_basis": dependency.resolution_basis,
+                    "scope": dependency.scope,
+                },
+            )
+        )
+    return findings, exact_dependencies
+
+
 def _verified_historical_direct_calls(
     candidates: Iterable[DirectCallDependency],
     old_snapshot: GitSnapshot,
@@ -2605,6 +3117,37 @@ def _verified_historical_direct_calls(
             invocation_kind=candidate.invocation_kind,
         )
         if old_endpoint.symbol_kind == "callable" and new_endpoint.symbol_kind == "missing":
+            verified.append(candidate)
+    return verified
+
+
+def _verified_historical_direct_attributes(
+    candidates: Iterable[DirectAttributeDependency],
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+) -> list[DirectAttributeDependency]:
+    """Promote old-proven self/super reads when the new binding is absent or unresolved."""
+
+    verified: list[DirectAttributeDependency] = []
+    for candidate in candidates:
+        if candidate.lookup_root is None or candidate.member is None:
+            continue
+        old_endpoint = old_snapshot.attribute_endpoint(
+            candidate.target,
+            candidate.access_kind,
+            receiver_type=candidate.lookup_root,
+            member=candidate.member,
+        )
+        new_endpoint = new_snapshot.attribute_endpoint(
+            candidate.target,
+            candidate.access_kind,
+            receiver_type=candidate.lookup_root,
+            member=candidate.member,
+        )
+        if (
+            _direct_attribute_state(old_endpoint).compatible is True
+            and _direct_attribute_state(new_endpoint).compatible is not True
+        ):
             verified.append(candidate)
     return verified
 
@@ -2701,12 +3244,18 @@ def validate_current_contracts(
     relations: Iterable[Relation],
     snapshot: GitSnapshot,
     plan: AnalysisPlan | None = None,
-) -> tuple[list[DirectCallDependency], list[dict[str, Any]]]:
-    """Validate exact call/return contracts for one checked-out source pair."""
+) -> tuple[
+    list[DirectCallDependency],
+    list[DirectAttributeDependency],
+    list[dict[str, Any]],
+]:
+    """Validate exact call, member-presence, and return contracts for one source pair."""
 
     plan = plan or resolve_analysis_plan()
     discovered_dependencies = DirectCallDetector(engine).discover() if plan.analyze_direct_calls else []
+    discovered_attributes = DirectAttributeDetector(engine).discover() if plan.analyze_direct_attributes else []
     dependencies: list[DirectCallDependency] = []
+    attribute_dependencies: list[DirectAttributeDependency] = []
     findings: list[dict[str, Any]] = []
     for dependency in discovered_dependencies:
         upstream = snapshot.call_endpoint(
@@ -2755,6 +3304,34 @@ def validate_current_contracts(
                     }
                 )
 
+    for attribute_dependency in discovered_attributes:
+        upstream = snapshot.attribute_endpoint(
+            attribute_dependency.target,
+            attribute_dependency.access_kind,
+            receiver_type=attribute_dependency.lookup_root or attribute_dependency.receiver_type,
+            member=attribute_dependency.member,
+        )
+        attribute_dependencies.append(attribute_dependency)
+        state = _direct_attribute_state(upstream)
+        if state.compatible is True:
+            continue
+        findings.append(
+            {
+                "relation": "direct_attribute",
+                "contract_kind": "attribute_presence",
+                "status": "risk" if state.compatible is False else "review",
+                "upstream": upstream.as_dict(),
+                "downstream": {
+                    "file": attribute_dependency.file,
+                    "owner": attribute_dependency.owner,
+                    "name": attribute_dependency.expression,
+                    "line": attribute_dependency.line,
+                },
+                "reason": state.reason,
+                "evidence": attribute_dependency.as_dict(),
+            }
+        )
+
     for relation in relations:
         if (
             relation.upstream_package != "vllm"
@@ -2798,7 +3375,7 @@ def validate_current_contracts(
             item["downstream"]["line"] or 0,
         ),
     )
-    return dependencies, ordered
+    return dependencies, attribute_dependencies, ordered
 
 
 def _cache_bypass_event(component: str, commit_sha: str, reason: str) -> CacheResult:
@@ -3051,6 +3628,18 @@ def analyze_range(
             "vllm_new_sha": new_sha,
         },
     )
+    direct_attribute_identity = build_identity(
+        component="downstream_direct_attributes",
+        repo_root=ascend_root,
+        commit_sha=ascend_sha,
+        analyzer_version=f"{GENERATOR_VERSION}/{RANGE_ANALYZER_VERSION}",
+        component_schema=DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION,
+        config={
+            "analysis_plan": plan.as_dict(),
+            "vllm_repo_root": normalized_repo_path(vllm_root),
+            "vllm_new_sha": new_sha,
+        },
+    )
 
     def analyze_relations() -> tuple[list[RangeFinding], float]:
         started = time.perf_counter()
@@ -3176,7 +3765,80 @@ def analyze_range(
             time.perf_counter() - comparison_started,
         )
 
-    branch_count = 1 + int(plan.analyze_direct_imports) + int(plan.analyze_direct_calls)
+    def analyze_direct_attributes() -> tuple[
+        list[RangeFinding],
+        list[DirectAttributeDependency],
+        float,
+        float,
+    ]:
+        discovery_started = time.perf_counter()
+        if relation_cache_safe or not persistent_cache.enabled:
+            cached_attributes, direct_attribute_cache_result = persistent_cache.load(
+                "downstream_direct_attributes",
+                direct_attribute_identity,
+                validator=lambda item: (
+                    isinstance(item, dict)
+                    and isinstance(item.get("dependencies"), list)
+                    and all(
+                        isinstance(dependency, DirectAttributeDependency) for dependency in item.get("dependencies", [])
+                    )
+                    and isinstance(item.get("historical_candidates"), list)
+                    and all(
+                        isinstance(dependency, DirectAttributeDependency)
+                        for dependency in item.get("historical_candidates", [])
+                    )
+                ),
+            )
+        else:
+            cached_attributes = None
+            direct_attribute_cache_result = _cache_bypass_event(
+                "downstream_direct_attributes",
+                ascend_sha,
+                f"upstream: {upstream_cache_reason}; downstream: {downstream_cache_reason}",
+            )
+            persistent_cache.events.append(direct_attribute_cache_result)
+        if isinstance(cached_attributes, dict):
+            discovered_attributes = cached_attributes["dependencies"]
+            historical_candidates = cached_attributes["historical_candidates"]
+        else:
+            direct_attribute_detector = DirectAttributeDetector(generator)
+            discovered_attributes = direct_attribute_detector.discover()
+            historical_candidates = direct_attribute_detector.historical_attribute_candidates
+            if relation_cache_safe:
+                persistent_cache.store(
+                    "downstream_direct_attributes",
+                    direct_attribute_identity,
+                    {
+                        "dependencies": discovered_attributes,
+                        "historical_candidates": historical_candidates,
+                    },
+                    build_seconds=time.perf_counter() - discovery_started,
+                    result=direct_attribute_cache_result,
+                )
+        discovered_attributes.extend(
+            _verified_historical_direct_attributes(
+                historical_candidates,
+                old_snapshot,
+                new_snapshot,
+            )
+        )
+        discovery_elapsed = time.perf_counter() - discovery_started
+        comparison_started = time.perf_counter()
+        branch_findings, dependencies = _direct_attribute_findings(
+            discovered_attributes,
+            old_snapshot,
+            new_snapshot,
+        )
+        return (
+            branch_findings,
+            dependencies,
+            discovery_elapsed,
+            time.perf_counter() - comparison_started,
+        )
+
+    branch_count = (
+        1 + int(plan.analyze_direct_imports) + int(plan.analyze_direct_calls) + int(plan.analyze_direct_attributes)
+    )
     effective_workers = min(analysis_workers, branch_count)
     if effective_workers > 1:
         with ThreadPoolExecutor(
@@ -3186,13 +3848,18 @@ def analyze_range(
             relation_future = executor.submit(analyze_relations)
             import_future = executor.submit(analyze_imports) if plan.analyze_direct_imports else None
             direct_call_future = executor.submit(analyze_direct_calls) if plan.analyze_direct_calls else None
+            direct_attribute_future = (
+                executor.submit(analyze_direct_attributes) if plan.analyze_direct_attributes else None
+            )
             relation_result = relation_future.result()
             import_result = import_future.result() if import_future is not None else None
             direct_call_result = direct_call_future.result() if direct_call_future is not None else None
+            direct_attribute_result = direct_attribute_future.result() if direct_attribute_future is not None else None
     else:
         relation_result = analyze_relations()
         import_result = analyze_imports() if plan.analyze_direct_imports else None
         direct_call_result = analyze_direct_calls() if plan.analyze_direct_calls else None
+        direct_attribute_result = analyze_direct_attributes() if plan.analyze_direct_attributes else None
 
     findings, relation_elapsed = relation_result
     _record_diagnostic_timing("relation_comparison", relation_elapsed, timings)
@@ -3212,6 +3879,21 @@ def analyze_range(
     else:
         timings["direct_call_discovery"] = None
         timings["direct_call_comparison"] = None
+
+    direct_attribute_dependencies: list[DirectAttributeDependency] = []
+    if direct_attribute_result is not None:
+        (
+            direct_attribute_findings,
+            direct_attribute_dependencies,
+            discovery_elapsed,
+            comparison_elapsed,
+        ) = direct_attribute_result
+        findings.extend(direct_attribute_findings)
+        _record_diagnostic_timing("direct_attribute_discovery", discovery_elapsed, timings)
+        _record_diagnostic_timing("direct_attribute_comparison", comparison_elapsed, timings)
+    else:
+        timings["direct_attribute_discovery"] = None
+        timings["direct_attribute_comparison"] = None
 
     generator_finding_started = time.perf_counter()
     for candidate in generator_findings if plan.include_generator_findings else []:
@@ -3367,6 +4049,7 @@ def analyze_range(
             timing_value("relation_comparison")
             + timing_value("direct_import_analysis")
             + timing_value("direct_call_comparison")
+            + timing_value("direct_attribute_comparison")
             + timing_value("generator_finding_conversion"),
             6,
         ),
@@ -3393,6 +4076,7 @@ def analyze_range(
                     "relation_comparison",
                     *(["direct_import_analysis"] if plan.analyze_direct_imports else []),
                     *(["direct_call_analysis"] if plan.analyze_direct_calls else []),
+                    *(["direct_attribute_analysis"] if plan.analyze_direct_attributes else []),
                 ],
             },
             "repository_index_cache": generator.repository_index_cache,
@@ -3411,6 +4095,7 @@ def analyze_range(
             "relations": analyzed_relation_count,
             "relations_collected": len(relations),
             "direct_call_dependencies": len(direct_call_dependencies),
+            "direct_attribute_dependencies": len(direct_attribute_dependencies),
             "generator_findings": (len(generator_findings) if plan.include_generator_findings else 0),
             "total": len(ordered),
             "by_relation": dict(sorted(relation_counts.items())),
@@ -3524,6 +4209,7 @@ def _markdown(report: dict[str, Any]) -> str:
             "symbol_presence": "imported symbol",
             "target_presence": "upstream target",
             "base_presence": "base class",
+            "attribute_presence": "member attribute",
         }
         contract_label = contract_labels.get(item.get("contract_kind"), item.get("contract_kind", "interface contract"))
         lines.extend(

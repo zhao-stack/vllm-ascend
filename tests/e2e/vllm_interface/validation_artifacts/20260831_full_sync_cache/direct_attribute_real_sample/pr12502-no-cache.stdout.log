@@ -1,0 +1,245 @@
+{
+  "metadata": {
+    "range_analyzer_version": "2.1.0",
+    "generator_version": "0.44.0",
+    "profile": "exact-contracts",
+    "scenario": "main2main",
+    "analysis_plan": {
+      "scenario": "main2main",
+      "plan_version": 3,
+      "report_style": "main2main-full",
+      "capabilities": {
+        "inheritance_mro": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "override": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "monkey_patch": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_import": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_call": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "direct_attribute": {
+          "state": "analyzed",
+          "produces_findings": true
+        },
+        "generator_findings": {
+          "state": "included",
+          "produces_findings": true
+        }
+      }
+    },
+    "vllm_old_sha": "54503ecec0f3ac31e5ecfc5f28652e4cc42307b5",
+    "vllm_new_sha": "fe784ff22e630a31fd798f392b01e0a75c18f047",
+    "vllm_ascend_sha": "6003e3222b7a6d2f08753e03fe2aa44690da2dcf",
+    "external_sources": {},
+    "execution": {
+      "analysis_workers_requested": 4,
+      "analysis_workers_used": 4,
+      "parallel_branches": true,
+      "branches": [
+        "relation_comparison",
+        "direct_import_analysis",
+        "direct_call_analysis",
+        "direct_attribute_analysis"
+      ]
+    },
+    "repository_index_cache": {
+      "upstream_file_fragments": {
+        "enabled": false,
+        "status": "disabled",
+        "database": null,
+        "files_total": 2031,
+        "cache_hits": 0,
+        "cache_misses": 2031,
+        "invalid_entries": 0,
+        "workers_requested": 4,
+        "workers_used": 4,
+        "load_seconds": 1e-06,
+        "build_seconds": 304.494869,
+        "write_seconds": 1e-06,
+        "merge_finalize_seconds": 23.445063,
+        "database_bytes": null,
+        "hit_ratio": 0.0,
+        "commit_sha": "fe784ff22e630a31fd798f392b01e0a75c18f047",
+        "reason": null
+      },
+      "downstream": {
+        "enabled": false,
+        "status": "disabled",
+        "commit_sha": "6003e3222b7a6d2f08753e03fe2aa44690da2dcf",
+        "key": null,
+        "path": null,
+        "reason": null,
+        "load_seconds": 0.0,
+        "build_seconds": 0.0,
+        "write_seconds": 0.0,
+        "saved_seconds": 0.0
+      }
+    },
+    "persistent_cache": {
+      "enabled": false,
+      "root": "C:\\Users\\20202\\AppData\\Local\\vllm-interface-contracts",
+      "upstream_source_state": "clean",
+      "downstream_source_state": "clean",
+      "estimated_saved_seconds": 0.0,
+      "events": [
+        {
+          "component": "downstream_direct_attributes",
+          "enabled": false,
+          "status": "disabled",
+          "commit_sha": "6003e3222b7a6d2f08753e03fe2aa44690da2dcf",
+          "key": null,
+          "path": null,
+          "reason": null,
+          "load_seconds": 0.0,
+          "write_seconds": 0.0,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "downstream_direct_calls",
+          "enabled": false,
+          "status": "disabled",
+          "commit_sha": "6003e3222b7a6d2f08753e03fe2aa44690da2dcf",
+          "key": null,
+          "path": null,
+          "reason": null,
+          "load_seconds": 0.0,
+          "write_seconds": 0.0,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "downstream_direct_imports",
+          "enabled": false,
+          "status": "disabled",
+          "commit_sha": "6003e3222b7a6d2f08753e03fe2aa44690da2dcf",
+          "key": null,
+          "path": null,
+          "reason": null,
+          "load_seconds": 0.0,
+          "write_seconds": 0.0,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "downstream_relations",
+          "enabled": false,
+          "status": "disabled",
+          "commit_sha": "6003e3222b7a6d2f08753e03fe2aa44690da2dcf",
+          "key": null,
+          "path": null,
+          "reason": null,
+          "load_seconds": 0.0,
+          "write_seconds": 0.0,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "upstream_snapshot",
+          "enabled": false,
+          "status": "disabled",
+          "commit_sha": "54503ecec0f3ac31e5ecfc5f28652e4cc42307b5",
+          "key": null,
+          "path": null,
+          "reason": null,
+          "load_seconds": 0.0,
+          "write_seconds": 0.0,
+          "saved_seconds": 0.0
+        },
+        {
+          "component": "upstream_snapshot",
+          "enabled": false,
+          "status": "disabled",
+          "commit_sha": "fe784ff22e630a31fd798f392b01e0a75c18f047",
+          "key": null,
+          "path": null,
+          "reason": null,
+          "load_seconds": 0.0,
+          "write_seconds": 0.0,
+          "saved_seconds": 0.0
+        }
+      ]
+    },
+    "stage_timings_seconds": {
+      "downstream_scanning_parsing": 19.797649,
+      "downstream_relation_generation": 152.313653,
+      "monkey_patch_generation": 206.235731,
+      "upstream_old_new_snapshot_index": 238.763876,
+      "contract_comparison": 656.533099,
+      "report_generation": 0.116072,
+      "total": 1019.186792,
+      "total_with_report": 1019.302864
+    },
+    "timings_seconds": {
+      "input_verification": 0.311865,
+      "repository_indexing": 348.063046,
+      "repository_indexing.upstream": 328.103372,
+      "repository_indexing.downstream": 19.797649,
+      "repository_indexing.external": 6e-06,
+      "relation_generation.inheritance_mro": 9.71262,
+      "relation_generation.override": 142.601033,
+      "relation_generation.monkey_patch": 206.235731,
+      "relation_generation.relation_finalization": 0.062501,
+      "relation_comparison": 177.958532,
+      "direct_import_analysis": 255.106573,
+      "direct_call_discovery": 160.789116,
+      "direct_call_comparison": 117.71779,
+      "direct_attribute_discovery": 153.960226,
+      "direct_attribute_comparison": 102.782237,
+      "generator_finding_conversion": 2.967967,
+      "cache_estimated_saved": 0.0,
+      "total": 1019.186792
+    }
+  },
+  "summary": {
+    "relations": 1013,
+    "relations_collected": 1013,
+    "direct_call_dependencies": 4566,
+    "direct_attribute_dependencies": 2695,
+    "generator_findings": 206,
+    "total": 269,
+    "by_relation": {
+      "direct_attribute": 2,
+      "direct_call": 59,
+      "direct_import": 13,
+      "inheritance": 4,
+      "monkey_patch": 29,
+      "override": 162
+    },
+    "by_contract": {
+      "analysis_evidence": 175,
+      "attribute_presence": 2,
+      "call_arguments": 55,
+      "call_target_presence": 11,
+      "replacement_return": 6,
+      "return_usage": 1,
+      "symbol_presence": 13,
+      "target_presence": 6
+    },
+    "actionable_introduced_break": 41,
+    "by_action": {
+      "dismiss": 1,
+      "modify": 41,
+      "review": 227
+    },
+    "introduced_break": 41,
+    "compatibility_warning": 11,
+    "preexisting": 0,
+    "fixed": 1,
+    "analysis_unresolved": 216
+  },
+  "outputs": {
+    "json": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\direct-attribute-pr12502-no-cache-report\\main2main-range-report.json",
+    "all_csv": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\direct-attribute-pr12502-no-cache-report\\main2main-all-findings.csv",
+    "introduced_csv": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\direct-attribute-pr12502-no-cache-report\\main2main-introduced-breaks.csv",
+    "markdown": "C:\\Users\\20202\\Documents\\main2main∏¥≈Ã\\.tmp\\direct-attribute-pr12502-no-cache-report\\main2main-range-report.md"
+  }
+}

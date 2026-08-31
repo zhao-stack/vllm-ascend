@@ -5,6 +5,7 @@ from pathlib import Path
 
 from tools.vllm_interface_contracts.call_contracts import (
     CallShape,
+    DirectAttributeDetector,
     DirectCallDetector,
     ReturnContract,
     ReturnShape,
@@ -45,6 +46,23 @@ def _direct_calls(
     (ascend_root / "vllm_ascend" / "consumer.py").write_text(consumer, encoding="utf-8")
     engine = InterfaceBoundaryGenerator(vllm_root, ascend_root)
     return DirectCallDetector(engine).discover()
+
+
+def _direct_attributes(
+    tmp_path: Path,
+    consumer: str,
+    upstream: str = "class Base:\n    VALUE = 1\n",
+):
+    vllm_root = tmp_path / "vllm"
+    ascend_root = tmp_path / "vllm_ascend"
+    (vllm_root / "vllm").mkdir(parents=True)
+    (ascend_root / "vllm_ascend").mkdir(parents=True)
+    (vllm_root / "vllm" / "__init__.py").write_text("", encoding="utf-8")
+    (vllm_root / "vllm" / "api.py").write_text(upstream, encoding="utf-8")
+    (ascend_root / "vllm_ascend" / "__init__.py").write_text("", encoding="utf-8")
+    (ascend_root / "vllm_ascend" / "consumer.py").write_text(consumer, encoding="utf-8")
+    engine = InterfaceBoundaryGenerator(vllm_root, ascend_root)
+    return DirectAttributeDetector(engine).discover()
 
 
 def test_literal_argument_expansions_are_exact() -> None:
@@ -166,6 +184,150 @@ def test_unimported_vllm_root_is_not_a_verified_call(tmp_path: Path) -> None:
     assert calls == []
 
 
+def test_direct_class_attribute_read_is_discovered(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        "from vllm.api import Base\n\ndef use():\n    return Base.VALUE\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].target == "vllm.api.Base.VALUE"
+    assert attributes[0].expression == "Base.VALUE"
+
+
+def test_nested_module_attribute_emits_only_the_complete_member(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        "import vllm.api as api\n\ndef use():\n    return api.Base.VALUE\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].target == "vllm.api.Base.VALUE"
+
+
+def test_called_member_is_left_to_direct_call_detector(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        "from vllm.api import Base\n\ndef use(value: Base):\n    return value.run()\n",
+        "class Base:\n    def run(self):\n        return 1\n",
+    )
+    assert attributes == []
+
+
+def test_annotated_instance_attribute_read_is_discovered(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        "from vllm.api import Base\n\ndef use(value: Base):\n    return value.payload\n",
+        "class Base:\n    def __init__(self):\n        self.payload = 1\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].target == "vllm.api.Base.payload"
+    assert attributes[0].access_kind == "instance"
+
+
+def test_hasattr_guarded_attribute_read_is_not_a_break_dependency(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        (
+            "from vllm.api import Base\n\n"
+            "def use(value: Base):\n"
+            "    if hasattr(value, 'payload'):\n"
+            "        return value.payload\n"
+            "    return None\n"
+        ),
+        "class Base:\n    def __init__(self):\n        self.payload = 1\n",
+    )
+    assert attributes == []
+
+
+def test_hasattr_else_attribute_read_remains_a_dependency(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        (
+            "from vllm.api import Base\n\n"
+            "def use(value: Base):\n"
+            "    if hasattr(value, 'payload'):\n"
+            "        return None\n"
+            "    return value.payload\n"
+        ),
+        "class Base:\n    def __init__(self):\n        self.payload = 1\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].expression == "value.payload"
+
+
+def test_try_attribute_error_protects_only_try_body(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        (
+            "from vllm.api import Base\n\n"
+            "def use(value: Base):\n"
+            "    try:\n"
+            "        first = value.payload\n"
+            "    except AttributeError:\n"
+            "        return value.payload\n"
+            "    return first\n"
+        ),
+        "class Base:\n    def __init__(self):\n        self.payload = 1\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].line == 7
+
+
+def test_augmented_assignment_reads_upstream_attribute(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        ("from vllm.api import Base\n\ndef use(value: Base):\n    value.payload += 1\n    value.created = 1\n"),
+        "class Base:\n    def __init__(self):\n        self.payload = 1\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].expression == "value.payload"
+
+
+def test_downstream_self_attribute_uses_exact_upstream_mro(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        ("from vllm.api import Base\n\nclass Child(Base):\n    def use(self):\n        return self.payload\n"),
+        "class Base:\n    def __init__(self):\n        self.payload = 1\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].target == "vllm.api.Base.payload"
+    assert attributes[0].lookup_root is None
+    assert attributes[0].resolution_basis == "new_exact"
+
+
+def test_downstream_self_assignment_blocks_upstream_attribute_dependency(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        (
+            "from vllm.api import Base\n\n"
+            "class Child(Base):\n"
+            "    def __init__(self):\n"
+            "        self.payload = 1\n"
+            "    def use(self):\n"
+            "        return self.payload\n"
+        ),
+        "class Base:\n    pass\n",
+    )
+    assert attributes == []
+
+
+def test_inherited_self_augmented_assignment_remains_an_upstream_read(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        ("from vllm.api import Base\n\nclass Child(Base):\n    def update(self):\n        self.payload += 1\n"),
+        "class Base:\n    def __init__(self):\n        self.payload = 1\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].expression == "self.payload"
+
+
+def test_object_member_read_is_not_attributed_to_upstream_base(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        ("from vllm.api import Base\n\nclass Child(Base):\n    def use(self):\n        return self.__class__\n"),
+    )
+    assert attributes == []
+
+
 def test_triton_subscript_launch_uses_outer_call_arguments(tmp_path: Path) -> None:
     calls = _direct_calls(
         tmp_path,
@@ -184,6 +346,14 @@ def test_triton_subscript_launch_uses_outer_call_arguments(tmp_path: Path) -> No
         positional_count=1,
         keyword_names=("BLOCK_SIZE",),
     )
+
+
+def test_triton_subscript_launch_is_not_duplicated_as_attribute_read(tmp_path: Path) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        "import vllm.api as api\n\ndef use():\n    api.kernel[(2,)](1)\n",
+    )
+    assert attributes == []
 
 
 def test_ordinary_subscript_callable_is_not_assumed_to_be_triton(tmp_path: Path) -> None:

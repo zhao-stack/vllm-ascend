@@ -22,6 +22,8 @@ from .analysis_plans import (
     resolve_analysis_plan,
 )
 from .call_contracts import (
+    DirectAttributeDependency,
+    DirectAttributeDetector,
     DirectCallDetector,
     ReturnContract,
     ReturnUse,
@@ -40,6 +42,8 @@ __all__ = [
     "MAIN2MAIN_SCENARIO",
     "VLLM_INTERFACE_SCENARIO",
     "AnalysisPlan",
+    "DirectAttributeDependency",
+    "DirectAttributeDetector",
     "DirectCallDetector",
     "InterfaceBoundaryGenerator",
     "RepositoryIndex",

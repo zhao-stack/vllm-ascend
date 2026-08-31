@@ -553,7 +553,7 @@ def test_report_writer_separates_introduced_csv(tmp_path: Path) -> None:
     outputs = write_reports(report, tmp_path / "reports")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
     introduced_csv = Path(outputs["introduced_csv"]).read_text(encoding="utf-8-sig")
-    assert payload["schema_version"] == 10
+    assert payload["schema_version"] == 11
     assert payload["metadata"]["stage_timings_seconds"]["report_generation"] >= 0
     assert (
         payload["metadata"]["stage_timings_seconds"]["total_with_report"]
@@ -774,6 +774,132 @@ def test_deleted_self_call_with_incomplete_mro_is_not_guessed(
         for item in report["findings"]
         if item["relation"] == "direct_call" and item["downstream"]["name"] == "self.removed"
     ]
+
+
+def test_deleted_class_attribute_read_is_an_introduced_break(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    VALUE = 1\n",
+        new_source="class Base:\n    pass\n",
+        consumer_source="from vllm.api import Base\n\ndef use():\n    return Base.VALUE\n",
+    )
+    report = _run(*roots)
+    findings = [
+        item
+        for item in report["findings"]
+        if item["relation"] == "direct_attribute" and item["contract_kind"] == "attribute_presence"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["action"] == "modify"
+    assert findings[0]["priority"] == "P1"
+    assert findings[0]["details"]["target"] == "vllm.api.Base.VALUE"
+    assert all(findings[0]["gates"].values())
+    assert report["summary"]["direct_attribute_dependencies"] == 1
+
+
+def test_deleted_annotated_instance_field_is_an_introduced_break(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def __init__(self):\n        self.payload = 1\n",
+        new_source="class Base:\n    def __init__(self):\n        pass\n",
+        consumer_source=("from vllm.api import Base\n\ndef use(value: Base):\n    return value.payload\n"),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["upstream"]["old"]["descriptor"] == "instance_attribute"
+    assert findings[0]["upstream"]["new"]["symbol_kind"] == "missing"
+
+
+def test_deleted_dataclass_field_is_an_introduced_break(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=("from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    payload: int\n"),
+        new_source=("from dataclasses import dataclass\n\n@dataclass\nclass Base:\n    replacement: int\n"),
+        consumer_source=("from vllm.api import Base\n\ndef use(value: Base):\n    return value.payload\n"),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["upstream"]["old"]["descriptor"] == "instance_attribute"
+    assert findings[0]["upstream"]["new"]["symbol_kind"] == "missing"
+
+
+def test_deleted_inherited_self_field_is_an_introduced_break(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def __init__(self):\n        self.payload = 1\n",
+        new_source="class Base:\n    def __init__(self):\n        pass\n",
+        consumer_source=(
+            "from vllm.api import Base\n\nclass Child(Base):\n    def use(self):\n        return self.payload\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["details"]["lookup_root"] == "vllm.api.Base"
+    assert findings[0]["details"]["resolution_basis"] == "old_fallback_self"
+
+
+def test_deleted_self_field_after_upstream_class_consolidation_is_a_break(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=("class DFlashSpeculator:\n    def __init__(self):\n        self.dflash_causal = True\n"),
+        new_source=(
+            "class DraftModelSpeculator:\n"
+            "    def __init__(self):\n"
+            "        self._group_causal = True\n\n"
+            "class DFlashSpeculator(DraftModelSpeculator):\n"
+            "    pass\n"
+        ),
+        consumer_source=(
+            "from vllm.api import DFlashSpeculator\n\n"
+            "class AscendDFlashSpeculator(DFlashSpeculator):\n"
+            "    def build(self):\n"
+            "        return self.dflash_causal\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["upstream"]["old"]["owner"] == "DFlashSpeculator"
+    assert findings[0]["upstream"]["new"]["owner"] == "DraftModelSpeculator"
+    assert findings[0]["downstream"]["name"] == "self.dflash_causal"
+
+
+def test_instance_field_moved_to_upstream_base_remains_compatible(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=(
+            "class Parent:\n    pass\n\nclass Base(Parent):\n    def __init__(self):\n        self.payload = 1\n"
+        ),
+        new_source=(
+            "class Parent:\n    def __init__(self):\n        self.payload = 1\n\nclass Base(Parent):\n    pass\n"
+        ),
+        consumer_source=("from vllm.api import Base\n\ndef use(value: Base):\n    return value.payload\n"),
+    )
+    report = _run(*roots)
+    assert not [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+
+
+def test_dynamic_attribute_provider_is_unresolved_not_a_break(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def __init__(self):\n        self.payload = 1\n",
+        new_source=("class Base:\n    def __getattr__(self, name):\n        return provide(name)\n"),
+        consumer_source=("from vllm.api import Base\n\ndef use(value: Base):\n    return value.payload\n"),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "analysis_unresolved"
+    assert findings[0]["action"] == "review"
+    assert findings[0]["priority"] == "P2"
 
 
 def test_deleted_verified_override_target_is_an_introduced_break(
@@ -1519,12 +1645,13 @@ def test_current_pair_validation_includes_direct_call_and_replacement_return(tmp
         source_versions={"vllm": new_sha, "vllm_ascend": ascend_sha},
     )
     relations, _ = engine.generate()
-    dependencies, findings = validate_current_contracts(
+    dependencies, attributes, findings = validate_current_contracts(
         engine,
         relations,
         GitSnapshot(vllm_root, new_sha),
     )
     assert dependencies
+    assert not attributes
     assert {(item["relation"], item["contract_kind"], item["status"]) for item in findings} >= {
         ("direct_call", "call_arguments", "risk"),
         ("monkey_patch", "replacement_return", "risk"),
@@ -1545,12 +1672,13 @@ def test_current_pair_validation_reports_missing_call_target(tmp_path: Path) -> 
         source_versions={"vllm": new_sha, "vllm_ascend": ascend_sha},
     )
     relations, _ = engine.generate()
-    dependencies, findings = validate_current_contracts(
+    dependencies, attributes, findings = validate_current_contracts(
         engine,
         relations,
         GitSnapshot(vllm_root, new_sha),
     )
     assert len(dependencies) == 1
+    assert not attributes
     direct = [item for item in findings if item["relation"] == "direct_call"]
     assert len(direct) == 1
     assert direct[0]["status"] == "risk"
@@ -1578,11 +1706,12 @@ def test_current_pair_validation_ignores_unverified_historical_self_candidate(
         source_versions={"vllm": new_sha, "vllm_ascend": ascend_sha},
     )
     relations, _ = engine.generate()
-    dependencies, findings = validate_current_contracts(
+    dependencies, attributes, findings = validate_current_contracts(
         engine,
         relations,
         GitSnapshot(vllm_root, new_sha),
     )
+    assert not attributes
     assert not [item for item in dependencies if item.callee == "self.removed"]
     assert not [
         item for item in findings if item["relation"] == "direct_call" and item["downstream"]["name"] == "self.removed"
@@ -1617,17 +1746,49 @@ def test_validate_cli_reports_current_contract_counts(tmp_path: Path) -> None:
     )
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["summary"]["direct_call_dependencies"] == 1
+    assert payload["summary"]["direct_attribute_dependencies"] == 0
     assert payload["summary"]["contract_risks"] == 1
     assert payload["contract_findings"][0]["contract_kind"] == "call_arguments"
+
+
+def test_validate_reports_a_missing_direct_attribute(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    VALUE = 1\n",
+        new_source="class Base:\n    pass\n",
+        consumer_source="from vllm.api import Base\n\ndef use():\n    return Base.VALUE\n",
+    )
+    vllm_root, ascend_root, _, new_sha, ascend_sha = roots
+    engine = InterfaceBoundaryGenerator(
+        vllm_root,
+        ascend_root,
+        source_versions={"vllm": new_sha, "vllm_ascend": ascend_sha},
+    )
+    relations, _ = engine.generate()
+    direct_calls, attributes, findings = validate_current_contracts(
+        engine,
+        relations,
+        GitSnapshot(vllm_root, new_sha),
+    )
+    assert not direct_calls
+    assert len(attributes) == 1
+    assert [(item["relation"], item["contract_kind"], item["status"]) for item in findings] == [
+        ("direct_attribute", "attribute_presence", "risk")
+    ]
 
 
 def test_vllm_interface_scenario_runs_only_upstream_pr_capabilities(tmp_path: Path) -> None:
     roots = _call_repositories(
         tmp_path,
-        old_source="class Base:\n    def run(self, value): return value\n",
+        old_source="class Base:\n    VALUE = 1\n    def run(self, value): return value\n",
         new_source="class Base:\n    def run(self, value, required): return value\n",
         consumer_source=(
-            "from vllm.api import Base\n\ndef replacement(self, value):\n    return value\n\nBase.run = replacement\n"
+            "from vllm.api import Base\n\n"
+            "def replacement(self, value):\n"
+            "    return value\n\n"
+            "Base.run = replacement\n\n"
+            "def read_value():\n"
+            "    return Base.VALUE\n"
         ),
     )
     report = analyze_range(
@@ -1642,6 +1803,9 @@ def test_vllm_interface_scenario_runs_only_upstream_pr_capabilities(tmp_path: Pa
     capabilities = report["metadata"]["analysis_plan"]["capabilities"]
     assert capabilities["inheritance_mro"]["state"] == "prerequisite"
     assert capabilities["monkey_patch"]["state"] == "skipped"
+    assert capabilities["direct_attribute"]["state"] == "skipped"
+    assert report["summary"]["direct_attribute_dependencies"] == 0
+    assert not [item for item in report["findings"] if item["relation"] == "direct_attribute"]
     assert capabilities["direct_import"]["state"] == "analyzed"
     assert report["metadata"]["timings_seconds"]["relation_generation.monkey_patch"] is None
     assert report["metadata"]["timings_seconds"]["direct_import_analysis"] is not None
@@ -1714,7 +1878,7 @@ def test_vllm_interface_expands_transitive_override_impacts_under_one_root_cause
 
     outputs = write_reports(report, tmp_path / "upstream-report")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 10
+    assert payload["schema_version"] == 11
     assert payload["summary"]["introduced_breaks"] == 2
     assert payload["summary"]["root_causes"] == 1
     markdown = Path(outputs["markdown"]).read_text(encoding="utf-8")
@@ -1880,6 +2044,7 @@ def test_persistent_cache_first_run_misses_and_second_run_hits(tmp_path: Path) -
     assert _component_statuses(hot, "downstream_relations") == ["hit"]
     assert _component_statuses(hot, "downstream_direct_imports") == ["hit"]
     assert _component_statuses(hot, "downstream_direct_calls") == ["hit"]
+    assert _component_statuses(hot, "downstream_direct_attributes") == ["hit"]
     assert _component_statuses(hot, "upstream_snapshot") == ["hit", "hit"]
     assert cold["metadata"]["repository_index_cache"]["downstream"]["status"] == "miss"
     assert hot["metadata"]["repository_index_cache"]["downstream"]["status"] == "hit"
@@ -1903,6 +2068,7 @@ def test_upstream_sha_change_invalidates_only_commit_dependent_entries(tmp_path:
 
     assert _component_statuses(report, "downstream_relations") == ["miss"]
     assert _component_statuses(report, "downstream_direct_calls") == ["miss"]
+    assert _component_statuses(report, "downstream_direct_attributes") == ["miss"]
     snapshot_status = {
         event["commit_sha"]: event["status"]
         for event in _cache_events(report)
@@ -1935,6 +2101,7 @@ def test_downstream_sha_change_invalidates_downstream_entries(tmp_path: Path) ->
     assert _component_statuses(report, "downstream_relations") == ["miss"]
     assert _component_statuses(report, "downstream_direct_imports") == ["miss"]
     assert _component_statuses(report, "downstream_direct_calls") == ["miss"]
+    assert _component_statuses(report, "downstream_direct_attributes") == ["miss"]
     assert _component_statuses(report, "upstream_snapshot") == ["hit", "hit"]
     downstream_index = report["metadata"]["repository_index_cache"]["downstream"]
     assert downstream_index["status"] == "miss"
@@ -1986,6 +2153,7 @@ def test_dirty_worktree_bypasses_persistent_cache(tmp_path: Path) -> None:
     assert _component_statuses(report, "downstream_relations") == ["bypassed"]
     assert _component_statuses(report, "downstream_direct_imports") == ["bypassed"]
     assert _component_statuses(report, "downstream_direct_calls") == ["bypassed"]
+    assert _component_statuses(report, "downstream_direct_attributes") == ["bypassed"]
     downstream_index = report["metadata"]["repository_index_cache"]["downstream"]
     assert downstream_index["status"] == "bypassed"
 

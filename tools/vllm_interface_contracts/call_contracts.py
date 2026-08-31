@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
-"""Exact static contracts for downstream calls and callable return values.
+"""Exact static contracts for downstream calls, member reads, and returns.
 
 This module intentionally lives in the shared engine.  The main2main skill is
 only an orchestration layer and must not grow a second AST implementation.
@@ -33,6 +33,7 @@ from .generator import (
     _TRITON_KERNEL_PROTOCOL,
     InterfaceBoundaryGenerator,
     ModuleInfo,
+    RepositoryIndex,
     _expression_name,
     _function_local_names,
     _function_scope_nodes,
@@ -137,6 +138,27 @@ class DirectCallDependency:
         payload["call_shape"] = self.call_shape.as_dict()
         payload["return_use"] = self.return_use.as_dict()
         return payload
+
+
+@dataclass(frozen=True)
+class DirectAttributeDependency:
+    """One uniquely resolved vLLM member read made by vllm-ascend."""
+
+    target: str
+    access_kind: str
+    file: str
+    line: int
+    column: int
+    owner: str | None
+    scope: str | None
+    expression: str
+    receiver_type: str | None = None
+    member: str | None = None
+    lookup_root: str | None = None
+    resolution_basis: str = "new_exact"
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def call_shape(node: ast.Call) -> CallShape:
@@ -841,6 +863,80 @@ def _under_version_guard(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
     return False
 
 
+def _inside_annotation(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
+    current = node
+    parent = parents.get(id(current))
+    while parent is not None:
+        if isinstance(parent, ast.arg) and parent.annotation is current:
+            return True
+        if isinstance(parent, ast.AnnAssign) and parent.annotation is current:
+            return True
+        if isinstance(parent, (ast.AsyncFunctionDef, ast.FunctionDef)) and parent.returns is current:
+            return True
+        current = parent
+        parent = parents.get(id(current))
+    return False
+
+
+def _under_attribute_fallback(node: ast.Attribute, parents: dict[int, ast.AST]) -> bool:
+    """Return whether source explicitly handles this member being absent."""
+
+    receiver = ast.dump(node.value, include_attributes=False)
+
+    def positively_guards(test: ast.AST) -> bool:
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+            return any(positively_guards(value) for value in test.values)
+        return (
+            isinstance(test, ast.Call)
+            and (_expression_name(test.func) or "").rsplit(".", 1)[-1] == "hasattr"
+            and len(test.args) == 2
+            and ast.dump(test.args[0], include_attributes=False) == receiver
+            and isinstance(test.args[1], ast.Constant)
+            and test.args[1].value == node.attr
+        )
+
+    current: ast.AST = node
+    parent = parents.get(id(current))
+    while parent is not None:
+        if isinstance(parent, ast.If) and current in parent.body and positively_guards(parent.test):
+            return True
+        if isinstance(parent, ast.Try) and current in parent.body:
+            if any(
+                (_expression_name(handler.type) or "").rsplit(".", 1)[-1] == "AttributeError"
+                for handler in parent.handlers
+            ):
+                return True
+        current = parent
+        parent = parents.get(id(current))
+    return False
+
+
+def _attribute_is_read(node: ast.Attribute, parents: dict[int, ast.AST]) -> bool:
+    if isinstance(node.ctx, ast.Load):
+        return True
+    parent = parents.get(id(node))
+    return isinstance(parent, ast.AugAssign) and parent.target is node
+
+
+def _attribute_is_call_target(node: ast.Attribute, parents: dict[int, ast.AST]) -> bool:
+    current: ast.AST = node
+    parent = parents.get(id(current))
+    while (
+        isinstance(parent, ast.Attribute)
+        and parent.value is current
+        or isinstance(parent, ast.Subscript)
+        and parent.value is current
+    ):
+        current = parent
+        parent = parents.get(id(current))
+    return isinstance(parent, ast.Call) and parent.func is current
+
+
+def _member_access(node: ast.Call | ast.Attribute) -> ast.Attribute | None:
+    candidate = node.func if isinstance(node, ast.Call) else node
+    return candidate if isinstance(candidate, ast.Attribute) else None
+
+
 def _annotation_reference(node: ast.AST | None) -> str | None:
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
         candidates = {_annotation_reference(node.left), _annotation_reference(node.right)} - {None, "None"}
@@ -853,8 +949,8 @@ def _annotation_reference(node: ast.AST | None) -> str | None:
     return _expression_name(node)
 
 
-class DirectCallDetector:
-    """Discover exact downstream-to-upstream calls without changing golden relations."""
+class _DirectDependencyResolver:
+    """Shared exact name, receiver, and MRO resolution for downstream uses."""
 
     def __init__(self, engine: InterfaceBoundaryGenerator):
         self.engine = engine
@@ -1096,25 +1192,26 @@ class DirectCallDetector:
 
     def _self_or_super_target(
         self,
-        node: ast.Call,
+        node: ast.Call | ast.Attribute,
         parents: dict[int, ast.AST],
         module: str,
     ) -> tuple[str, str, str, str, str | None, str] | None:
-        if not isinstance(node.func, ast.Attribute):
+        member_access = _member_access(node)
+        if member_access is None:
             return None
         is_super = (
-            isinstance(node.func.value, ast.Call)
-            and isinstance(node.func.value.func, ast.Name)
-            and node.func.value.func.id == "super"
-            and not node.func.value.args
-            and not node.func.value.keywords
+            isinstance(member_access.value, ast.Call)
+            and isinstance(member_access.value.func, ast.Name)
+            and member_access.value.func.id == "super"
+            and not member_access.value.args
+            and not member_access.value.keywords
         )
         function = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
         receiver = None
         if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             positional = [*function.args.posonlyargs, *function.args.args]
             receiver = positional[0].arg if positional else None
-        is_receiver = isinstance(node.func.value, ast.Name) and node.func.value.id == receiver
+        is_receiver = isinstance(member_access.value, ast.Name) and member_access.value.id == receiver
         if not is_super and not is_receiver:
             return None
         if (
@@ -1131,20 +1228,20 @@ class DirectCallDetector:
         if not mro.complete:
             return None
         owners = mro.owners[1:] if is_super else mro.owners
-        resolution = self.engine._effective_method_resolution(owners, node.func.attr)
+        resolution = self.engine._effective_method_resolution(owners, member_access.attr)
         if (
             len(resolution.callable_owners) == 1
             and not resolution.may_be_missing
             and not resolution.may_be_non_callable
             and not resolution.has_unresolved_value
         ):
-            target = f"{resolution.callable_owners[0]}.{node.func.attr}"
+            target = f"{resolution.callable_owners[0]}.{member_access.attr}"
             return (
                 (
                     target,
                     "instance",
                     class_name,
-                    node.func.attr,
+                    member_access.attr,
                     None,
                     "new_exact",
                 )
@@ -1157,7 +1254,7 @@ class DirectCallDetector:
             and not resolution.may_be_non_callable
             and not resolution.has_unresolved_value
             and not resolution.blocking_owners
-            and not hasattr(object, node.func.attr)
+            and not hasattr(object, member_access.attr)
         )
         if not definitely_missing:
             return None
@@ -1168,23 +1265,24 @@ class DirectCallDetector:
         if lookup_root is None:
             return None
         return (
-            f"{lookup_root}.{node.func.attr}",
+            f"{lookup_root}.{member_access.attr}",
             "instance",
             class_name,
-            node.func.attr,
+            member_access.attr,
             lookup_root,
             "old_fallback_super" if is_super else "old_fallback_self",
         )
 
     def _annotated_instance_target(
         self,
-        node: ast.Call,
+        node: ast.Call | ast.Attribute,
         function: ast.AsyncFunctionDef | ast.FunctionDef | None,
         module_info: ModuleInfo,
     ) -> tuple[str, str, str, str, str | None, str] | None:
-        if function is None or not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
+        member_access = _member_access(node)
+        if function is None or member_access is None or not isinstance(member_access.value, ast.Name):
             return None
-        root = node.func.value.id
+        root = member_access.value.id
         arguments = [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]
         argument = next((item for item in arguments if item.arg == root), None)
         reference = _annotation_reference(argument.annotation) if argument is not None else None
@@ -1201,8 +1299,8 @@ class DirectCallDetector:
         )
         if resolved is None:
             return None
-        target = f"{resolved}.{node.func.attr}"
-        return (target, "instance", resolved, node.func.attr, None, "new_exact")
+        target = f"{resolved}.{member_access.attr}"
+        return (target, "instance", resolved, member_access.attr, None, "new_exact")
 
     def _resolve_in_scope(
         self,
@@ -1240,28 +1338,29 @@ class DirectCallDetector:
 
     def _constructed_instance_target(
         self,
-        node: ast.Call,
+        node: ast.Call | ast.Attribute,
         function: ast.AsyncFunctionDef | ast.FunctionDef | None,
         module_info: ModuleInfo,
     ) -> tuple[str, str, str, str, str | None, str] | None:
-        if not isinstance(node.func, ast.Attribute):
+        member_access = _member_access(node)
+        if member_access is None:
             return None
         annotation_reference: str | None = None
-        if isinstance(node.func.value, ast.Call):
+        if isinstance(member_access.value, ast.Call):
             reference = self._resolve_in_scope(
-                node.func.value.func,
+                member_access.value.func,
                 function=function,
                 module_info=module_info,
-                line=getattr(node.func.value, "lineno", getattr(node, "lineno", 0)),
+                line=getattr(member_access.value, "lineno", getattr(node, "lineno", 0)),
             )
             if reference is None:
                 return None
             # This remains a candidate receiver path, not proof that the
             # symbol is a class.  Old/new endpoint resolution must each prove
             # the class and inherited member independently.
-            return (f"{reference}.{node.func.attr}", "instance", reference, node.func.attr, None, "new_exact")
-        if function is not None and isinstance(node.func.value, ast.Name):
-            root = node.func.value.id
+            return (f"{reference}.{member_access.attr}", "instance", reference, member_access.attr, None, "new_exact")
+        if function is not None and isinstance(member_access.value, ast.Name):
+            root = member_access.value.id
             binding = self._constructed_instance_bindings(function, module_info).get(root)
             if isinstance(binding, ast.AnnAssign):
                 binding_end = (
@@ -1287,7 +1386,7 @@ class DirectCallDetector:
                 if binding_end > call_start:
                     return None
                 reference = self._resolve_in_scope(
-                    node.func.value,
+                    member_access.value,
                     function=function,
                     module_info=module_info,
                     line=getattr(node, "lineno", 0),
@@ -1301,7 +1400,14 @@ class DirectCallDetector:
                     )
                 if reference is None:
                     return None
-                return (f"{reference}.{node.func.attr}", "instance", reference, node.func.attr, None, "new_exact")
+                return (
+                    f"{reference}.{member_access.attr}",
+                    "instance",
+                    reference,
+                    member_access.attr,
+                    None,
+                    "new_exact",
+                )
         if annotation_reference is None:
             return None
         try:
@@ -1315,19 +1421,20 @@ class DirectCallDetector:
         )
         if reference is None:
             return None
-        target = f"{reference}.{node.func.attr}"
-        return (target, "instance", reference, node.func.attr, None, "new_exact")
+        target = f"{reference}.{member_access.attr}"
+        return (target, "instance", reference, member_access.attr, None, "new_exact")
 
     def _resolved_access_kind(
         self,
-        node: ast.Call,
+        node: ast.Call | ast.Attribute,
         target: str,
         function: ast.AsyncFunctionDef | ast.FunctionDef | None,
         module_info: ModuleInfo,
     ) -> str | None:
-        if function is None or not isinstance(node.func, ast.Attribute) or not isinstance(node.func.value, ast.Name):
+        member_access = _member_access(node)
+        if function is None or member_access is None or not isinstance(member_access.value, ast.Name):
             return self._access_kind(node, target)
-        root = node.func.value.id
+        root = member_access.value.id
         bindings = self._constructed_instance_bindings(function, module_info)
         if root not in bindings:
             return self._access_kind(node, target)
@@ -1337,7 +1444,7 @@ class DirectCallDetector:
         return None
 
     @staticmethod
-    def _access_kind(_node: ast.Call, _target: str) -> str:
+    def _access_kind(_node: ast.Call | ast.Attribute, _target: str) -> str:
         # A bare imported symbol can be a function or a class, and an
         # attribute can belong to either a module or a class.  Preserve that
         # syntax-neutral fact; each old/new snapshot derives its own binding.
@@ -1348,6 +1455,10 @@ class DirectCallDetector:
 
         callable_info = self.engine.upstream.find_callable(target)
         return callable_info is not None and callable_info.decorator_references == (_TRITON_JIT_DECORATOR,)
+
+
+class DirectCallDetector(_DirectDependencyResolver):
+    """Discover exact downstream-to-upstream calls without changing golden relations."""
 
     def discover(self) -> list[DirectCallDependency]:
         """Discover exact downstream calls and constrained return uses."""
@@ -1473,8 +1584,245 @@ class DirectCallDetector:
         return [unique[key] for key in sorted(unique)]
 
 
+class DirectAttributeDetector(_DirectDependencyResolver):
+    """Discover exact downstream reads of upstream members."""
+
+    def __init__(self, engine: InterfaceBoundaryGenerator):
+        super().__init__(engine)
+        self.historical_attribute_candidates: list[DirectAttributeDependency] = []
+        self._defined_member_cache: dict[tuple[int, str, str], bool] = {}
+
+    def _index_owner_defines_member(self, index: RepositoryIndex, owner: str, member: str) -> bool:
+        cache_key = (id(index), owner, member)
+        if cache_key in self._defined_member_cache:
+            return self._defined_member_cache[cache_key]
+        if index.find_value(f"{owner}.{member}") is not None:
+            self._defined_member_cache[cache_key] = True
+            return True
+        if index.find_callable(f"{owner}.{member}") is not None:
+            self._defined_member_cache[cache_key] = True
+            return True
+        class_info = index.classes.get(owner)
+        if class_info is None:
+            self._defined_member_cache[cache_key] = False
+            return False
+        for method in class_info.methods.values():
+            if not isinstance(method, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            positional = [*method.args.posonlyargs, *method.args.args]
+            receiver = positional[0].arg if positional else None
+            if receiver is None:
+                continue
+            for candidate in _function_scope_nodes(method):
+                if isinstance(candidate, (ast.Assign, ast.AnnAssign)):
+                    if isinstance(candidate, ast.AnnAssign) and candidate.value is None:
+                        continue
+                    targets = candidate.targets if isinstance(candidate, ast.Assign) else (candidate.target,)
+                    if any(
+                        isinstance(target, ast.Attribute)
+                        and target.attr == member
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == receiver
+                        for target in targets
+                    ):
+                        self._defined_member_cache[cache_key] = True
+                        return True
+                if (
+                    isinstance(candidate, ast.Call)
+                    and (_expression_name(candidate.func) or "").rsplit(".", 1)[-1] == "setattr"
+                    and len(candidate.args) >= 2
+                    and isinstance(candidate.args[0], ast.Name)
+                    and candidate.args[0].id == receiver
+                    and isinstance(candidate.args[1], ast.Constant)
+                    and candidate.args[1].value == member
+                ):
+                    self._defined_member_cache[cache_key] = True
+                    return True
+        self._defined_member_cache[cache_key] = False
+        return False
+
+    def _local_owner_defines_member(self, owner: str, member: str) -> bool:
+        return self._index_owner_defines_member(self.engine.downstream, owner, member)
+
+    def _self_or_super_attribute_target(
+        self,
+        node: ast.Attribute,
+        parents: dict[int, ast.AST],
+        module: str,
+    ) -> tuple[str, str, str, str, str | None, str] | None:
+        is_super = (
+            isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "super"
+            and not node.value.args
+            and not node.value.keywords
+        )
+        function = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
+        receiver = None
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            positional = [*function.args.posonlyargs, *function.args.args]
+            receiver = positional[0].arg if positional else None
+        is_receiver = isinstance(node.value, ast.Name) and node.value.id == receiver
+        if not is_super and not is_receiver:
+            return None
+        if (
+            is_receiver
+            and isinstance(function, (ast.AsyncFunctionDef, ast.FunctionDef))
+            and receiver is not None
+            and self._name_reassigned_before(function, receiver, node)
+        ):
+            return None
+        class_name = self._class_name(node, parents, module)
+        if class_name is None:
+            return None
+        mro = self.engine._linearized_mro(class_name)
+        if not mro.complete:
+            return None
+        owners = mro.owners[1:] if is_super else mro.owners
+        lookup_root = next((owner for owner in owners if owner.startswith("vllm.")), None)
+        if lookup_root is None:
+            return None
+        for owner in owners:
+            if owner.startswith("vllm."):
+                if self._index_owner_defines_member(self.engine.upstream, owner, node.attr):
+                    return (
+                        f"{owner}.{node.attr}",
+                        "instance",
+                        class_name,
+                        node.attr,
+                        None,
+                        "new_exact",
+                    )
+            elif self._local_owner_defines_member(owner, node.attr):
+                return None
+        if hasattr(object, node.attr):
+            return None
+        return (
+            f"{lookup_root}.{node.attr}",
+            "instance",
+            class_name,
+            node.attr,
+            lookup_root,
+            "old_fallback_super" if is_super else "old_fallback_self",
+        )
+
+    def discover(self) -> list[DirectAttributeDependency]:
+        dependencies: list[DirectAttributeDependency] = []
+        for module_info in self.engine.downstream.modules.values():
+            tree = module_info.tree
+            parents = _parents(tree)
+            for node in ast.walk(tree):
+                if (
+                    not isinstance(node, ast.Attribute)
+                    or not _attribute_is_read(node, parents)
+                    or _under_version_guard(node, parents)
+                    or _inside_annotation(node, parents)
+                    or _under_attribute_fallback(node, parents)
+                ):
+                    continue
+                parent = parents.get(id(node))
+                if (
+                    isinstance(parent, ast.Attribute)
+                    and parent.value is node
+                    or _attribute_is_call_target(node, parents)
+                ):
+                    continue
+                function_node = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
+                function = function_node if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+                special = self._self_or_super_attribute_target(node, parents, module_info.name)
+                special = special or self._annotated_instance_target(node, function, module_info)
+                expression = _expression_name(node)
+                root = expression.split(".", 1)[0] if expression is not None else None
+                candidate_roots = self._scope_candidate_roots(function, module_info)
+                if root is not None and self._outer_function_shadows(
+                    node,
+                    root,
+                    parents,
+                    function,
+                ):
+                    continue
+                may_be_constructed = (
+                    isinstance(node.value, ast.Call)
+                    and (_expression_name(node.value.func) or "").split(".", 1)[0] in candidate_roots
+                ) or root in candidate_roots
+                if special is None and may_be_constructed:
+                    special = self._constructed_instance_target(node, function, module_info)
+
+                receiver_type: str | None
+                member: str | None
+                lookup_root: str | None
+                access_kind: str
+                if special is not None:
+                    target = special[0]
+                    access_kind = special[1]
+                    receiver_type = special[2]
+                    member = special[3]
+                    lookup_root = special[4]
+                    resolution_basis = special[5]
+                else:
+                    if root not in candidate_roots:
+                        continue
+                    resolved = self._resolve_in_scope(
+                        node,
+                        function=function,
+                        module_info=module_info,
+                        line=getattr(node, "lineno", 0),
+                    )
+                    if resolved is None or not resolved.startswith("vllm."):
+                        continue
+                    resolved_access_kind = self._resolved_access_kind(
+                        node,
+                        resolved,
+                        function,
+                        module_info,
+                    )
+                    if resolved_access_kind is None:
+                        continue
+                    target = resolved
+                    access_kind = resolved_access_kind
+                    receiver_type = None
+                    member = node.attr
+                    lookup_root = None
+                    resolution_basis = "new_exact"
+                owner = self._class_name(node, parents, module_info.name)
+                dependency = DirectAttributeDependency(
+                    target=target,
+                    access_kind=access_kind,
+                    file=module_info.file,
+                    line=getattr(node, "lineno", 0),
+                    column=getattr(node, "col_offset", 0),
+                    owner=owner.rsplit(".", 1)[-1] if owner else None,
+                    scope=function.name if function is not None else None,
+                    expression=ast.unparse(node),
+                    receiver_type=receiver_type,
+                    member=member,
+                    lookup_root=lookup_root,
+                    resolution_basis=resolution_basis,
+                )
+                if lookup_root is not None:
+                    self.historical_attribute_candidates.append(dependency)
+                else:
+                    dependencies.append(dependency)
+        unique = {
+            (
+                item.file,
+                item.line,
+                item.column,
+                item.target,
+                item.expression,
+                item.access_kind,
+                item.receiver_type,
+                item.member,
+            ): item
+            for item in dependencies
+        }
+        return [unique[key] for key in sorted(unique)]
+
+
 __all__ = [
     "CallShape",
+    "DirectAttributeDependency",
+    "DirectAttributeDetector",
     "DirectCallDependency",
     "DirectCallDetector",
     "ReturnContract",
