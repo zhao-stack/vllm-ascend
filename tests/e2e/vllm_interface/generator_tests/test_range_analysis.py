@@ -553,7 +553,7 @@ def test_report_writer_separates_introduced_csv(tmp_path: Path) -> None:
     outputs = write_reports(report, tmp_path / "reports")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
     introduced_csv = Path(outputs["introduced_csv"]).read_text(encoding="utf-8-sig")
-    assert payload["schema_version"] == 11
+    assert payload["schema_version"] == 12
     assert payload["metadata"]["stage_timings_seconds"]["report_generation"] >= 0
     assert (
         payload["metadata"]["stage_timings_seconds"]["total_with_report"]
@@ -796,6 +796,251 @@ def test_deleted_class_attribute_read_is_an_introduced_break(tmp_path: Path) -> 
     assert findings[0]["details"]["target"] == "vllm.api.Base.VALUE"
     assert all(findings[0]["gates"].values())
     assert report["summary"]["direct_attribute_dependencies"] == 1
+
+
+def _inherited_state_repositories(
+    tmp_path: Path,
+    downstream_initializer: str,
+    *,
+    new_property_body: str = "return self._state.enabled",
+) -> tuple[Path, Path, str, str, str]:
+    return _call_repositories(
+        tmp_path,
+        old_source=("class Base:\n    def __init__(self, config):\n        self._state = config\n"),
+        new_source=(
+            "class Base:\n"
+            "    def __init__(self, config):\n"
+            "        self._state = config\n\n"
+            "    @property\n"
+            "    def requires_state(self):\n"
+            f"        {new_property_body}\n"
+        ),
+        consumer_source=(
+            "from vllm.api import Base\n\n"
+            "class Child(Base):\n"
+            "    def __init__(self, config):\n"
+            f"{downstream_initializer}"
+        ),
+    )
+
+
+def test_new_inherited_property_read_missing_downstream_state_is_a_break(
+    tmp_path: Path,
+) -> None:
+    roots = _inherited_state_repositories(
+        tmp_path,
+        "        self.local = config\n",
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["classification"] == "introduced_break"
+    assert finding["contract_kind"] == "required_instance_attribute"
+    assert finding["direction"] == "upstream_inherited_read_to_downstream_state"
+    assert finding["action"] == "modify"
+    assert finding["priority"] == "P1"
+    assert finding["upstream"]["old"]["symbol_kind"] == "missing"
+    assert finding["upstream"]["new"]["descriptor"] == "property"
+    assert finding["downstream"]["name"] == "__init__"
+    assert finding["details"]["required_attribute"] == "_state"
+    assert finding["details"]["initialization_status"] == "missing"
+    assert report["summary"]["inherited_state_dependencies"] == 1
+
+
+def test_inherited_state_is_compatible_when_downstream_assigns_the_field(
+    tmp_path: Path,
+) -> None:
+    roots = _inherited_state_repositories(
+        tmp_path,
+        "        self._state = config\n",
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "compatibility_warning"
+    assert findings[0]["compatibility"]["new"]["compatible"] is True
+    assert findings[0]["action"] == "review"
+
+
+def test_inherited_state_is_compatible_when_downstream_calls_super_init(
+    tmp_path: Path,
+) -> None:
+    roots = _inherited_state_repositories(
+        tmp_path,
+        "        super().__init__(config)\n",
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "compatibility_warning"
+    assert findings[0]["compatibility"]["new"]["compatible"] is True
+
+
+def test_inherited_state_is_compatible_when_super_init_is_in_required_with_block(
+    tmp_path: Path,
+) -> None:
+    roots = _inherited_state_repositories(
+        tmp_path,
+        "        with context():\n            super().__init__(config)\n",
+    )
+    _write(
+        roots[1],
+        "vllm_ascend/context.py",
+        "from contextlib import nullcontext\n\ncontext = nullcontext\n",
+    )
+    _write(
+        roots[1],
+        "vllm_ascend/consumer.py",
+        "from vllm.api import Base\n"
+        "from vllm_ascend.context import context\n\n"
+        "class Child(Base):\n"
+        "    def __init__(self, config):\n"
+        "        with context():\n"
+        "            super().__init__(config)\n",
+    )
+    ascend_sha = _commit(roots[1], "with-wrapped initializer")
+    report = _run(roots[0], roots[1], roots[2], roots[3], ascend_sha)
+    findings = [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "compatibility_warning"
+    assert findings[0]["compatibility"]["new"]["compatible"] is True
+
+
+def test_conditional_downstream_state_initialization_is_unresolved(
+    tmp_path: Path,
+) -> None:
+    roots = _inherited_state_repositories(
+        tmp_path,
+        "        if config:\n            self._state = config\n",
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "analysis_unresolved"
+    assert findings[0]["details"]["initialization_status"] == "unknown"
+
+
+def test_guarded_inherited_attribute_read_is_not_a_hard_requirement(
+    tmp_path: Path,
+) -> None:
+    roots = _inherited_state_repositories(
+        tmp_path,
+        "        self.local = config\n",
+        new_property_body=("if hasattr(self, '_state'):\n            return self._state.enabled\n        return False"),
+    )
+    report = _run(*roots)
+    assert not [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert report["summary"]["inherited_state_dependencies"] == 0
+
+
+def test_terminating_initializer_branch_proves_upstream_required_state(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=(
+            "class Base:\n"
+            "    def __init__(self, config):\n"
+            "        if config is not None:\n"
+            "            self._state = config\n"
+            "        else:\n"
+            "            raise ValueError('config is required')\n"
+        ),
+        new_source=(
+            "class Base:\n"
+            "    def __init__(self, config):\n"
+            "        if config is not None:\n"
+            "            self._state = config\n"
+            "        else:\n"
+            "            raise ValueError('config is required')\n\n"
+            "    @property\n"
+            "    def requires_state(self):\n"
+            "        return self._state.enabled\n"
+        ),
+        consumer_source=(
+            "from vllm.api import Base\n\n"
+            "class Child(Base):\n"
+            "    def __init__(self, config):\n"
+            "        self.local = config\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["details"]["required_attribute"] == "_state"
+
+
+def test_inherited_state_groups_members_and_transitive_impacts_by_constructor_field(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def __init__(self):\n        self._state = 1\n",
+        new_source=(
+            "class Base:\n"
+            "    def __init__(self):\n"
+            "        self._state = 1\n\n"
+            "    def first(self):\n"
+            "        return self._state\n\n"
+            "    def second(self):\n"
+            "        return self._state\n"
+        ),
+        consumer_source=(
+            "from vllm.api import Base\n\n"
+            "class Child(Base):\n"
+            "    def __init__(self):\n"
+            "        self.local = 1\n\n"
+            "class GrandChild(Child):\n"
+            "    pass\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "inherited_state"]
+    assert len(findings) == 1
+    assert findings[0]["details"]["inherited_members"] == [
+        "vllm.api.Base.first",
+        "vllm.api.Base.second",
+    ]
+    assert findings[0]["details"]["impacted_downstream_classes"] == [
+        "vllm_ascend.consumer.Child",
+        "vllm_ascend.consumer.GrandChild",
+    ]
+    assert report["summary"]["inherited_state_dependencies"] == 4
+
+
+def test_conditional_inherited_state_read_is_review_not_a_proven_break(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=("class Base:\n    def __init__(self):\n        self.enabled = False\n        self.payload = 1\n"),
+        new_source=(
+            "class Base:\n"
+            "    def __init__(self):\n"
+            "        self.enabled = False\n"
+            "        self.payload = 1\n\n"
+            "    def use(self):\n"
+            "        if self.enabled:\n"
+            "            return self.payload\n"
+            "        return None\n"
+        ),
+        consumer_source=(
+            "from vllm.api import Base\n\nclass Child(Base):\n    def __init__(self):\n        self.local = 1\n"
+        ),
+    )
+    report = _run(*roots)
+    by_field = {
+        item["details"]["required_attribute"]: item
+        for item in report["findings"]
+        if item["relation"] == "inherited_state"
+    }
+    assert by_field["enabled"]["classification"] == "introduced_break"
+    assert by_field["enabled"]["details"]["read_condition"] == "unconditional"
+    assert by_field["payload"]["classification"] == "analysis_unresolved"
+    assert by_field["payload"]["details"]["read_condition"] == "conditional"
+    assert by_field["payload"]["action"] == "review"
 
 
 def test_deleted_annotated_instance_field_is_an_introduced_break(tmp_path: Path) -> None:
@@ -1804,7 +2049,9 @@ def test_vllm_interface_scenario_runs_only_upstream_pr_capabilities(tmp_path: Pa
     assert capabilities["inheritance_mro"]["state"] == "prerequisite"
     assert capabilities["monkey_patch"]["state"] == "skipped"
     assert capabilities["direct_attribute"]["state"] == "skipped"
+    assert capabilities["inherited_state"]["state"] == "skipped"
     assert report["summary"]["direct_attribute_dependencies"] == 0
+    assert report["summary"]["inherited_state_dependencies"] == 0
     assert not [item for item in report["findings"] if item["relation"] == "direct_attribute"]
     assert capabilities["direct_import"]["state"] == "analyzed"
     assert report["metadata"]["timings_seconds"]["relation_generation.monkey_patch"] is None
@@ -1878,7 +2125,7 @@ def test_vllm_interface_expands_transitive_override_impacts_under_one_root_cause
 
     outputs = write_reports(report, tmp_path / "upstream-report")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 11
+    assert payload["schema_version"] == 12
     assert payload["summary"]["introduced_breaks"] == 2
     assert payload["summary"]["root_causes"] == 1
     markdown = Path(outputs["markdown"]).read_text(encoding="utf-8")

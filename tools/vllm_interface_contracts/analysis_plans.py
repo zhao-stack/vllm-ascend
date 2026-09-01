@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-ANALYSIS_PLAN_VERSION = 3
+ANALYSIS_PLAN_VERSION = 4
 MAIN2MAIN_SCENARIO = "main2main"
 VLLM_INTERFACE_SCENARIO = "vllm-interface"
 SCENARIOS = (MAIN2MAIN_SCENARIO, VLLM_INTERFACE_SCENARIO)
@@ -42,6 +42,7 @@ class AnalysisPlan:
     analyze_direct_imports: bool
     analyze_direct_calls: bool
     analyze_direct_attributes: bool
+    analyze_inherited_state: bool
     include_generator_findings: bool
     report_style: str
 
@@ -85,6 +86,10 @@ class AnalysisPlan:
                 "state": "analyzed" if self.analyze_direct_attributes else "skipped",
                 "produces_findings": self.analyze_direct_attributes,
             },
+            "inherited_state": {
+                "state": "analyzed" if self.analyze_inherited_state else "skipped",
+                "produces_findings": self.analyze_inherited_state,
+            },
             "generator_findings": {
                 "state": "included" if self.include_generator_findings else "skipped",
                 "produces_findings": self.include_generator_findings,
@@ -109,6 +114,7 @@ MAIN2MAIN_PLAN = AnalysisPlan(
     analyze_direct_imports=True,
     analyze_direct_calls=True,
     analyze_direct_attributes=True,
+    analyze_inherited_state=True,
     include_generator_findings=True,
     report_style="main2main-full",
 )
@@ -122,6 +128,7 @@ VLLM_INTERFACE_PLAN = AnalysisPlan(
     analyze_direct_imports=True,
     analyze_direct_calls=True,
     analyze_direct_attributes=False,
+    analyze_inherited_state=False,
     include_generator_findings=False,
     report_style="upstream-pr-introduced-only",
 )

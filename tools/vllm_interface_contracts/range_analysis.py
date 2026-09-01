@@ -52,6 +52,9 @@ from .call_contracts import (
     DirectCallDetector,
     ReturnContract,
     ReturnShape,
+    _attribute_is_read,
+    _parents,
+    _under_attribute_fallback,
     bind_call_shape,
     infer_return_contract,
     replacement_return_compatible,
@@ -76,6 +79,7 @@ from .generator import (
     _import_binding_reference,
     _jsonable_signature,
     _scope_final_bindings,
+    _statements_must_terminate,
     _tag_guard_names,
 )
 from .models import (
@@ -84,10 +88,10 @@ from .models import (
     SourceEndpoint,
 )
 
-RANGE_SCHEMA_VERSION = 11
-RANGE_ANALYZER_VERSION = "2.1.0"
-SNAPSHOT_CACHE_SCHEMA_VERSION = 3
-RELATION_CACHE_SCHEMA_VERSION = 1
+RANGE_SCHEMA_VERSION = 12
+RANGE_ANALYZER_VERSION = "2.2.0"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 4
+RELATION_CACHE_SCHEMA_VERSION = 2
 DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
 DIRECT_CALL_CACHE_SCHEMA_VERSION = 1
 DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 3
@@ -98,6 +102,40 @@ CLASSIFICATIONS = (
     "fixed",
     "analysis_unresolved",
 )
+
+
+@dataclass(frozen=True)
+class InheritedStateDependency:
+    """A new upstream inherited read that depends on downstream instance state."""
+
+    downstream_class: str
+    downstream_file: str
+    upstream_root: str
+    inherited_member: str
+    required_attribute: str
+    read_line: int
+    read_condition: str
+    constructor_owner: str
+    constructor_file: str
+    constructor_line: int
+    initialization_status: str
+    initialization_reason: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "downstream_class": self.downstream_class,
+            "downstream_file": self.downstream_file,
+            "upstream_root": self.upstream_root,
+            "inherited_member": self.inherited_member,
+            "required_attribute": self.required_attribute,
+            "read_line": self.read_line,
+            "read_condition": self.read_condition,
+            "constructor_owner": self.constructor_owner,
+            "constructor_file": self.constructor_file,
+            "constructor_line": self.constructor_line,
+            "initialization_status": self.initialization_status,
+            "initialization_reason": self.initialization_reason,
+        }
 
 
 def _diagnostic_timing(
@@ -935,20 +973,82 @@ class GitSnapshot:
                 return True
         return False
 
-    @staticmethod
-    def _calls_super_init(function: ast.AsyncFunctionDef | ast.FunctionDef) -> bool:
-        return any(
-            isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Call)
-            and isinstance(statement.value.func, ast.Attribute)
-            and statement.value.func.attr == "__init__"
-            and isinstance(statement.value.func.value, ast.Call)
-            and isinstance(statement.value.func.value.func, ast.Name)
-            and statement.value.func.value.func.id == "super"
-            and not statement.value.func.value.args
-            and not statement.value.func.value.keywords
-            for statement in function.body
-        )
+    @classmethod
+    def _statements_definitely_assign_instance_member(
+        cls,
+        statements: Iterable[ast.stmt],
+        receiver: str,
+        member: str,
+    ) -> bool:
+        """Prove a field assignment on every normally completing branch."""
+
+        for statement in statements:
+            if cls._instance_assignment(statement, receiver, member) is not None:
+                return True
+            if not isinstance(statement, ast.If):
+                if isinstance(statement, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
+                    return False
+                continue
+            body_assigns = cls._statements_definitely_assign_instance_member(
+                statement.body,
+                receiver,
+                member,
+            )
+            else_assigns = cls._statements_definitely_assign_instance_member(
+                statement.orelse,
+                receiver,
+                member,
+            )
+            body_terminates = _statements_must_terminate(statement.body)
+            else_terminates = _statements_must_terminate(statement.orelse)
+            if (
+                (body_assigns or body_terminates)
+                and (else_assigns or else_terminates)
+                and not (body_terminates and else_terminates)
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _statements_definitely_call_super_init(
+        cls,
+        statements: Iterable[ast.stmt],
+    ) -> bool:
+        for statement in statements:
+            if (
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and statement.value.func.attr == "__init__"
+                and isinstance(statement.value.func.value, ast.Call)
+                and isinstance(statement.value.func.value.func, ast.Name)
+                and statement.value.func.value.func.id == "super"
+                and not statement.value.func.value.args
+                and not statement.value.func.value.keywords
+            ):
+                return True
+            if isinstance(statement, (ast.AsyncWith, ast.With)):
+                if cls._statements_definitely_call_super_init(statement.body):
+                    return True
+                continue
+            if isinstance(statement, ast.If):
+                body_calls = cls._statements_definitely_call_super_init(statement.body)
+                else_calls = cls._statements_definitely_call_super_init(statement.orelse)
+                body_terminates = _statements_must_terminate(statement.body)
+                else_terminates = _statements_must_terminate(statement.orelse)
+                if (
+                    (body_calls or body_terminates)
+                    and (else_calls or else_terminates)
+                    and not (body_terminates and else_terminates)
+                ):
+                    return True
+            if isinstance(statement, (ast.Break, ast.Continue, ast.Raise, ast.Return)):
+                return False
+        return False
+
+    @classmethod
+    def _calls_super_init(cls, function: ast.AsyncFunctionDef | ast.FunctionDef) -> bool:
+        return cls._statements_definitely_call_super_init(function.body)
 
     @staticmethod
     def _slot_binding(class_node: ast.ClassDef, member: str) -> tuple[bool | None, ast.AST | None]:
@@ -1152,6 +1252,19 @@ class GitSnapshot:
                     assignment,
                     "non_callable",
                     _node_fingerprint(assignment),
+                )
+            if self._statements_definitely_assign_instance_member(
+                initializer.node.body,
+                receiver,
+                member,
+            ):
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    initializer.node,
+                    "non_callable",
+                    initializer.fingerprint,
                 )
             if self._function_may_assign_instance_member(initializer.node, receiver, member):
                 return _QualifiedBinding(
@@ -3084,6 +3197,538 @@ def _direct_attribute_findings(
     return findings, exact_dependencies
 
 
+def _instance_attribute_reads(
+    function: ast.AsyncFunctionDef | ast.FunctionDef,
+) -> dict[str, tuple[int, bool]]:
+    """Return exact receiver fields read by one inherited callable.
+
+    Direct method dispatch (``self.run()``) is a callable contract, not state.
+    A receiver used as the base of a longer chain (``self.client.send()``),
+    however, still requires the ``client`` instance attribute.  Explicit
+    ``hasattr`` or ``AttributeError`` fallbacks are not hard requirements.
+    """
+
+    positional = [*function.args.posonlyargs, *function.args.args]
+    if not positional:
+        return {}
+    receiver = positional[0].arg
+    parents = _parents(function)
+    reads: dict[str, tuple[int, bool]] = {}
+    for node in _function_scope_nodes(function):
+        if not (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == receiver
+            and _attribute_is_read(node, parents)
+        ):
+            continue
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.Call) and parent.func is node:
+            continue
+        if _under_attribute_fallback(node, parents):
+            continue
+        conditional = _under_conditional_branch(node, parents)
+        previous_line, previous_conditional = reads.get(node.attr, (node.lineno, True))
+        reads[node.attr] = (
+            min(previous_line, node.lineno),
+            previous_conditional and conditional,
+        )
+    return reads
+
+
+def _under_conditional_branch(
+    node: ast.AST,
+    parents: dict[int, ast.AST],
+) -> bool:
+    current = node
+    parent = parents.get(id(current))
+    while parent is not None:
+        if isinstance(parent, ast.If) and current is not parent.test:
+            return True
+        if isinstance(parent, ast.IfExp) and current is not parent.test:
+            return True
+        if isinstance(parent, (ast.AsyncFor, ast.For, ast.Match, ast.While)):
+            return True
+        current = parent
+        parent = parents.get(id(current))
+    return False
+
+
+def _snapshot_inherited_reads(
+    snapshot: GitSnapshot,
+    upstream_root: str,
+    member: str,
+) -> tuple[dict[str, tuple[int, bool]] | None, SourceEndpoint]:
+    endpoint = snapshot.call_endpoint(
+        f"{upstream_root}.{member}",
+        "instance",
+        receiver_type=upstream_root,
+        member=member,
+    )
+    binding = snapshot._effective_member(upstream_root, member)
+    if binding is None or binding.status == "unknown":
+        return None, endpoint
+    if binding.status != "exact":
+        return {}, endpoint
+    if not isinstance(binding.node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+        return None, endpoint
+    return _instance_attribute_reads(binding.node), endpoint
+
+
+def _downstream_class_binding_state(
+    engine: InterfaceBoundaryGenerator,
+    downstream_mro: tuple[str, ...],
+    upstream_index: int,
+    member: str,
+) -> CompatibilityState | None:
+    """Resolve a class-level fallback before the first upstream MRO owner."""
+
+    for owner in downstream_mro[:upstream_index]:
+        alternatives = engine._final_bindings(f"{owner}.{member}")
+        if not alternatives:
+            continue
+        live = [
+            alternative
+            for alternative in alternatives
+            if alternative.kind != "unbound"
+            and not (isinstance(alternative.node, ast.AnnAssign) and alternative.node.value is None)
+        ]
+        if not live:
+            continue
+        if len(alternatives) == 1:
+            return CompatibilityState(
+                True,
+                True,
+                f"downstream class {owner} provides the required member",
+            )
+        return CompatibilityState(
+            None,
+            None,
+            f"downstream class {owner} provides the member only on some source paths",
+        )
+    return None
+
+
+def _initializer_has_unresolved_base_call(
+    function: ast.AsyncFunctionDef | ast.FunctionDef,
+    receiver: str,
+) -> bool:
+    for node in _function_scope_nodes(function):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "__init__":
+            continue
+        if (
+            isinstance(node.func.value, ast.Call)
+            and isinstance(node.func.value.func, ast.Name)
+            and node.func.value.func.id == "super"
+            and not node.func.value.args
+            and not node.func.value.keywords
+        ):
+            continue
+        if node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == receiver:
+            return True
+    return False
+
+
+def _other_downstream_method_may_initialize(
+    engine: InterfaceBoundaryGenerator,
+    downstream_mro: tuple[str, ...],
+    upstream_index: int,
+    member: str,
+) -> bool:
+    for owner in downstream_mro[:upstream_index]:
+        class_info = engine.downstream.find_class(owner)
+        if class_info is None:
+            continue
+        for name, node in class_info.methods.items():
+            if name == "__init__" or not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            positional = [*node.args.posonlyargs, *node.args.args]
+            if positional and GitSnapshot._function_may_assign_instance_member(
+                node,
+                positional[0].arg,
+                member,
+            ):
+                return True
+    return False
+
+
+def _downstream_initialization_state(
+    engine: InterfaceBoundaryGenerator,
+    new_snapshot: GitSnapshot,
+    downstream_mro: tuple[str, ...],
+    upstream_root: str,
+    member: str,
+) -> tuple[CompatibilityState, SourceEndpoint]:
+    """Prove whether the effective downstream constructor establishes a field."""
+
+    upstream_index = downstream_mro.index(upstream_root)
+    class_binding = _downstream_class_binding_state(
+        engine,
+        downstream_mro,
+        upstream_index,
+        member,
+    )
+    if class_binding is not None:
+        owner = downstream_mro[0]
+        class_info = engine.downstream.find_class(owner)
+        return class_binding, SourceEndpoint(
+            class_info.file if class_info is not None else None,
+            class_info.name if class_info is not None else owner.rsplit(".", 1)[-1],
+            member,
+            symbol_kind="class_attribute",
+        )
+
+    for dynamic_name in ("__getattr__", "__getattribute__"):
+        resolution = engine._effective_method_resolution(
+            downstream_mro[:upstream_index],
+            dynamic_name,
+        )
+        if resolution.callable_owners:
+            owner = resolution.callable_owners[0]
+            callable_info = engine.downstream.find_callable(f"{owner}.{dynamic_name}")
+            return CompatibilityState(
+                None,
+                None,
+                f"downstream {dynamic_name} may provide the required member dynamically",
+            ), SourceEndpoint(
+                callable_info.file if callable_info is not None else None,
+                owner.rsplit(".", 1)[-1],
+                dynamic_name,
+                getattr(callable_info.node, "lineno", None) if callable_info is not None else None,
+                symbol_kind="callable",
+            )
+
+    def resolve_initializer(start: int) -> tuple[CompatibilityState, SourceEndpoint]:
+        resolution = engine._effective_method_resolution(
+            downstream_mro[start:],
+            "__init__",
+        )
+        if not resolution.is_total_callable or len(resolution.callable_owners) != 1:
+            owner = downstream_mro[start]
+            return CompatibilityState(
+                None,
+                None,
+                "effective constructor could not be proven through the complete MRO",
+            ), SourceEndpoint(None, owner.rsplit(".", 1)[-1], "__init__", symbol_kind="unknown")
+        owner = resolution.callable_owners[0]
+        owner_index = downstream_mro.index(owner, start)
+        if owner.startswith("vllm."):
+            field = new_snapshot._effective_instance_field(upstream_root, member)
+            if field is not None and field.status in {"exact", "non_callable"}:
+                return CompatibilityState(
+                    True,
+                    True,
+                    "the effective upstream constructor establishes the required attribute",
+                ), SourceEndpoint(
+                    field.file or None,
+                    field.owner,
+                    field.name,
+                    getattr(field.node, "lineno", None),
+                    descriptor="instance_attribute",
+                    symbol_kind="attribute",
+                )
+            return CompatibilityState(
+                None,
+                None,
+                "the upstream field initializer could not be proven",
+            ), SourceEndpoint(None, owner.rsplit(".", 1)[-1], member, symbol_kind="unknown")
+
+        callable_info = engine.downstream.find_callable(f"{owner}.__init__")
+        node = callable_info.node if callable_info is not None else None
+        endpoint = SourceEndpoint(
+            callable_info.file if callable_info is not None else None,
+            owner.rsplit(".", 1)[-1],
+            "__init__",
+            getattr(node, "lineno", None),
+            descriptor=callable_info.descriptor_kind if callable_info is not None else None,
+            symbol_kind="callable" if callable_info is not None else "unknown",
+        )
+        if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+            return CompatibilityState(
+                None,
+                None,
+                f"downstream constructor {owner} is not an exact function definition",
+            ), endpoint
+        positional = [*node.args.posonlyargs, *node.args.args]
+        if not positional:
+            return CompatibilityState(
+                None,
+                None,
+                f"downstream constructor {owner} has no provable instance receiver",
+            ), endpoint
+        receiver = positional[0].arg
+        assignment = next(
+            (
+                candidate
+                for statement in node.body
+                if (candidate := GitSnapshot._instance_assignment(statement, receiver, member)) is not None
+            ),
+            None,
+        )
+        if assignment is not None:
+            return CompatibilityState(
+                True,
+                True,
+                f"downstream constructor {owner} assigns {member} on its main path",
+            ), endpoint
+        if GitSnapshot._statements_definitely_assign_instance_member(
+            node.body,
+            receiver,
+            member,
+        ):
+            return CompatibilityState(
+                True,
+                True,
+                f"downstream constructor {owner} assigns {member} on every normal path",
+            ), endpoint
+        if GitSnapshot._function_may_assign_instance_member(node, receiver, member):
+            return CompatibilityState(
+                None,
+                None,
+                f"downstream constructor {owner} assigns {member} only through unproven control flow",
+            ), endpoint
+        if GitSnapshot._calls_super_init(node):
+            return resolve_initializer(owner_index + 1)
+        if _initializer_has_unresolved_base_call(node, receiver):
+            return CompatibilityState(
+                None,
+                None,
+                f"downstream constructor {owner} invokes an explicit initializer that could not be resolved",
+            ), endpoint
+        if _other_downstream_method_may_initialize(
+            engine,
+            downstream_mro,
+            upstream_index,
+            member,
+        ):
+            return CompatibilityState(
+                None,
+                None,
+                f"another downstream method may initialize {member}",
+            ), endpoint
+        return CompatibilityState(
+            False,
+            False,
+            f"downstream constructor {owner} neither assigns {member} nor calls super().__init__()",
+        ), endpoint
+
+    return resolve_initializer(0)
+
+
+def _inherited_state_findings(
+    engine: InterfaceBoundaryGenerator,
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+) -> tuple[list[RangeFinding], list[InheritedStateDependency]]:
+    """Detect newly required upstream state missing from downstream constructors."""
+
+    findings_by_id: dict[str, RangeFinding] = {}
+    dependencies: list[InheritedStateDependency] = []
+    old_read_cache: dict[
+        tuple[str, str],
+        tuple[dict[str, tuple[int, bool]] | None, SourceEndpoint],
+    ] = {}
+    new_read_cache: dict[str, dict[str, tuple[int, bool]]] = {}
+    new_field_cache: dict[tuple[str, str], bool] = {}
+    state_cache: dict[tuple[str, str, str], tuple[CompatibilityState, SourceEndpoint]] = {}
+
+    for class_info in sorted(engine.downstream.classes.values(), key=lambda item: item.qualified_name):
+        mro_result = engine._linearized_mro(class_info.qualified_name)
+        if not mro_result.complete:
+            continue
+        downstream_mro = mro_result.owners
+        upstream_owners = tuple(owner for owner in downstream_mro if owner.startswith("vllm."))
+        if not upstream_owners:
+            continue
+        upstream_root = upstream_owners[0]
+        initializer_resolution = engine._effective_method_resolution(
+            downstream_mro,
+            "__init__",
+        )
+        if (
+            not initializer_resolution.is_total_callable
+            or len(initializer_resolution.callable_owners) != 1
+            or not initializer_resolution.callable_owners[0].startswith("vllm_ascend.")
+        ):
+            continue
+        method_names = {
+            method_name
+            for owner in upstream_owners
+            if (upstream_class := engine.upstream.find_class(owner)) is not None
+            for method_name in upstream_class.methods
+            if method_name not in {"__init__", "__new__"}
+        }
+        for method_name in sorted(method_names):
+            resolution = engine._effective_method_resolution(downstream_mro, method_name)
+            if not resolution.is_total_callable or len(resolution.callable_owners) != 1:
+                continue
+            inherited_owner = resolution.callable_owners[0]
+            if not inherited_owner.startswith("vllm."):
+                continue
+            qualified_member = f"{inherited_owner}.{method_name}"
+            callable_info = engine.upstream.find_callable(qualified_member)
+            if callable_info is None:
+                continue
+            node = callable_info.node
+            if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            if qualified_member not in new_read_cache:
+                new_read_cache[qualified_member] = _instance_attribute_reads(node)
+            new_reads = new_read_cache[qualified_member]
+            if not new_reads:
+                continue
+            old_key = (upstream_root, method_name)
+            if old_key not in old_read_cache:
+                old_read_cache[old_key] = _snapshot_inherited_reads(
+                    old_snapshot,
+                    upstream_root,
+                    method_name,
+                )
+            old_reads, old_endpoint = old_read_cache[old_key]
+            new_endpoint = new_snapshot.endpoint(
+                callable_info.file,
+                callable_info.owner,
+                callable_info.name,
+            )
+            for required_attribute, (read_line, conditional_read) in sorted(new_reads.items()):
+                if old_reads is not None and required_attribute in old_reads:
+                    continue
+                field_key = (upstream_root, required_attribute)
+                if field_key not in new_field_cache:
+                    field = new_snapshot._effective_instance_field(upstream_root, required_attribute)
+                    new_field_cache[field_key] = field is not None and field.status in {"exact", "non_callable"}
+                if not new_field_cache[field_key]:
+                    continue
+                state_key = (class_info.qualified_name, upstream_root, required_attribute)
+                if state_key not in state_cache:
+                    state_cache[state_key] = _downstream_initialization_state(
+                        engine,
+                        new_snapshot,
+                        downstream_mro,
+                        upstream_root,
+                        required_attribute,
+                    )
+                initialization_state, constructor = state_cache[state_key]
+                if constructor.file is None or not constructor.owner:
+                    continue
+                new_state = (
+                    CompatibilityState(
+                        initialization_state.exists,
+                        None,
+                        f"{initialization_state.reason}; the inherited read is conditional",
+                    )
+                    if conditional_read and initialization_state.compatible is False
+                    else initialization_state
+                )
+                old_state = (
+                    CompatibilityState(
+                        None,
+                        None,
+                        "the old inherited callable binding could not be proven",
+                    )
+                    if old_reads is None
+                    else CompatibilityState(
+                        True,
+                        True,
+                        f"the old inherited callable did not read {required_attribute}",
+                    )
+                )
+                classification = _classify(old_state, new_state, True)
+                gates = {
+                    "relationship_verified": True,
+                    "contract_changed": True,
+                    "runtime_reachable": not conditional_read,
+                    "version_lane_matches": True,
+                }
+                action = _finding_action(classification, gates)
+                dependency = InheritedStateDependency(
+                    downstream_class=class_info.qualified_name,
+                    downstream_file=class_info.file,
+                    upstream_root=upstream_root,
+                    inherited_member=qualified_member,
+                    required_attribute=required_attribute,
+                    read_line=read_line,
+                    read_condition="conditional" if conditional_read else "unconditional",
+                    constructor_owner=constructor.owner,
+                    constructor_file=constructor.file,
+                    constructor_line=constructor.line or 0,
+                    initialization_status=(
+                        "established"
+                        if initialization_state.compatible is True
+                        else "missing"
+                        if initialization_state.compatible is False
+                        else "unknown"
+                    ),
+                    initialization_reason=initialization_state.reason,
+                )
+                dependencies.append(dependency)
+                finding_id = _finding_id(
+                    "inherited_state",
+                    constructor.file,
+                    constructor.owner,
+                    required_attribute,
+                    upstream_root,
+                    old_snapshot.revision,
+                    new_snapshot.revision,
+                )
+                candidate_finding = RangeFinding(
+                    finding_id=finding_id,
+                    classification=classification,
+                    relation="inherited_state",
+                    priority="P1" if action == "modify" else "P2",
+                    action=action,
+                    confidence="high" if classification != "analysis_unresolved" else "medium",
+                    upstream_old=old_endpoint,
+                    upstream_new=new_endpoint,
+                    downstream=constructor,
+                    old_state=old_state,
+                    new_state=new_state,
+                    change=(f"inherited upstream member newly reads required instance attribute {required_attribute}"),
+                    evidence=[dependency.as_dict()],
+                    gates=gates,
+                    suggestion=(
+                        f"Initialize {required_attribute} in the downstream constructor or call "
+                        "super().__init__(), then add an inherited-state regression test."
+                    ),
+                    source="inherited_state_detector",
+                    contract_kind="required_instance_attribute",
+                    direction="upstream_inherited_read_to_downstream_state",
+                    details={
+                        "upstream_root": upstream_root,
+                        "inherited_member": qualified_member,
+                        "required_attribute": required_attribute,
+                        "read_line": read_line,
+                        "read_condition": dependency.read_condition,
+                        "downstream_class": class_info.qualified_name,
+                        "initialization_status": dependency.initialization_status,
+                        "initialization_reason": dependency.initialization_reason,
+                        "inherited_members": [qualified_member],
+                        "impacted_downstream_classes": [class_info.qualified_name],
+                    },
+                )
+                previous = findings_by_id.get(finding_id)
+                if previous is None:
+                    findings_by_id[finding_id] = candidate_finding
+                    continue
+                inherited_members = set(previous.details["inherited_members"])
+                inherited_members.add(qualified_member)
+                impacted_classes = set(previous.details["impacted_downstream_classes"])
+                impacted_classes.add(class_info.qualified_name)
+                retained = (
+                    candidate_finding
+                    if CLASSIFICATIONS.index(candidate_finding.classification)
+                    < CLASSIFICATIONS.index(previous.classification)
+                    else previous
+                )
+                retained.evidence = [*previous.evidence, dependency.as_dict()]
+                retained.details["inherited_members"] = sorted(inherited_members)
+                retained.details["impacted_downstream_classes"] = sorted(impacted_classes)
+                findings_by_id[finding_id] = retained
+    return list(findings_by_id.values()), dependencies
+
+
 def _verified_historical_direct_calls(
     candidates: Iterable[DirectCallDependency],
     old_snapshot: GitSnapshot,
@@ -3836,8 +4481,25 @@ def analyze_range(
             time.perf_counter() - comparison_started,
         )
 
+    def analyze_inherited_state() -> tuple[
+        list[RangeFinding],
+        list[InheritedStateDependency],
+        float,
+    ]:
+        started = time.perf_counter()
+        branch_findings, dependencies = _inherited_state_findings(
+            generator,
+            old_snapshot,
+            new_snapshot,
+        )
+        return branch_findings, dependencies, time.perf_counter() - started
+
     branch_count = (
-        1 + int(plan.analyze_direct_imports) + int(plan.analyze_direct_calls) + int(plan.analyze_direct_attributes)
+        1
+        + int(plan.analyze_direct_imports)
+        + int(plan.analyze_direct_calls)
+        + int(plan.analyze_direct_attributes)
+        + int(plan.analyze_inherited_state)
     )
     effective_workers = min(analysis_workers, branch_count)
     if effective_workers > 1:
@@ -3851,15 +4513,18 @@ def analyze_range(
             direct_attribute_future = (
                 executor.submit(analyze_direct_attributes) if plan.analyze_direct_attributes else None
             )
+            inherited_state_future = executor.submit(analyze_inherited_state) if plan.analyze_inherited_state else None
             relation_result = relation_future.result()
             import_result = import_future.result() if import_future is not None else None
             direct_call_result = direct_call_future.result() if direct_call_future is not None else None
             direct_attribute_result = direct_attribute_future.result() if direct_attribute_future is not None else None
+            inherited_state_result = inherited_state_future.result() if inherited_state_future is not None else None
     else:
         relation_result = analyze_relations()
         import_result = analyze_imports() if plan.analyze_direct_imports else None
         direct_call_result = analyze_direct_calls() if plan.analyze_direct_calls else None
         direct_attribute_result = analyze_direct_attributes() if plan.analyze_direct_attributes else None
+        inherited_state_result = analyze_inherited_state() if plan.analyze_inherited_state else None
 
     findings, relation_elapsed = relation_result
     _record_diagnostic_timing("relation_comparison", relation_elapsed, timings)
@@ -3894,6 +4559,14 @@ def analyze_range(
     else:
         timings["direct_attribute_discovery"] = None
         timings["direct_attribute_comparison"] = None
+
+    inherited_state_dependencies: list[InheritedStateDependency] = []
+    if inherited_state_result is not None:
+        inherited_state_findings, inherited_state_dependencies, inherited_state_elapsed = inherited_state_result
+        findings.extend(inherited_state_findings)
+        _record_diagnostic_timing("inherited_state_comparison", inherited_state_elapsed, timings)
+    else:
+        timings["inherited_state_comparison"] = None
 
     generator_finding_started = time.perf_counter()
     for candidate in generator_findings if plan.include_generator_findings else []:
@@ -4050,6 +4723,7 @@ def analyze_range(
             + timing_value("direct_import_analysis")
             + timing_value("direct_call_comparison")
             + timing_value("direct_attribute_comparison")
+            + timing_value("inherited_state_comparison")
             + timing_value("generator_finding_conversion"),
             6,
         ),
@@ -4077,6 +4751,7 @@ def analyze_range(
                     *(["direct_import_analysis"] if plan.analyze_direct_imports else []),
                     *(["direct_call_analysis"] if plan.analyze_direct_calls else []),
                     *(["direct_attribute_analysis"] if plan.analyze_direct_attributes else []),
+                    *(["inherited_state_analysis"] if plan.analyze_inherited_state else []),
                 ],
             },
             "repository_index_cache": generator.repository_index_cache,
@@ -4096,6 +4771,7 @@ def analyze_range(
             "relations_collected": len(relations),
             "direct_call_dependencies": len(direct_call_dependencies),
             "direct_attribute_dependencies": len(direct_attribute_dependencies),
+            "inherited_state_dependencies": len(inherited_state_dependencies),
             "generator_findings": (len(generator_findings) if plan.include_generator_findings else 0),
             "total": len(ordered),
             "by_relation": dict(sorted(relation_counts.items())),
@@ -4210,6 +4886,7 @@ def _markdown(report: dict[str, Any]) -> str:
             "target_presence": "upstream target",
             "base_presence": "base class",
             "attribute_presence": "member attribute",
+            "required_instance_attribute": "required inherited instance state",
         }
         contract_label = contract_labels.get(item.get("contract_kind"), item.get("contract_kind", "interface contract"))
         lines.extend(

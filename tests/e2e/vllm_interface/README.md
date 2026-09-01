@@ -152,7 +152,8 @@ printed by the CLI.
 `--scenario` selects one of two fixed execution plans; it is not a collection of independent low-level switches:
 
 - `main2main` (default) runs the full exact-contract analysis: patch, override, inheritance, direct import, direct call,
-  direct attribute, return protocol, and generator findings. It preserves the existing report names and behavior.
+  direct attribute, inherited instance state, return protocol, and generator findings. It preserves the existing report
+  names and behavior.
 - `vllm-interface` is the upstream PR awareness plan. It analyzes direct imports, overrides, and exact downstream-call
   contracts. Inheritance/MRO discovery still runs as an override prerequisite, but it does not emit inheritance
   findings. Monkey-patch collection and patch-oriented generator-finding conversion are skipped before execution. This
@@ -168,9 +169,16 @@ Findings are separated into `introduced_break`, `compatibility_warning`, `preexi
 `analysis_unresolved`.  Unchanged verified relationships are omitted from the upgrade report.  By default the command
 only warns and exits successfully; `--fail-on introduced` is available for a future blocking CI, but is not the default.
 
-Range schema version 11 adds full-main2main `direct_attribute / attribute_presence` findings and their cache/timing
-metadata. It retains the exact call and return contract families without changing the generator JSONL schema or its
-fixed relation golden:
+Range schema version 12 adds full-main2main `inherited_state / required_instance_attribute` findings. When an effective
+upstream method or property newly reads an instance attribute, the analyzer checks whether the pinned downstream
+subclass overrides `__init__` and still establishes that state. A direct main-path assignment or a provable
+`super().__init__()` chain satisfies the contract. Conditional initialization, dynamic providers, incomplete MROs, and
+explicit unresolved initializer calls fail closed as review findings. Reads protected by `hasattr` or
+`AttributeError` are not hard requirements. This phase is intentionally skipped by the `vllm-interface` scenario.
+
+Schema version 11 introduced full-main2main `direct_attribute / attribute_presence` findings and their cache/timing
+metadata. Version 12 retains those exact call and return contract families without changing the generator JSONL schema
+or its fixed relation golden:
 
 - downstream-to-upstream calls: uniquely resolved module functions, constructors, class/static methods, annotated or
   provably constructed instances are checked by binding each concrete `args`/`kwargs` shape independently at old and
