@@ -64,6 +64,7 @@ from .call_contracts import (
 from .generator import (
     _KNOWN_TRANSPARENT_SIGNATURE_DECORATORS,
     _KNOWN_WRAPS_SIGNATURE_DECORATORS,
+    _TRITON_HEURISTICS_DECORATOR,
     _TRITON_JIT_DECORATOR,
     _TRITON_KERNEL_PROTOCOL,
     GENERATOR_VERSION,
@@ -88,8 +89,8 @@ from .models import (
     SourceEndpoint,
 )
 
-RANGE_SCHEMA_VERSION = 12
-RANGE_ANALYZER_VERSION = "2.2.0"
+RANGE_SCHEMA_VERSION = 13
+RANGE_ANALYZER_VERSION = "2.3.0"
 SNAPSHOT_CACHE_SCHEMA_VERSION = 4
 RELATION_CACHE_SCHEMA_VERSION = 2
 DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
@@ -262,20 +263,99 @@ def _signature_status(
     return "exact"
 
 
-def _invocation_signature_status(
+def _snapshot_node_signature_contract(
     node: ast.AST | None,
     resolver: Any | None,
     invocation_kind: str,
-) -> str | None:
-    if invocation_kind != _TRITON_KERNEL_PROTOCOL:
-        return _signature_status(node, resolver)
+    *,
+    descriptor: str | None,
+    binds_receiver: bool,
+    access_kind: str | None = None,
+) -> SignatureContract | None:
+    """Derive the callable contract used by one historical snapshot.
+
+    Relation discovery already models Triton JIT kernels by their public
+    ``kernel[grid](...)`` launch protocol. Historical range comparison must
+    apply the same decorator transform instead of treating ``@triton.jit`` as
+    an unknown ordinary Python wrapper.
+    """
+
     if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
         return None
-    references: list[str | None] = []
-    for item in node.decorator_list:
-        raw = _decorator_name(item)
-        references.append(resolver(raw) if resolver is not None and raw else raw or None)
-    return "exact" if references == [_TRITON_JIT_DECORATOR] else "unknown"
+    definition_signature = _jsonable_signature(node)
+    runtime_signature = definition_signature
+    reported_signature = definition_signature
+    protocol = "property_access" if descriptor == "property" else "python_call"
+    status = _signature_status(node, resolver)
+    provenance = ["git_snapshot"]
+
+    if invocation_kind == _TRITON_KERNEL_PROTOCOL:
+        status = "exact"
+        protocol = _TRITON_KERNEL_PROTOCOL
+        reported_signature = None
+        saw_jit = False
+        for decorator in reversed(node.decorator_list):
+            raw = _decorator_name(decorator)
+            reference = resolver(raw) if resolver is not None and raw else raw or None
+            label = reference or raw or "<dynamic-decorator>"
+            if reference == _TRITON_JIT_DECORATOR:
+                if saw_jit:
+                    status = "unknown"
+                    runtime_signature = None
+                    provenance.append(f"{label}:duplicate_kernel_launch")
+                    break
+                saw_jit = True
+                runtime_signature = definition_signature
+                provenance.append(f"{label}:kernel_launch")
+                continue
+            if reference == _TRITON_HEURISTICS_DECORATOR:
+                generated_names = InterfaceBoundaryGenerator._triton_heuristic_names(decorator)
+                transformed_signature = (
+                    InterfaceBoundaryGenerator._triton_heuristics_signature(
+                        runtime_signature,
+                        generated_names,
+                    )
+                    if saw_jit and generated_names is not None
+                    else None
+                )
+                if transformed_signature is None:
+                    status = "unknown"
+                    runtime_signature = None
+                    provenance.append(f"{label}:unresolved_kernel_heuristics")
+                    break
+                runtime_signature = transformed_signature
+                provenance.append(f"{label}:generated={','.join(generated_names or ())}")
+                continue
+            status = "unknown"
+            runtime_signature = None
+            provenance.append(label)
+            break
+        if not saw_jit:
+            status = "unknown"
+            runtime_signature = None
+            provenance.append("missing_triton_jit")
+
+    bound_signature = (
+        _bound_signature(
+            runtime_signature,
+            descriptor=descriptor,
+            access_kind=access_kind or ("instance" if binds_receiver else "module"),
+        )
+        if status == "exact"
+        else None
+    )
+    if status == "exact" and bound_signature is None:
+        status = "unknown"
+        provenance.append("unknown_descriptor_binding")
+    return SignatureContract(
+        definition_signature=definition_signature,
+        runtime_entry_signature=runtime_signature,
+        reported_signature=reported_signature,
+        bound_call_signature=bound_signature,
+        protocol=protocol,
+        status=status or "unknown",
+        provenance=tuple(provenance),
+    )
 
 
 def _class_nodes(tree: ast.Module) -> Iterator[tuple[tuple[str, ...], ast.ClassDef]]:
@@ -542,7 +622,10 @@ def _relation_symbol_presence(endpoint: SourceEndpoint) -> bool | None:
     return True
 
 
-def _snapshot_signature_contract(endpoint: SourceEndpoint) -> SignatureContract | None:
+def _snapshot_signature_contract(
+    endpoint: SourceEndpoint,
+    invocation_kind: str = "python_call",
+) -> SignatureContract | None:
     """Build the provable runtime-signature view available from one Git snapshot."""
 
     if endpoint.symbol_kind != "callable":
@@ -566,7 +649,7 @@ def _snapshot_signature_contract(endpoint: SourceEndpoint) -> SignatureContract 
         runtime_entry_signature=runtime_signature,
         reported_signature=runtime_signature,
         bound_call_signature=bound_signature,
-        protocol="property_access" if endpoint.descriptor == "property" else "python_call",
+        protocol=("property_access" if endpoint.descriptor == "property" else invocation_kind),
         status=status,
         provenance=("git_snapshot",),
     )
@@ -587,17 +670,17 @@ def _signature_contract_semantics(contract: SignatureContract | None) -> object:
 
 
 def _runtime_signature_changed(
-    old: SourceEndpoint,
-    new: SourceEndpoint,
+    old_contract: SignatureContract | None,
+    new_contract: SignatureContract | None,
 ) -> bool:
     """Compare runtime contracts when both snapshot definitions are exact."""
 
-    if old.signature_status != new.signature_status:
+    if old_contract is None or new_contract is None:
+        return old_contract is not new_contract
+    if old_contract.status != new_contract.status:
         return True
-    if old.signature_status != "exact" or new.signature_status != "exact":
+    if old_contract.status != "exact" or new_contract.status != "exact":
         return False
-    old_contract = _snapshot_signature_contract(old)
-    new_contract = _snapshot_signature_contract(new)
     return _signature_contract_semantics(old_contract) != _signature_contract_semantics(new_contract)
 
 
@@ -1624,13 +1707,29 @@ class GitSnapshot:
             )
         return evidence
 
-    def endpoint(self, file_name: str, owner: str | None, name: str) -> SourceEndpoint:
+    def endpoint(
+        self,
+        file_name: str,
+        owner: str | None,
+        name: str,
+        *,
+        invocation_kind: str = "python_call",
+    ) -> SourceEndpoint:
         tree = self.tree(file_name)
         binding = _named_binding(tree, owner, name) if tree is not None else _NamedBinding(None, "unknown")
         node = binding.node if binding.status == "exact" else None
+        resolver = self._return_resolver(file_name)
+        descriptor = _descriptor(node, resolver) if node is not None else None
+        signature_contract = _snapshot_node_signature_contract(
+            node,
+            resolver,
+            invocation_kind,
+            descriptor=descriptor,
+            binds_receiver=owner is not None,
+        )
         return_contract = infer_return_contract(
             node,
-            resolver=self._return_resolver(file_name),
+            resolver=resolver,
         )
         if binding.status == "exact":
             symbol_kind = (
@@ -1650,13 +1749,36 @@ class GitSnapshot:
             name=name,
             line=getattr(node, "lineno", None),
             signature=_jsonable_signature(node),
-            descriptor=_descriptor(node, self._return_resolver(file_name)) if node is not None else None,
+            descriptor=descriptor,
             symbol_kind=symbol_kind,
             signature_status=(
-                "unknown" if binding.status == "unknown" else _signature_status(node, self._return_resolver(file_name))
+                "unknown"
+                if binding.status == "unknown"
+                else signature_contract.status
+                if signature_contract is not None
+                else None
             ),
             analysis_fingerprint=binding.fingerprint,
             return_contract=return_contract.as_dict() if return_contract is not None else None,
+        )
+
+    def signature_contract(
+        self,
+        endpoint: SourceEndpoint,
+        invocation_kind: str = "python_call",
+    ) -> SignatureContract | None:
+        if endpoint.file is None or endpoint.name is None:
+            return _snapshot_signature_contract(endpoint, invocation_kind)
+        tree = self.tree(endpoint.file)
+        node = _named_node(tree, endpoint.owner, endpoint.name) if tree is not None else None
+        if node is None:
+            return _snapshot_signature_contract(endpoint, invocation_kind)
+        return _snapshot_node_signature_contract(
+            node,
+            self._return_resolver(endpoint.file),
+            invocation_kind,
+            descriptor=endpoint.descriptor,
+            binds_receiver=endpoint.owner is not None,
         )
 
     def call_endpoint(
@@ -1818,11 +1940,15 @@ class GitSnapshot:
         descriptor = _descriptor(node, self._return_resolver(file_name))
         if access_kind == "direct":
             effective_access_kind = "class_attribute" if owner is not None else "module"
-        signature = _bound_signature(
-            _jsonable_signature(node),
+        invocation_contract = _snapshot_node_signature_contract(
+            node,
+            self._return_resolver(file_name),
+            invocation_kind,
             descriptor=descriptor,
+            binds_receiver=effective_access_kind in {"constructor", "instance"},
             access_kind=effective_access_kind,
         )
+        signature = invocation_contract.bound_call_signature if invocation_contract is not None else None
         return_contract = infer_return_contract(node, resolver=self._return_resolver(file_name))
         return SourceEndpoint(
             file=file_name,
@@ -1832,11 +1958,7 @@ class GitSnapshot:
             signature=signature,
             descriptor=descriptor,
             symbol_kind="callable",
-            signature_status=_invocation_signature_status(
-                node,
-                self._return_resolver(file_name),
-                invocation_kind,
-            ),
+            signature_status=invocation_contract.status if invocation_contract is not None else None,
             analysis_fingerprint=resolved.fingerprint,
             return_contract=return_contract.as_dict() if return_contract is not None else None,
         )
@@ -1863,6 +1985,8 @@ class GitSnapshot:
         owner: str | None,
         old_name: str,
         fingerprint: str | None,
+        *,
+        invocation_kind: str = "python_call",
     ) -> SourceEndpoint | None:
         if fingerprint is None:
             return None
@@ -1883,15 +2007,24 @@ class GitSnapshot:
         if len(matches) != 1:
             return None
         node = matches[0]
+        resolver = self._return_resolver(file_name)
+        descriptor = _descriptor(node, resolver)
+        signature_contract = _snapshot_node_signature_contract(
+            node,
+            resolver,
+            invocation_kind,
+            descriptor=descriptor,
+            binds_receiver=owner is not None,
+        )
         return SourceEndpoint(
             file=file_name,
             owner=owner,
             name=node.name,
             line=node.lineno,
             signature=_jsonable_signature(node),
-            descriptor=_descriptor(node, self._return_resolver(file_name)),
+            descriptor=descriptor,
             symbol_kind="callable",
-            signature_status=_signature_status(node, self._return_resolver(file_name)),
+            signature_status=signature_contract.status if signature_contract is not None else None,
             analysis_fingerprint=_node_fingerprint(node),
             return_contract=(
                 contract.as_dict()
@@ -2154,13 +2287,20 @@ def _relation_endpoints(
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
     new_to_old: dict[str, str],
+    invocation_kind: str,
 ) -> tuple[SourceEndpoint, SourceEndpoint]:
     old_file = new_to_old.get(relation.upstream_file, relation.upstream_file)
-    old_endpoint = old_snapshot.endpoint(old_file, relation.upstream_owner, relation.upstream_name)
+    old_endpoint = old_snapshot.endpoint(
+        old_file,
+        relation.upstream_owner,
+        relation.upstream_name,
+        invocation_kind=invocation_kind,
+    )
     new_endpoint = new_snapshot.endpoint(
         relation.upstream_file,
         relation.upstream_owner,
         relation.upstream_name,
+        invocation_kind=invocation_kind,
     )
     if _relation_symbol_presence(new_endpoint) is False:
         old_tree = old_snapshot.tree(old_file)
@@ -2170,6 +2310,7 @@ def _relation_endpoints(
             relation.upstream_owner,
             relation.upstream_name,
             _definition_fingerprint(old_node),
+            invocation_kind=invocation_kind,
         )
         if renamed is not None:
             new_endpoint = renamed
@@ -2485,18 +2626,27 @@ def _relation_findings(
     registered_overrides: dict[tuple[str, str], list[dict[str, object]]],
 ) -> list[RangeFinding]:
     """Compare one verified replacement relation across the selected range."""
+    invocation_kind = (
+        _TRITON_KERNEL_PROTOCOL
+        if relation.upstream_signature_contract is not None
+        and relation.upstream_signature_contract.protocol == _TRITON_KERNEL_PROTOCOL
+        else "python_call"
+    )
     old_endpoint, new_endpoint = _relation_endpoints(
         relation,
         old_snapshot,
         new_snapshot,
         new_to_old,
+        invocation_kind,
     )
+    old_signature_contract = old_snapshot.signature_contract(old_endpoint, invocation_kind)
+    new_signature_contract = new_snapshot.signature_contract(new_endpoint, invocation_kind)
     downstream = _relation_downstream_endpoint(relation, engine)
     old_exists = _relation_symbol_presence(old_endpoint)
     new_exists = _relation_symbol_presence(new_endpoint)
     runtime_signature_changed = _runtime_signature_changed(
-        old_endpoint,
-        new_endpoint,
+        old_signature_contract,
+        new_signature_contract,
     )
     contract_changed = (
         old_exists != new_exists
@@ -2519,13 +2669,14 @@ def _relation_findings(
             downstream.signature,
             relation.relation,
             downstream.descriptor,
+            old_signature_contract,
         )
         new_state = _state(
             new_endpoint,
             downstream.signature,
             relation.relation,
             downstream.descriptor,
-            _snapshot_signature_contract(new_endpoint),
+            new_signature_contract,
         )
         classification = _classify(
             old_state,
@@ -2536,8 +2687,14 @@ def _relation_findings(
             ),
         )
         parameter_delta = (
-            _signature_delta(old_endpoint.signature, new_endpoint.signature)
-            if old_endpoint.signature_status == "exact" and new_endpoint.signature_status == "exact"
+            _signature_delta(
+                old_signature_contract.bound_call_signature,
+                new_signature_contract.bound_call_signature,
+            )
+            if old_signature_contract is not None
+            and new_signature_contract is not None
+            and old_signature_contract.status == "exact"
+            and new_signature_contract.status == "exact"
             else None
         )
         optional_parameters = (
@@ -2565,7 +2722,7 @@ def _relation_findings(
         )
         optional_contract_review = bool(optional_parameters and not upstream_call_evidence)
         masked_preexisting_delta = bool(
-            relation.relation == "override"
+            relation.relation in {"monkey_patch", "override"}
             and classification == "preexisting"
             and _signature_delta_changed(parameter_delta)
         )
@@ -2596,6 +2753,8 @@ def _relation_findings(
                 new_endpoint,
             )
         review_details: dict[str, object] = {}
+        if _signature_delta_changed(parameter_delta):
+            review_details["parameter_delta"] = parameter_delta
         if optional_parameters:
             review_details.update(
                 {
@@ -2616,6 +2775,7 @@ def _relation_findings(
                 {
                     "new_delta_on_preexisting_break": True,
                     "actionability_reason": "new_delta_masked_by_preexisting_incompatibility",
+                    "priority_reason": "exact_new_parameter_delta_requires_separate_review",
                     "parameter_delta": parameter_delta,
                 }
             )
@@ -2631,8 +2791,8 @@ def _relation_findings(
                 relation=relation.relation,
                 priority=(
                     "P0"
-                    if relation.relation == "monkey_patch" and action == "modify"
-                    else ("P1" if action == "modify" else "P2")
+                    if relation.relation == "monkey_patch" and (action == "modify" or masked_preexisting_delta)
+                    else ("P1" if action == "modify" or masked_preexisting_delta else "P2")
                 ),
                 action=action,
                 confidence="high" if classification != "analysis_unresolved" else "medium",
@@ -2654,6 +2814,7 @@ def _relation_findings(
                 details={
                     "installed_signature": downstream.signature,
                     "installed_descriptor": downstream.descriptor,
+                    "invocation_protocol": invocation_kind,
                     **review_details,
                     **_override_details(relation),
                 },
@@ -4569,8 +4730,36 @@ def analyze_range(
         timings["inherited_state_comparison"] = None
 
     generator_finding_started = time.perf_counter()
+    exact_relation_signature_keys = {
+        (
+            finding.relation,
+            finding.downstream.file,
+            finding.downstream.owner,
+            finding.downstream.name,
+        )
+        for finding in findings
+        if finding.source == "dynamic_relation_graph"
+        and finding.contract_kind == "call_arguments"
+        and finding.old_state.compatible is not None
+        and finding.new_state.compatible is not None
+    }
     for candidate in generator_findings if plan.include_generator_findings else []:
         if candidate.status not in {"review", "risk"}:
+            continue
+        if (
+            candidate.supplemental
+            and candidate.reason_code == "signature_incompatible"
+            and (
+                candidate.relation,
+                candidate.downstream_file,
+                candidate.downstream_owner,
+                candidate.downstream_name,
+            )
+            in exact_relation_signature_keys
+        ):
+            # The range finding already owns the exact old/new compatibility
+            # conclusion. Keeping the current-snapshot supplemental risk would
+            # duplicate the same root cause as an unresolved P2 review.
             continue
         old_endpoint = old_snapshot.expression_endpoint(candidate.target_expression)
         new_endpoint = new_snapshot.expression_endpoint(candidate.target_expression)

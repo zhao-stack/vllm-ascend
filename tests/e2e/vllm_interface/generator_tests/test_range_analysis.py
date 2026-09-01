@@ -204,8 +204,9 @@ def test_range_separates_preexisting_incompatibility(tmp_path: Path) -> None:
     assert overrides
     assert overrides[0]["classification"] == "preexisting"
     assert overrides[0]["action"] == "review"
-    assert overrides[0]["priority"] == "P2"
+    assert overrides[0]["priority"] == "P1"
     assert overrides[0]["details"]["new_delta_on_preexisting_break"] is True
+    assert overrides[0]["details"]["priority_reason"] == "exact_new_parameter_delta_requires_separate_review"
     assert [item["name"] for item in overrides[0]["details"]["parameter_delta"]["added"]] == ["new_required"]
 
 
@@ -469,6 +470,117 @@ def test_new_upstream_patch_contract_conflict_is_introduced(tmp_path: Path) -> N
     assert patches[0]["compatibility"]["new"]["exists"] is True
 
 
+def test_triton_monkey_patch_compares_kernel_launch_signature(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=("from vllm.triton_utils import triton\n\n@triton.jit\ndef kernel(value, BLOCK_SIZE): pass\n"),
+        new_source=(
+            "from vllm.triton_utils import triton\n\n@triton.jit\ndef kernel(value, required, BLOCK_SIZE): pass\n"
+        ),
+        consumer_source=(
+            "import vllm.api as api\n"
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit\n"
+            "def replacement(value, BLOCK_SIZE): pass\n\n"
+            "api.kernel = replacement\n"
+        ),
+    )
+    report = _run(*roots)
+    patches = [
+        item
+        for item in report["findings"]
+        if item["relation"] == "monkey_patch" and item["contract_kind"] == "call_arguments"
+    ]
+    assert len(patches) == 1
+    assert patches[0]["classification"] == "introduced_break"
+    assert patches[0]["action"] == "modify"
+    assert patches[0]["priority"] == "P0"
+    assert patches[0]["upstream"]["old"]["signature_status"] == "exact"
+    assert patches[0]["upstream"]["new"]["signature_status"] == "exact"
+    assert patches[0]["details"]["invocation_protocol"] == "triton_kernel_launch"
+    assert [item["name"] for item in patches[0]["details"]["parameter_delta"]["added"]] == ["required"]
+    assert not any(
+        item["relation"] == "monkey_patch"
+        and item["contract_kind"] == "analysis_evidence"
+        and item["downstream"]["name"] == "replacement"
+        for item in report["findings"]
+    )
+
+
+def test_triton_monkey_patch_applies_literal_heuristics_signature(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=(
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.heuristics({'EVEN': lambda args: True})\n"
+            "@triton.jit\n"
+            "def kernel(value, EVEN, BLOCK_SIZE): pass\n"
+        ),
+        new_source=(
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.heuristics({'EVEN': lambda args: True})\n"
+            "@triton.jit\n"
+            "def kernel(value, required, EVEN, BLOCK_SIZE): pass\n"
+        ),
+        consumer_source=(
+            "import vllm.api as api\n"
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.heuristics({'EVEN': lambda args: True})\n"
+            "@triton.jit\n"
+            "def replacement(value, EVEN, BLOCK_SIZE): pass\n\n"
+            "api.kernel = replacement\n"
+        ),
+    )
+    report = _run(*roots)
+    patches = [
+        item
+        for item in report["findings"]
+        if item["relation"] == "monkey_patch" and item["contract_kind"] == "call_arguments"
+    ]
+    assert len(patches) == 1
+    assert patches[0]["classification"] == "introduced_break"
+    assert patches[0]["compatibility"]["old"]["compatible"] is True
+    assert patches[0]["compatibility"]["new"]["compatible"] is False
+    assert [item["name"] for item in patches[0]["details"]["parameter_delta"]["added"]] == ["required"]
+
+
+def test_triton_monkey_patch_preserves_new_delta_priority_on_preexisting_break(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=(
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit\n"
+            "def kernel(value, already_required, BLOCK_SIZE): pass\n"
+        ),
+        new_source=(
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit\n"
+            "def kernel(value, already_required, new_required, BLOCK_SIZE): pass\n"
+        ),
+        consumer_source=(
+            "import vllm.api as api\n"
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit\n"
+            "def replacement(value, BLOCK_SIZE): pass\n\n"
+            "api.kernel = replacement\n"
+        ),
+    )
+    report = _run(*roots)
+    patches = [
+        item
+        for item in report["findings"]
+        if item["relation"] == "monkey_patch" and item["contract_kind"] == "call_arguments"
+    ]
+    assert len(patches) == 1
+    assert patches[0]["classification"] == "preexisting"
+    assert patches[0]["action"] == "review"
+    assert patches[0]["priority"] == "P0"
+    assert patches[0]["details"]["new_delta_on_preexisting_break"] is True
+    assert [item["name"] for item in patches[0]["details"]["parameter_delta"]["added"]] == ["new_required"]
+
+
 def test_signature_status_change_emits_fail_closed_finding(tmp_path: Path) -> None:
     roots = _call_repositories(
         tmp_path,
@@ -553,7 +665,7 @@ def test_report_writer_separates_introduced_csv(tmp_path: Path) -> None:
     outputs = write_reports(report, tmp_path / "reports")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
     introduced_csv = Path(outputs["introduced_csv"]).read_text(encoding="utf-8-sig")
-    assert payload["schema_version"] == 12
+    assert payload["schema_version"] == 13
     assert payload["metadata"]["stage_timings_seconds"]["report_generation"] >= 0
     assert (
         payload["metadata"]["stage_timings_seconds"]["total_with_report"]
@@ -2125,7 +2237,7 @@ def test_vllm_interface_expands_transitive_override_impacts_under_one_root_cause
 
     outputs = write_reports(report, tmp_path / "upstream-report")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 12
+    assert payload["schema_version"] == 13
     assert payload["summary"]["introduced_breaks"] == 2
     assert payload["summary"]["root_causes"] == 1
     markdown = Path(outputs["markdown"]).read_text(encoding="utf-8")
