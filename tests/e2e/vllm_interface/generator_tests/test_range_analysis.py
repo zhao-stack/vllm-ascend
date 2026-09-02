@@ -210,6 +210,59 @@ def test_range_separates_preexisting_incompatibility(tmp_path: Path) -> None:
     assert [item["name"] for item in overrides[0]["details"]["parameter_delta"]["added"]] == ["new_required"]
 
 
+def test_main2main_requires_exact_optional_override_alignment_without_call_evidence(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def __init__(self, value): self.value = value\n",
+        new_source="class Base:\n    def __init__(self, value, optional=None): self.value = value\n",
+        consumer_source=(
+            "from vllm.api import Base\n\nclass Child(Base):\n    def __init__(self, value): self.value = value\n"
+        ),
+    )
+    report = _run(*roots)
+    override = next(
+        item
+        for item in report["findings"]
+        if item["relation"] == "override" and item["contract_kind"] == "call_arguments"
+    )
+    assert override["classification"] == "introduced_break"
+    assert override["action"] == "modify"
+    assert override["priority"] == "P1"
+    assert override["details"]["strict_main2main_contract"] is True
+    assert override["details"]["actionability_reason"] == "exact_optional_contract_requires_main2main_alignment"
+    assert override["details"]["upstream_call_evidence"] == []
+
+
+def test_main2main_counts_one_signature_root_for_multiple_affected_overrides(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def run(self, value): return value\n",
+        new_source="class Base:\n    def run(self, value, optional=None): return value\n",
+        consumer_source=(
+            "from vllm.api import Base\n\n"
+            "class First(Base):\n    def run(self, value): return value\n\n"
+            "class Second(Base):\n    def run(self, value): return value\n"
+        ),
+    )
+    report = _run(*roots)
+    affected = [
+        item
+        for item in report["findings"]
+        if item["classification"] == "introduced_break"
+        and item["action"] == "modify"
+        and item["relation"] == "override"
+        and item["upstream"]["new"]["name"] == "run"
+    ]
+    assert len(affected) == 2
+    assert len({item["root_cause_id"] for item in affected}) == 1
+    assert report["summary"]["actionable_introduced_findings"] == 2
+    assert report["summary"]["actionable_introduced_break"] == 1
+
+
 def test_optional_only_override_is_review_without_exact_upstream_call(
     tmp_path: Path,
 ) -> None:
@@ -665,7 +718,7 @@ def test_report_writer_separates_introduced_csv(tmp_path: Path) -> None:
     outputs = write_reports(report, tmp_path / "reports")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
     introduced_csv = Path(outputs["introduced_csv"]).read_text(encoding="utf-8-sig")
-    assert payload["schema_version"] == 13
+    assert payload["schema_version"] == 14
     assert payload["metadata"]["stage_timings_seconds"]["report_generation"] >= 0
     assert (
         payload["metadata"]["stage_timings_seconds"]["total_with_report"]
@@ -2237,7 +2290,7 @@ def test_vllm_interface_expands_transitive_override_impacts_under_one_root_cause
 
     outputs = write_reports(report, tmp_path / "upstream-report")
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 13
+    assert payload["schema_version"] == 14
     assert payload["summary"]["introduced_breaks"] == 2
     assert payload["summary"]["root_causes"] == 1
     markdown = Path(outputs["markdown"]).read_text(encoding="utf-8")
@@ -2268,6 +2321,9 @@ def test_vllm_interface_reports_import_and_call_breaks_as_one_root_cause(
         "direct_call",
         "direct_import",
     }
+    assert report["summary"]["actionable_introduced_findings"] == 2
+    assert report["summary"]["actionable_introduced_break"] == 1
+    assert len({item["root_cause_id"] for item in introduced}) == 1
     output_dir = tmp_path / "upstream-report"
     outputs = write_reports(report, output_dir)
     payload = json.loads(Path(outputs["json"]).read_text(encoding="utf-8"))
@@ -2281,6 +2337,28 @@ def test_vllm_interface_reports_import_and_call_breaks_as_one_root_cause(
     assert "downstream imports, overrides" in markdown
     assert "direct imports" not in markdown
     assert markdown.count("- Upstream: `vllm/api.py:helper`") == 2
+
+
+def test_main2main_reports_import_and_inheritance_removal_as_one_root_cause(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    pass\n",
+        new_source="OTHER = 1\n",
+        consumer_source=("from vllm.api import Base\n\nclass Child(Base):\n    pass\n"),
+    )
+    report = _run(*roots)
+    introduced = [
+        item
+        for item in report["findings"]
+        if item["classification"] == "introduced_break" and item["action"] == "modify"
+    ]
+    affected = [item for item in introduced if item["relation"] in {"direct_import", "inheritance"}]
+    assert {item["relation"] for item in affected} == {"direct_import", "inheritance"}
+    assert len({item["root_cause_id"] for item in affected}) == 1
+    assert report["summary"]["actionable_introduced_findings"] == 2
+    assert report["summary"]["actionable_introduced_break"] == 1
 
 
 def test_vllm_interface_reports_masked_preexisting_delta_as_review(tmp_path: Path) -> None:

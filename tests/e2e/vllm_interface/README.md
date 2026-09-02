@@ -169,6 +169,18 @@ Findings are separated into `introduced_break`, `compatibility_warning`, `preexi
 `analysis_unresolved`.  Unchanged verified relationships are omitted from the upgrade report.  By default the command
 only warns and exits successfully; `--fail-on introduced` is available for a future blocking CI, but is not the default.
 
+Range schema version 14 gives every finding a stable `root_cause_id`. Multiple relation findings remain in JSON and CSV
+as independent evidence, but summary action counts are based on the unique upstream changes that caused them. The
+summary exposes `actionable_introduced_findings` for the raw relation count and `actionable_introduced_break` for the
+deduplicated root-cause count. Presence changes are grouped by the canonical upstream symbol, exact parameter changes
+by the canonical callable and serialized delta, and inherited-state changes by the property or method plus its required
+attribute.
+
+The full `main2main` scenario treats an exact optional-only upstream signature addition as a P1 required alignment even
+when no current upstream dispatch site can be proven. This preserves the downstream implementation contract for future
+callers. The reduced `vllm-interface` CI scenario retains its narrower P2 review policy unless exact call and dispatch
+evidence proves runtime reachability, so this local full-analysis policy does not expand CI scope.
+
 Range schema version 12 adds full-main2main `inherited_state / required_instance_attribute` findings. When an effective
 upstream method or property newly reads an instance attribute, the analyzer checks whether the pinned downstream
 subclass overrides `__init__` and still establishes that state. A direct main-path assignment or a provable

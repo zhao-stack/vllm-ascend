@@ -89,8 +89,8 @@ from .models import (
     SourceEndpoint,
 )
 
-RANGE_SCHEMA_VERSION = 13
-RANGE_ANALYZER_VERSION = "2.3.0"
+RANGE_SCHEMA_VERSION = 14
+RANGE_ANALYZER_VERSION = "2.4.0"
 SNAPSHOT_CACHE_SCHEMA_VERSION = 4
 RELATION_CACHE_SCHEMA_VERSION = 2
 DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
@@ -2624,6 +2624,8 @@ def _relation_findings(
     new_to_old: dict[str, str],
     changed_upstream_files: tuple[str, ...],
     registered_overrides: dict[tuple[str, str], list[dict[str, object]]],
+    *,
+    strict_optional_contracts: bool,
 ) -> list[RangeFinding]:
     """Compare one verified replacement relation across the selected range."""
     invocation_kind = (
@@ -2720,7 +2722,8 @@ def _relation_findings(
             candidate_upstream_call_evidence,
             registered_overrides,
         )
-        optional_contract_review = bool(optional_parameters and not upstream_call_evidence)
+        optional_contract_without_dispatch = bool(optional_parameters and not upstream_call_evidence)
+        optional_contract_review = optional_contract_without_dispatch and not strict_optional_contracts
         masked_preexisting_delta = bool(
             relation.relation in {"monkey_patch", "override"}
             and classification == "preexisting"
@@ -2765,8 +2768,11 @@ def _relation_findings(
                     "actionability_reason": (
                         "exact_upstream_call_and_dispatch_proof_pass_new_optional_parameter"
                         if upstream_call_evidence
+                        else "exact_optional_contract_requires_main2main_alignment"
+                        if strict_optional_contracts
                         else "strict_optional_contract_without_proven_downstream_dispatch"
                     ),
+                    "strict_main2main_contract": bool(strict_optional_contracts and optional_contract_without_dispatch),
                     "parameter_delta": parameter_delta,
                 }
             )
@@ -4461,6 +4467,7 @@ def analyze_range(
                 new_to_old,
                 changed_upstream_files,
                 registered_overrides,
+                strict_optional_contracts=plan.scenario == MAIN2MAIN_SCENARIO,
             )
         ]
         return branch_findings, time.perf_counter() - started
@@ -4855,6 +4862,17 @@ def analyze_range(
             item.finding_id,
         ),
     )
+    finding_payloads = [item.as_dict() for item in ordered]
+    for payload in finding_payloads:
+        payload["root_cause_id"] = _finding_id(
+            "root_cause",
+            _root_cause_key(payload),
+            old_sha,
+            new_sha,
+        )
+    introduced_payloads = [item for item in finding_payloads if item["classification"] == "introduced_break"]
+    actionable_payloads = [item for item in introduced_payloads if item["action"] == "modify"]
+    review_payloads = [item for item in finding_payloads if item["action"] == "review"]
     counts = Counter(item.classification for item in ordered)
     action_counts = Counter(item.action for item in ordered)
     relation_counts = Counter(item.relation for item in ordered)
@@ -4963,15 +4981,17 @@ def analyze_range(
             "inherited_state_dependencies": len(inherited_state_dependencies),
             "generator_findings": (len(generator_findings) if plan.include_generator_findings else 0),
             "total": len(ordered),
+            "root_causes": len({item["root_cause_id"] for item in finding_payloads}),
             "by_relation": dict(sorted(relation_counts.items())),
             "by_contract": dict(sorted(contract_counts.items())),
-            "actionable_introduced_break": sum(
-                item.classification == "introduced_break" and item.action == "modify" for item in ordered
-            ),
+            "actionable_introduced_break": len({item["root_cause_id"] for item in actionable_payloads}),
+            "actionable_introduced_findings": len(actionable_payloads),
+            "introduced_break_root_causes": len({item["root_cause_id"] for item in introduced_payloads}),
+            "review_root_causes": len({item["root_cause_id"] for item in review_payloads}),
             "by_action": dict(sorted(action_counts.items())),
             **{name: counts[name] for name in CLASSIFICATIONS},
         },
-        "findings": [item.as_dict() for item in ordered],
+        "findings": finding_payloads,
     }
 
 
@@ -4981,6 +5001,7 @@ def _csv_rows(findings: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
         new = item["upstream"]["new"]
         downstream = item["downstream"]
         yield {
+            "root_cause_id": item.get("root_cause_id", ""),
             "classification": item["classification"],
             "priority": item["priority"],
             "action": item["action"],
@@ -5008,6 +5029,7 @@ def _csv_rows(findings: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
 
 
 CSV_FIELDS = [
+    "root_cause_id",
     "classification",
     "priority",
     "action",
@@ -5048,8 +5070,16 @@ def _markdown(report: dict[str, Any]) -> str:
         "",
         f"- vLLM range: `{meta['vllm_old_sha']}` → `{meta['vllm_new_sha']}`",
         f"- vllm-ascend baseline: `{meta['vllm_ascend_sha']}`",
-        f"- Required downstream changes: {summary['actionable_introduced_break']}",
-        f"- Strict contract incompatibilities, including review items: {summary['introduced_break']}",
+        (
+            "- Required downstream changes: "
+            f"{summary['actionable_introduced_break']} root causes "
+            f"({summary['actionable_introduced_findings']} relation findings)"
+        ),
+        (
+            "- Strict contract incompatibilities, including review items: "
+            f"{summary['introduced_break_root_causes']} root causes "
+            f"({summary['introduced_break']} relation findings)"
+        ),
         f"- Compatibility warnings: {summary['compatibility_warning']}",
         f"- Preexisting issues: {summary['preexisting']}",
         f"- Statically unresolved: {summary['analysis_unresolved']}",
@@ -5160,19 +5190,48 @@ def _upstream_pr_review_findings(report: dict[str, Any]) -> list[dict[str, Any]]
 
 
 def _root_cause_key(item: dict[str, Any]) -> tuple[object, ...]:
+    """Group affected relations by the upstream change that caused them."""
+
     details = item.get("details", {})
-    upstream = details.get("root_upstream") or item["upstream"]["old"]
-    fingerprint = upstream.get("analysis_fingerprint")
-    if fingerprint:
-        return ("upstream_fingerprint", fingerprint, upstream.get("name"))
-    target = details.get("target")
-    if target:
-        return ("upstream_target", target, item.get("change"))
+    old = item["upstream"]["old"]
+    new = item["upstream"]["new"]
+    root = details.get("root_upstream") or old
+
+    def present(endpoint: dict[str, Any]) -> bool:
+        return endpoint.get("file") is not None and endpoint.get("symbol_kind") != "missing"
+
+    def identity(endpoint: dict[str, Any]) -> tuple[object, ...]:
+        return (
+            endpoint.get("file"),
+            endpoint.get("owner"),
+            endpoint.get("name"),
+        )
+
+    old_present = present(old)
+    new_present = present(new)
+    if old_present and not new_present:
+        return ("upstream_presence_removed", *identity(root))
+    if not old_present and new_present:
+        return ("upstream_presence_added", *identity(new))
+
+    endpoint = new if new.get("file") is not None else root
+    parameter_delta = details.get("parameter_delta")
+    if _signature_delta_changed(parameter_delta):
+        return (
+            "upstream_parameter_delta",
+            *identity(endpoint),
+            json.dumps(parameter_delta, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        )
+    if item.get("contract_kind") == "required_instance_attribute":
+        return (
+            "upstream_inherited_state_requirement",
+            *identity(endpoint),
+            details.get("required_attribute"),
+        )
     return (
-        "upstream_endpoint",
-        upstream.get("file"),
-        upstream.get("owner"),
-        upstream.get("name"),
+        "upstream_contract",
+        *identity(endpoint),
+        item.get("contract_kind"),
         item.get("change"),
     )
 

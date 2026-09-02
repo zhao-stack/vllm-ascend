@@ -4,6 +4,24 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v2.4.0 - full-contract priority and root-cause counts
+
+- Full `main2main` analysis now reports exact optional-only signature additions
+  on downstream overrides as P1 required alignment even when the current
+  upstream snapshot has no proven dispatch site. The reduced `vllm-interface`
+  CI plan keeps its existing P2 review policy without call and registration
+  proof.
+- Range schema 14 adds `root_cause_id` to every JSON and CSV finding. Reports
+  retain all relation evidence while distinguishing the raw actionable finding
+  count from the deduplicated upstream root-cause count.
+- Root grouping covers one removed symbol observed through import, call, or
+  inheritance edges; one exact signature delta affecting multiple downstream
+  implementations; and one newly required inherited attribute affecting
+  multiple subclasses.
+- PR13358 replay retains all 272 finding IDs. Its 19 introduced relation
+  findings are now all actionable and group into 15 root causes; exactly seven
+  optional-only overrides move from P2 review to P1 modify.
+
 ## range analyzer v1.3.0 - exact Triton subscript launches
 
 - Direct-call discovery now unwraps the callable from Triton's
