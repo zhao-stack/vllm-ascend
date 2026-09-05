@@ -88,14 +88,15 @@ from .models import (
     RangeFinding,
     SourceEndpoint,
 )
+from .module_attributes import ModuleGetattrContract, module_getattr_contract, runtime_module_body
 
 RANGE_SCHEMA_VERSION = 14
-RANGE_ANALYZER_VERSION = "2.4.0"
-SNAPSHOT_CACHE_SCHEMA_VERSION = 4
+RANGE_ANALYZER_VERSION = "2.7.0"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 5
 RELATION_CACHE_SCHEMA_VERSION = 2
 DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
-DIRECT_CALL_CACHE_SCHEMA_VERSION = 1
-DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 3
+DIRECT_CALL_CACHE_SCHEMA_VERSION = 2
+DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 4
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -707,6 +708,7 @@ class GitSnapshot:
         self._trees: dict[str, ast.Module | None] = {}
         self._bindings: dict[str, dict[str, str]] = {}
         self._attribute_endpoints: dict[tuple[str, str, str | None, str | None], SourceEndpoint] = {}
+        self._module_attributes: dict[str, tuple[list[ast.stmt], ModuleGetattrContract | None]] = {}
         self._keyword_call_candidates: dict[
             tuple[tuple[str, ...], str],
             list[tuple[str, ast.Call, str | None, str]],
@@ -726,6 +728,8 @@ class GitSnapshot:
         self.root = Path(self.root).resolve()
         if not hasattr(self, "_attribute_endpoints"):
             self._attribute_endpoints = {}
+        if not hasattr(self, "_module_attributes"):
+            self._module_attributes = {}
         self._lock = threading.RLock()
 
     @property
@@ -1024,6 +1028,8 @@ class GitSnapshot:
         function: ast.AsyncFunctionDef | ast.FunctionDef,
         receiver: str,
         member: str,
+        *,
+        allow_dynamic_member: bool = True,
     ) -> bool:
         for candidate in _function_scope_nodes(function):
             if (
@@ -1035,7 +1041,8 @@ class GitSnapshot:
             ):
                 return True
             if (
-                isinstance(candidate, ast.Attribute)
+                allow_dynamic_member
+                and isinstance(candidate, ast.Attribute)
                 and candidate.attr == "__dict__"
                 and isinstance(candidate.value, ast.Name)
                 and candidate.value.id == receiver
@@ -1048,9 +1055,15 @@ class GitSnapshot:
                 and isinstance(candidate.args[0], ast.Name)
                 and candidate.args[0].id == receiver
                 and (
-                    len(candidate.args) < 2
-                    or not isinstance(candidate.args[1], ast.Constant)
-                    or candidate.args[1].value == member
+                    (
+                        len(candidate.args) >= 2
+                        and isinstance(candidate.args[1], ast.Constant)
+                        and candidate.args[1].value == member
+                    )
+                    or (
+                        allow_dynamic_member
+                        and (len(candidate.args) < 2 or not isinstance(candidate.args[1], ast.Constant))
+                    )
                 )
             ):
                 return True
@@ -1365,7 +1378,12 @@ class GitSnapshot:
                 continue
             positional = [*statement.args.posonlyargs, *statement.args.args]
             receiver = positional[0].arg if positional else None
-            if receiver is not None and self._function_may_assign_instance_member(statement, receiver, member):
+            if receiver is not None and self._function_may_assign_instance_member(
+                statement,
+                receiver,
+                member,
+                allow_dynamic_member=False,
+            ):
                 return _QualifiedBinding(
                     resolved.file,
                     actual_owner,
@@ -1377,28 +1395,71 @@ class GitSnapshot:
 
         if not recurse_to_base or not class_node.bases:
             return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
-        if len(class_node.bases) != 1:
-            return _QualifiedBinding(
-                resolved.file,
-                actual_owner,
+        if len(class_node.bases) == 1:
+            base = self._base_reference(resolved.file, class_node.bases[0])
+            if base == "builtins.object" or base in STDLIB_STRUCTURAL_BASES:
+                return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
+            if base is None or not base.startswith("vllm."):
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    None,
+                    "unknown",
+                    _node_fingerprint(class_node),
+                )
+            return self._effective_instance_field(
+                base,
                 member,
-                None,
-                "unknown",
-                _node_fingerprint(class_node),
+                frozenset((*seen, receiver_type)),
             )
-        base = self._base_reference(resolved.file, class_node.bases[0])
-        if base == "builtins.object" or base in STDLIB_STRUCTURAL_BASES:
+
+        base_bindings: list[_QualifiedBinding] = []
+        for base_node in class_node.bases:
+            base = self._base_reference(resolved.file, base_node)
+            if base == "builtins.object" or base in STDLIB_STRUCTURAL_BASES:
+                continue
+            if base is None or not base.startswith("vllm."):
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    None,
+                    "unknown",
+                    _node_fingerprint(class_node),
+                )
+            base_binding = self._effective_instance_field(
+                base,
+                member,
+                frozenset((*seen, receiver_type)),
+            )
+            if base_binding is None or base_binding.status == "unknown":
+                return _QualifiedBinding(
+                    resolved.file,
+                    actual_owner,
+                    member,
+                    None,
+                    "unknown",
+                    _node_fingerprint(class_node),
+                )
+            if base_binding.status != "missing":
+                base_bindings.append(base_binding)
+
+        if not base_bindings:
+            # C3 order is irrelevant when every statically resolved base proves
+            # absence.  This lets a removed field stay an exact deletion even
+            # when the receiver class has several mixin bases.
             return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
-        if base is None or not base.startswith("vllm."):
-            return _QualifiedBinding(
-                resolved.file,
-                actual_owner,
-                member,
-                None,
-                "unknown",
-                _node_fingerprint(class_node),
-            )
-        return self._effective_instance_field(base, member, frozenset((*seen, receiver_type)))
+        if len(base_bindings) == 1:
+            return base_bindings[0]
+        return _QualifiedBinding(
+            resolved.file,
+            actual_owner,
+            member,
+            None,
+            "unknown",
+            _node_fingerprint(class_node),
+        )
 
     def attribute_endpoint(
         self,
@@ -1437,6 +1498,10 @@ class GitSnapshot:
             receiver_type=receiver_type,
             member=member,
         )
+        if access_kind == "direct":
+            module_endpoint = self._module_attribute_endpoint(expression, endpoint)
+            if module_endpoint is not None:
+                return module_endpoint
         if (
             endpoint.symbol_kind not in {"missing", "unknown"}
             or access_kind != "instance"
@@ -1468,6 +1533,49 @@ class GitSnapshot:
             symbol_kind=binding.status,
             signature_status="unknown" if binding.status == "unknown" else None,
             analysis_fingerprint=binding.fingerprint,
+        )
+
+    def _module_attribute_endpoint(self, expression: str, fallback: SourceEndpoint) -> SourceEndpoint | None:
+        module, separator, name = expression.rpartition(".")
+        file_name = self.resolve_module(module) if separator else None
+        if file_name is None:
+            return None
+        tree = self.tree(file_name)
+        if tree is None:
+            return SourceEndpoint(file_name, None, name, symbol_kind="unknown")
+        with self._lock:
+            if file_name not in self._module_attributes:
+                body = runtime_module_body(tree)
+                getter = _body_named_binding(body, "__getattr__")
+                contract = None
+                if getter.status != "missing":
+                    contract = module_getattr_contract(body, getter.node)
+                    if _body_named_binding(body, "AttributeError").status != "missing":
+                        contract = ModuleGetattrContract(None)
+                self._module_attributes[file_name] = body, contract
+            body, contract = self._module_attributes[file_name]
+        binding = _body_named_binding(body, name)
+        descriptor = "module_attribute"
+        status, node = binding.status, binding.node
+        fingerprint = binding.fingerprint
+        if status == "missing" and contract is not None:
+            status, node = contract.resolve(name)
+            descriptor = "module_getattr_registry"
+            fingerprint = _node_fingerprint(node) if node is not None else None
+        elif status in {"exact", "non_callable"}:
+            status = "attribute"
+        elif status == "unknown" and fallback.symbol_kind not in {None, "missing", "unknown"}:
+            # Preserve proven re-export resolution from the ordinary resolver.
+            return fallback
+        return SourceEndpoint(
+            file=file_name,
+            owner=None,
+            name=name,
+            line=getattr(node, "lineno", None),
+            descriptor=descriptor,
+            symbol_kind=status,
+            signature_status="unknown" if status == "unknown" else None,
+            analysis_fingerprint=fingerprint,
         )
 
     def _constructor_class_safe(
@@ -2616,6 +2724,26 @@ def _optional_override_dispatch_evidence(
     ]
 
 
+def _relation_contract_changed(
+    old_endpoint: SourceEndpoint,
+    new_endpoint: SourceEndpoint,
+    old_signature_contract: SignatureContract | None,
+    new_signature_contract: SignatureContract | None,
+) -> bool:
+    old_exists = _relation_symbol_presence(old_endpoint)
+    new_exists = _relation_symbol_presence(new_endpoint)
+    return (
+        old_exists != new_exists
+        or old_endpoint.file != new_endpoint.file
+        or old_endpoint.name != new_endpoint.name
+        or old_endpoint.signature != new_endpoint.signature
+        or old_endpoint.descriptor != new_endpoint.descriptor
+        or old_endpoint.signature_status != new_endpoint.signature_status
+        or _ambiguous_binding_changed(old_endpoint, new_endpoint)
+        or _runtime_signature_changed(old_signature_contract, new_signature_contract)
+    )
+
+
 def _relation_findings(
     relation: Relation,
     engine: InterfaceBoundaryGenerator,
@@ -2646,19 +2774,12 @@ def _relation_findings(
     downstream = _relation_downstream_endpoint(relation, engine)
     old_exists = _relation_symbol_presence(old_endpoint)
     new_exists = _relation_symbol_presence(new_endpoint)
-    runtime_signature_changed = _runtime_signature_changed(
+    runtime_signature_changed = _runtime_signature_changed(old_signature_contract, new_signature_contract)
+    contract_changed = _relation_contract_changed(
+        old_endpoint,
+        new_endpoint,
         old_signature_contract,
         new_signature_contract,
-    )
-    contract_changed = (
-        old_exists != new_exists
-        or old_endpoint.file != new_endpoint.file
-        or old_endpoint.name != new_endpoint.name
-        or old_endpoint.signature != new_endpoint.signature
-        or old_endpoint.descriptor != new_endpoint.descriptor
-        or old_endpoint.signature_status != new_endpoint.signature_status
-        or _ambiguous_binding_changed(old_endpoint, new_endpoint)
-        or runtime_signature_changed
     )
     evidence = [item.as_dict() for item in relation.evidence] or [
         {"file": relation.evidence_file, "line": relation.evidence_line}
@@ -2729,14 +2850,22 @@ def _relation_findings(
             and classification == "preexisting"
             and _signature_delta_changed(parameter_delta)
         )
+        removed_override_target_only = bool(
+            relation.relation == "override" and old_exists is True and new_exists is False
+        )
         gates = {
             "relationship_verified": True,
             "contract_changed": contract_changed,
-            "runtime_reachable": True,
+            # A removed base declaration does not by itself prove that the
+            # surviving downstream method is called. Direct/super call
+            # analysis reports a hard break separately when one exists.
+            "runtime_reachable": not removed_override_target_only,
             "version_lane_matches": True,
         }
         action = (
-            "review" if optional_contract_review or masked_preexisting_delta else _finding_action(classification, gates)
+            "review"
+            if optional_contract_review or masked_preexisting_delta or removed_override_target_only
+            else _finding_action(classification, gates)
         )
         if optional_contract_review:
             suggestion = (
@@ -2747,6 +2876,11 @@ def _relation_findings(
             suggestion = (
                 "Upstream introduced another exact parameter delta while downstream was already incompatible at old. "
                 "Review this delta separately instead of treating it as a confirmed upgrade regression."
+            )
+        elif removed_override_target_only:
+            suggestion = (
+                "Upstream removed the overridden declaration. Review whether the downstream method is now dead or "
+                "still called through another path; remove or migrate it only with call-site evidence."
             )
         else:
             suggestion = _suggestion(
@@ -2783,6 +2917,14 @@ def _relation_findings(
                     "actionability_reason": "new_delta_masked_by_preexisting_incompatibility",
                     "priority_reason": "exact_new_parameter_delta_requires_separate_review",
                     "parameter_delta": parameter_delta,
+                }
+            )
+        if removed_override_target_only:
+            review_details.update(
+                {
+                    "removed_override_target_only": True,
+                    "actionability_reason": "removed_base_declaration_without_runtime_call_evidence",
+                    "priority_reason": "override_removal_requires_call_site_review",
                 }
             )
         findings.append(
@@ -3301,13 +3443,14 @@ def _direct_attribute_findings(
         exact_dependencies.append(dependency)
         old_state = _direct_attribute_state(old_endpoint)
         new_state = _direct_attribute_state(new_endpoint)
+        unresolved = old_state.exists is None or new_state.exists is None
         contract_changed = old_state.exists != new_state.exists or old_state.compatible != new_state.compatible
-        if not contract_changed:
+        if not contract_changed and not unresolved:
             continue
         classification = _classify(old_state, new_state, contract_changed)
         gates = {
             "relationship_verified": True,
-            "contract_changed": True,
+            "contract_changed": contract_changed and not unresolved,
             "runtime_reachable": True,
             "version_lane_matches": True,
         }
@@ -3340,11 +3483,17 @@ def _direct_attribute_findings(
                 ),
                 old_state=old_state,
                 new_state=new_state,
-                change=_change_text(old_endpoint, new_endpoint, "attribute_presence"),
+                change=(
+                    "upstream attribute presence could not be proven at both endpoints"
+                    if unresolved
+                    else _change_text(old_endpoint, new_endpoint, "attribute_presence")
+                ),
                 evidence=[dependency.as_dict()],
                 gates=gates,
                 suggestion=(
-                    "Update the downstream member read for the new upstream object layout and add an "
+                    "Inspect the unresolved upstream runtime attribute binding; do not assume an introduced break."
+                    if unresolved
+                    else "Update the downstream member read for the new upstream object layout and add an "
                     "attribute-presence regression test."
                 ),
                 source="direct_attribute_detector",
@@ -4737,6 +4886,22 @@ def analyze_range(
         timings["inherited_state_comparison"] = None
 
     generator_finding_started = time.perf_counter()
+    exact_relations_by_signature_key: dict[
+        tuple[str, str, str | None, str],
+        list[Relation],
+    ] = {}
+    for relation in relations:
+        if relation.upstream_package != "vllm" or relation.relation not in plan.relation_types:
+            continue
+        exact_relations_by_signature_key.setdefault(
+            (
+                relation.relation,
+                relation.downstream_file,
+                relation.downstream_owner,
+                relation.downstream_name,
+            ),
+            [],
+        ).append(relation)
     exact_relation_signature_keys = {
         (
             finding.relation,
@@ -4753,21 +4918,122 @@ def analyze_range(
     for candidate in generator_findings if plan.include_generator_findings else []:
         if candidate.status not in {"review", "risk"}:
             continue
+        candidate_signature_key = (
+            candidate.relation,
+            candidate.downstream_file,
+            candidate.downstream_owner,
+            candidate.downstream_name,
+        )
         if (
             candidate.supplemental
             and candidate.reason_code == "signature_incompatible"
-            and (
-                candidate.relation,
-                candidate.downstream_file,
-                candidate.downstream_owner,
-                candidate.downstream_name,
-            )
-            in exact_relation_signature_keys
+            and candidate_signature_key in exact_relation_signature_keys
         ):
             # The range finding already owns the exact old/new compatibility
             # conclusion. Keeping the current-snapshot supplemental risk would
             # duplicate the same root cause as an unresolved P2 review.
             continue
+        if candidate.supplemental and candidate.reason_code == "signature_incompatible":
+            exact_relations = exact_relations_by_signature_key.get(candidate_signature_key, [])
+            evidence_matches = [
+                relation
+                for relation in exact_relations
+                if any(evidence.target_expression == candidate.target_expression for evidence in relation.evidence)
+            ]
+            if evidence_matches:
+                exact_relations = evidence_matches
+            elif len(exact_relations) != 1:
+                exact_relations = []
+            converted_preexisting = False
+            for relation in exact_relations:
+                invocation_kind = (
+                    _TRITON_KERNEL_PROTOCOL
+                    if relation.upstream_signature_contract is not None
+                    and relation.upstream_signature_contract.protocol == _TRITON_KERNEL_PROTOCOL
+                    else "python_call"
+                )
+                old_relation_endpoint, new_relation_endpoint = _relation_endpoints(
+                    relation,
+                    old_snapshot,
+                    new_snapshot,
+                    new_to_old,
+                    invocation_kind,
+                )
+                old_contract = old_snapshot.signature_contract(old_relation_endpoint, invocation_kind)
+                new_contract = new_snapshot.signature_contract(new_relation_endpoint, invocation_kind)
+                if _relation_contract_changed(
+                    old_relation_endpoint,
+                    new_relation_endpoint,
+                    old_contract,
+                    new_contract,
+                ):
+                    continue
+                downstream = _relation_downstream_endpoint(relation, generator)
+                old_state = _state(
+                    old_relation_endpoint,
+                    downstream.signature,
+                    relation.relation,
+                    downstream.descriptor,
+                    old_contract,
+                )
+                new_state = _state(
+                    new_relation_endpoint,
+                    downstream.signature,
+                    relation.relation,
+                    downstream.descriptor,
+                    new_contract,
+                )
+                if old_state.compatible is not False or new_state.compatible is not False:
+                    continue
+                evidence = [item.as_dict() for item in relation.evidence] or [
+                    {"file": relation.evidence_file, "line": relation.evidence_line}
+                ]
+                findings.append(
+                    RangeFinding(
+                        finding_id=_finding_id(
+                            relation.exact_key(),
+                            "call_arguments",
+                            old_snapshot.revision,
+                            new_snapshot.revision,
+                        ),
+                        classification="preexisting",
+                        relation=relation.relation,
+                        priority="P2",
+                        action="review",
+                        confidence="high",
+                        upstream_old=old_relation_endpoint,
+                        upstream_new=new_relation_endpoint,
+                        downstream=downstream,
+                        old_state=old_state,
+                        new_state=new_state,
+                        change=(
+                            "upstream contract is unchanged; the installed downstream callable remains incompatible"
+                        ),
+                        evidence=evidence,
+                        gates={
+                            "relationship_verified": True,
+                            "contract_changed": False,
+                            "runtime_reachable": True,
+                            "version_lane_matches": True,
+                        },
+                        suggestion=(
+                            "This incompatibility predates the selected range. Track it as baseline debt rather than "
+                            "attributing it to the current upgrade."
+                        ),
+                        contract_kind="call_arguments",
+                        direction="upstream_contract_to_downstream_implementation",
+                        details={
+                            "installed_signature": downstream.signature,
+                            "installed_descriptor": downstream.descriptor,
+                            "invocation_protocol": invocation_kind,
+                            "unchanged_preexisting_contract": True,
+                        },
+                    )
+                )
+                converted_preexisting = True
+                break
+            if converted_preexisting:
+                continue
         old_endpoint = old_snapshot.expression_endpoint(candidate.target_expression)
         new_endpoint = new_snapshot.expression_endpoint(candidate.target_expression)
         old_endpoint = old_endpoint or SourceEndpoint(None, None, candidate.target_expression)

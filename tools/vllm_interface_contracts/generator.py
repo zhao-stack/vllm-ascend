@@ -60,7 +60,7 @@ from . import schema as _boundary_schema
 from .analysis_plans import MAIN2MAIN_PLAN, AnalysisPlan
 
 SCHEMA_VERSION = 6
-GENERATOR_VERSION = "0.44.0"
+GENERATOR_VERSION = "0.46.0"
 REPOSITORY_INDEX_CACHE_SCHEMA_VERSION = 2
 REPOSITORY_FILE_FRAGMENT_CACHE_SCHEMA_VERSION = 2
 SUPPORTED_RELATIONS = frozenset({"inheritance", "monkey_patch", "override"})

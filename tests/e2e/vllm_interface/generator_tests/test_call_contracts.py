@@ -290,7 +290,8 @@ def test_downstream_self_attribute_uses_exact_upstream_mro(tmp_path: Path) -> No
     )
     assert len(attributes) == 1
     assert attributes[0].target == "vllm.api.Base.payload"
-    assert attributes[0].lookup_root is None
+    assert attributes[0].lookup_root == "vllm.api.Base"
+    assert attributes[0].receiver_type == "vllm_ascend.consumer.Child"
     assert attributes[0].resolution_basis == "new_exact"
 
 
@@ -308,6 +309,25 @@ def test_downstream_self_assignment_blocks_upstream_attribute_dependency(tmp_pat
         "class Base:\n    pass\n",
     )
     assert attributes == []
+
+
+def test_downstream_self_assignment_after_read_keeps_upstream_attribute_dependency(
+    tmp_path: Path,
+) -> None:
+    attributes = _direct_attributes(
+        tmp_path,
+        (
+            "from vllm.api import Base\n\n"
+            "class Child(Base):\n"
+            "    def use(self):\n"
+            "        if self.payload:\n"
+            "            self.payload = False\n"
+        ),
+        "class Base:\n    def __init__(self):\n        self.payload = True\n",
+    )
+    assert len(attributes) == 1
+    assert attributes[0].target == "vllm.api.Base.payload"
+    assert attributes[0].expression == "self.payload"
 
 
 def test_inherited_self_augmented_assignment_remains_an_upstream_read(tmp_path: Path) -> None:
@@ -459,6 +479,45 @@ def test_constructed_receiver_keeps_class_path_without_new_owner_lookup(tmp_path
     assert method_calls[0].target == "vllm.api.Service.run"
     assert method_calls[0].access_kind == "instance"
     assert method_calls[0].receiver_type == "vllm.api.Service"
+
+
+def test_self_field_receiver_uses_unique_upstream_constructor_type(tmp_path: Path) -> None:
+    calls = _direct_calls(
+        tmp_path,
+        ("from vllm.api import Base\n\nclass Child(Base):\n    def use(self):\n        return self.service.run(1)\n"),
+        (
+            "class Service:\n"
+            "    def run(self, value): return value\n\n"
+            "class Base:\n"
+            "    def setup(self):\n"
+            "        self.service = Service()\n"
+        ),
+    )
+    method_calls = [item for item in calls if item.callee == "self.service.run"]
+    assert len(method_calls) == 1
+    assert method_calls[0].target == "vllm.api.Service.run"
+    assert method_calls[0].receiver_type == "vllm.api.Service"
+
+
+def test_self_field_receiver_with_ambiguous_constructor_type_is_not_verified(
+    tmp_path: Path,
+) -> None:
+    calls = _direct_calls(
+        tmp_path,
+        ("from vllm.api import Base\n\nclass Child(Base):\n    def use(self):\n        return self.service.run(1)\n"),
+        (
+            "class FirstService:\n"
+            "    def run(self, value): return value\n\n"
+            "class SecondService:\n"
+            "    def run(self, value): return value\n\n"
+            "class Base:\n"
+            "    def setup_first(self):\n"
+            "        self.service = FirstService()\n\n"
+            "    def setup_second(self):\n"
+            "        self.service = SecondService()\n"
+        ),
+    )
+    assert not [item for item in calls if item.callee == "self.service.run"]
 
 
 def test_conditional_constructed_receiver_is_not_verified(tmp_path: Path) -> None:

@@ -1,0 +1,453 @@
+{
+  "schema_version": 1,
+  "id": "pr13477-reviewed-contracts",
+  "split": "development",
+  "inputs": {
+    "vllm_old_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+    "vllm_new_sha": "58d3918e3ea0a544ffedadad2ba84559e9c51d8f",
+    "vllm_ascend_sha": "cda592a6407cba7870c45b15a871ab40192b4e4f",
+    "external_sources": {},
+    "scenario": "main2main",
+    "profile": "exact-contracts"
+  },
+  "adapted_sha": "c7972a3dcaad34c3293f1a68223b800d6dc0865a",
+  "coverage": "Reviewed contract cases, including verified omissions and strict alignment gaps. Not all PR hunks or all analyzer findings.",
+  "cases": [
+    {
+      "id": "fused-moe-export-removal",
+      "rationale": "The old FusedMoE factory export is removed; three imports, two calls, one attribute read and one patch installation share one upstream cause.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/model_executor/layers/fused_moe/layer.py",
+            "upstream_symbol.name": "FusedMoE",
+            "relation": "direct_import",
+            "downstream.file": "vllm_ascend/models/deepseek_v4.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        },
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/model_executor/layers/fused_moe/layer.py",
+            "upstream_symbol.name": "FusedMoE",
+            "relation": "direct_import",
+            "downstream.file": "vllm_ascend/models/minimax_m3/minimax_m3.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        },
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/model_executor/layers/fused_moe/layer.py",
+            "upstream_symbol.name": "FusedMoE",
+            "relation": "direct_import",
+            "downstream.file": "vllm_ascend/ops/fused_moe/fused_moe.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        },
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/model_executor/layers/fused_moe/layer.py",
+            "upstream_symbol.name": "FusedMoE",
+            "relation": "direct_call",
+            "downstream.file": "vllm_ascend/models/deepseek_v4.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        },
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/model_executor/layers/fused_moe/layer.py",
+            "upstream_symbol.name": "FusedMoE",
+            "relation": "direct_call",
+            "downstream.file": "vllm_ascend/models/minimax_m3/minimax_m3.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        },
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/model_executor/layers/fused_moe/layer.py",
+            "upstream_symbol.name": "FusedMoE",
+            "relation": "direct_attribute",
+            "downstream.file": "vllm_ascend/patch/platform/patch_fused_moe.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        },
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/model_executor/layers/fused_moe/layer.py",
+            "upstream_symbol.name": "FusedMoE",
+            "relation": "monkey_patch",
+            "downstream.file": "vllm_ascend/patch/platform/patch_fused_moe.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P0",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "removed-q_scale_constant",
+      "rationale": "The runtime environment registry loses this key; TYPE_CHECKING declarations do not provide the attribute. DSAAttention still reads it.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/envs.py",
+            "upstream_symbol.name": "Q_SCALE_CONSTANT",
+            "downstream.file": "vllm_ascend/models/layer/attention/layer.py",
+            "relation": "direct_attribute"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "removed-k_scale_constant",
+      "rationale": "The runtime environment registry loses this key; TYPE_CHECKING declarations do not provide the attribute. DSAAttention still reads it.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/envs.py",
+            "upstream_symbol.name": "K_SCALE_CONSTANT",
+            "downstream.file": "vllm_ascend/models/layer/attention/layer.py",
+            "relation": "direct_attribute"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "removed-v_scale_constant",
+      "rationale": "The runtime environment registry loses this key; TYPE_CHECKING declarations do not provide the attribute. DSAAttention still reads it.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "upstream_symbol.file": "vllm/envs.py",
+            "upstream_symbol.name": "V_SCALE_CONSTANT",
+            "downstream.file": "vllm_ascend/models/layer/attention/layer.py",
+            "relation": "direct_attribute"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "removed-calculate-kv-scales",
+      "rationale": "GPUModelRunner stops initializing calculate_kv_scales; NPUModelRunner reads it before writing it. The adaptation guards the old-version read.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "direct_attribute",
+            "upstream_symbol.name": "calculate_kv_scales",
+            "downstream.file": "vllm_ascend/worker/model_runner_v1.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "removed-clear-buffer",
+      "rationale": "RoutedExpertsCapturer removes clear_buffer while the typed downstream receiver still calls it.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "direct_call",
+            "upstream_symbol.name": "clear_buffer",
+            "downstream.file": "vllm_ascend/worker/model_runner_v1.py"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "gumbel-keyword-renaming",
+      "rationale": "Old real call binds the downstream patch. New speculator call uses logits_cache/logits_cache_col and fails CPython binding. The PR leaves the patch unchanged.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "monkey_patch",
+            "contract_kind": "call_arguments",
+            "upstream_symbol.file": "vllm/v1/worker/gpu/sample/gumbel.py",
+            "downstream.file": "vllm_ascend/worker/v2/sample/gumbel.py",
+            "downstream.name": "gumbel_sample"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P0",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "ipc-source-default",
+      "rationale": "Upstream makes source optional in the signature. Its body still rejects None, so this is strict interface alignment, not a new successful runtime path.",
+      "evidence_kind": "interface_alignment",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "override",
+            "contract_kind": "call_arguments",
+            "downstream.file": "vllm_ascend/distributed/weight_transfer/npu_ipc_engine.py",
+            "downstream.owner": "NPUIPCTrainerWeightTransferEngine",
+            "downstream.name": "trainer_init"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "mla-chunk-keyword",
+      "rationale": "Upstream renames chunk_idx to chunk. The downstream method remains a raise-only placeholder; assert interface alignment without claiming an exercised failure.",
+      "evidence_kind": "interface_alignment",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "override",
+            "contract_kind": "call_arguments",
+            "downstream.file": "vllm_ascend/patch/platform/patch_mla_prefill_backend.py",
+            "downstream.owner": "AscendMLAPrefillBackend",
+            "downstream.name": "run_prefill_context_chunk"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "offload-optional-parameters",
+      "rationale": "Upstream adds five optional disk/offload parameters. The current downstream caller passes only the original three; the full override signature nevertheless requires alignment.",
+      "evidence_kind": "interface_alignment",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "override",
+            "contract_kind": "call_arguments",
+            "downstream.file": "vllm_ascend/simple_kv_offload/worker.py",
+            "downstream.owner": "SimpleCPUOffloadNPUWorker",
+            "downstream.name": "__init__"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "mamba-historical-signature",
+      "rationale": "Old and new upstream postprocess_mamba_fused_kernel signatures are identical. The pre-upgrade patch already rejects the actual launch; the adapted signature accepts it.",
+      "evidence_kind": "historical",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13477",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "monkey_patch",
+            "contract_kind": "call_arguments",
+            "upstream_symbol.file": "vllm/v1/worker/mamba_utils.py",
+            "downstream.name": "postprocess_mamba_fused_kernel"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "preexisting",
+            "action": "review",
+            "priority": "P2"
+          }
+        }
+      ]
+    }
+  ]
+}

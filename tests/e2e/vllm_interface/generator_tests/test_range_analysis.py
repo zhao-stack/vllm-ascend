@@ -5,6 +5,8 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from tools.vllm_interface_contracts import cache as cache_module
 from tools.vllm_interface_contracts import generator as generator_module
 from tools.vllm_interface_contracts.cli import main as cli_main
@@ -634,6 +636,41 @@ def test_triton_monkey_patch_preserves_new_delta_priority_on_preexisting_break(
     assert [item["name"] for item in patches[0]["details"]["parameter_delta"]["added"]] == ["new_required"]
 
 
+def test_unchanged_incompatible_triton_patch_is_exact_preexisting_review(
+    tmp_path: Path,
+) -> None:
+    source = (
+        "from vllm.triton_utils import triton\n\n"
+        "@triton.jit(do_not_specialize=['value'])\n"
+        "def kernel(value, required, BLOCK_SIZE): pass\n"
+    )
+    roots = _call_repositories(
+        tmp_path,
+        old_source=source,
+        new_source=f"{source}\nMARKER = 1\n",
+        consumer_source=(
+            "import vllm.api as api\n"
+            "from vllm.triton_utils import triton\n\n"
+            "@triton.jit\n"
+            "def replacement(value, BLOCK_SIZE): pass\n\n"
+            "api.kernel = replacement\n"
+        ),
+    )
+    report = _run(*roots)
+    patches = [
+        item
+        for item in report["findings"]
+        if item["relation"] == "monkey_patch" and item["downstream"]["name"] == "replacement"
+    ]
+    assert len(patches) == 1
+    assert patches[0]["classification"] == "preexisting"
+    assert patches[0]["action"] == "review"
+    assert patches[0]["priority"] == "P2"
+    assert patches[0]["confidence"] == "high"
+    assert patches[0]["contract_kind"] == "call_arguments"
+    assert patches[0]["details"]["unchanged_preexisting_contract"] is True
+
+
 def test_signature_status_change_emits_fail_closed_finding(tmp_path: Path) -> None:
     roots = _call_repositories(
         tmp_path,
@@ -1208,6 +1245,117 @@ def test_conditional_inherited_state_read_is_review_not_a_proven_break(
     assert by_field["payload"]["action"] == "review"
 
 
+def _module_registry_source(entries: str, suffix: str = "") -> str:
+    return (
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n    Q_SCALE_CONSTANT: float\n    K_SCALE_CONSTANT: float\n    V_SCALE_CONSTANT: float\n"
+        f"environment_variables = {{{entries}}}\n"
+        "def __getattr__(name: str):\n"
+        '    """Read runtime configuration."""\n'
+        "    if name in environment_variables:\n"
+        "        return environment_variables[name]()\n"
+        "    raise AttributeError(name)\n" + suffix
+    )
+
+
+def test_deleted_module_registry_keys_are_introduced_breaks(tmp_path: Path) -> None:
+    entries = '"Q_SCALE_CONSTANT": lambda: 200, "K_SCALE_CONSTANT": lambda: 200, "V_SCALE_CONSTANT": lambda: 100'
+    roots = _call_repositories(
+        tmp_path,
+        old_source=_module_registry_source(entries),
+        new_source=_module_registry_source(""),
+        consumer_source=(
+            "import vllm.api as envs\n"
+            "def use():\n"
+            "    return envs.Q_SCALE_CONSTANT, envs.K_SCALE_CONSTANT, envs.V_SCALE_CONSTANT\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 3
+    assert {item["details"]["member"] for item in findings} == {
+        "Q_SCALE_CONSTANT",
+        "K_SCALE_CONSTANT",
+        "V_SCALE_CONSTANT",
+    }
+    for item in findings:
+        assert item["classification"] == "introduced_break"
+        assert item["priority"] == "P1"
+        assert item["action"] == "modify"
+        assert item["upstream"]["old"]["descriptor"] == "module_getattr_registry"
+        assert item["upstream"]["new"]["symbol_kind"] == "missing"
+
+
+@pytest.mark.parametrize("suffix", ["", "Q_SCALE_CONSTANT = 123\n"])
+def test_unchanged_or_static_module_attribute_has_no_break(tmp_path: Path, suffix: str) -> None:
+    entries = '"Q_SCALE_CONSTANT": lambda: 200'
+    roots = _call_repositories(
+        tmp_path,
+        old_source=_module_registry_source(entries, suffix),
+        new_source=_module_registry_source(entries if not suffix else "", suffix) + "# new commit\n",
+        consumer_source="import vllm.api as envs\ndef use(): return envs.Q_SCALE_CONSTANT\n",
+    )
+    report = _run(*roots)
+    assert not [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+
+
+def test_typing_only_module_annotation_does_not_preserve_removed_runtime_value(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="Q_SCALE_CONSTANT = 200\n",
+        new_source="from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    Q_SCALE_CONSTANT: float\n",
+        consumer_source="import vllm.api as envs\ndef use(): return envs.Q_SCALE_CONSTANT\n",
+    )
+    findings = [item for item in _run(*roots)["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+
+
+@pytest.mark.parametrize("unknown_first", [True, False])
+def test_unknown_to_missing_attribute_is_not_an_introduced_break(tmp_path: Path, unknown_first: bool) -> None:
+    unknown = "def __getattr__(name): return external_lookup(name)\n"
+    missing = "# No runtime attributes\n"
+    roots = _call_repositories(
+        tmp_path,
+        old_source=unknown if unknown_first else missing,
+        new_source=missing if unknown_first else unknown,
+        consumer_source="import vllm.api as envs\ndef use(): return envs.Q_SCALE_CONSTANT\n",
+    )
+    findings = [item for item in _run(*roots)["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "analysis_unresolved"
+    assert findings[0]["action"] == "review"
+    assert findings[0]["gates"]["contract_changed"] is False
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def __getattr__(name): return external_lookup(name)\n",
+        _module_registry_source("", "environment_variables.update(external)\n"),
+        _module_registry_source("", "alias = environment_variables\n"),
+        _module_registry_source("", "AttributeError = RuntimeError\n"),
+        _module_registry_source("", "__getattr__ = external_lookup\n"),
+        "from typing import TYPE_CHECKING as TC\nTC = condition\nif TC:\n    Q_SCALE_CONSTANT = 1\n",
+    ],
+)
+def test_unresolved_module_attributes_are_retained_for_review(tmp_path: Path, source: str) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=source,
+        new_source=source + "# new commit\n",
+        consumer_source="import vllm.api as envs\ndef use(): return envs.Q_SCALE_CONSTANT\n",
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "analysis_unresolved"
+    assert findings[0]["priority"] == "P2"
+    assert findings[0]["action"] == "review"
+    assert findings[0]["gates"]["contract_changed"] is False
+    assert "could not be proven" in findings[0]["change"]
+
+
 def test_deleted_annotated_instance_field_is_an_introduced_break(tmp_path: Path) -> None:
     roots = _call_repositories(
         tmp_path,
@@ -1221,6 +1369,83 @@ def test_deleted_annotated_instance_field_is_an_introduced_break(tmp_path: Path)
     assert findings[0]["classification"] == "introduced_break"
     assert findings[0]["upstream"]["old"]["descriptor"] == "instance_attribute"
     assert findings[0]["upstream"]["new"]["symbol_kind"] == "missing"
+
+
+@pytest.mark.parametrize("local_layers", [1, 2])
+def test_unchanged_inherited_field_uses_proven_upstream_lookup_root(tmp_path: Path, local_layers: int) -> None:
+    upstream = "class Base:\n    def __init__(self):\n        self.payload = 1\n"
+    consumer = "from vllm.api import Base\nclass Child(Base):\n    pass\n"
+    owner = "Child"
+    if local_layers == 2:
+        consumer += "class Grandchild(Child):\n    pass\n"
+        owner = "Grandchild"
+    consumer += f"class Reader({owner}):\n    def read(self):\n        return self.payload\n"
+    roots = _call_repositories(
+        tmp_path, old_source=upstream, new_source=upstream + "# next revision\n", consumer_source=consumer
+    )
+    report = _run(*roots)
+    assert report["summary"]["direct_attribute_dependencies"] == 1
+    assert not [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    engine = InterfaceBoundaryGenerator(roots[0], roots[1], source_versions={"vllm": roots[3], "vllm_ascend": roots[4]})
+    _, attributes, findings = validate_current_contracts(engine, [], GitSnapshot(roots[0], roots[3]))
+    assert len(attributes) == 1
+    assert attributes[0].lookup_root == "vllm.api.Base"
+    assert attributes[0].resolution_basis == "new_exact"
+    assert not [item for item in findings if item["relation"] == "direct_attribute"]
+
+
+def test_conditional_inherited_field_remains_unresolved_with_proven_lookup_root(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def __init__(self):\n        self.payload = 1\n",
+        new_source="class Base:\n    def __init__(self):\n        if condition:\n            self.payload = 1\n",
+        consumer_source="from vllm.api import Base\nclass Child(Base):\n    def read(self): return self.payload\n",
+    )
+    findings = [item for item in _run(*roots)["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["upstream"]["old"]["symbol_kind"] == "attribute"
+    assert findings[0]["upstream"]["new"]["symbol_kind"] == "unknown"
+    assert findings[0]["classification"] == "analysis_unresolved"
+    assert findings[0]["action"] == "review"
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_field_mutation_matches_independent_runtime_and_post_adaptation(tmp_path: Path, removed: bool) -> None:
+    old_source = "class Base:\n    def __init__(self):\n        self.payload = 1\n"
+    new_source = "class Base:\n    def __init__(self):\n        pass\n" if removed else old_source + "# unchanged\n"
+    child = "class Child(Base):\n    def read(self): return self.payload\n"
+    observed = []
+    for source in (old_source, new_source):
+        namespace: dict = {}
+        # Execute only this test's dependency-free fixture, independently of
+        # analyzer resolution and classification helpers.
+        exec(source + child, namespace)
+        try:
+            namespace["Child"]().read()
+            observed.append(True)
+        except AttributeError:
+            observed.append(False)
+    assert observed == [True, not removed]
+    roots = _call_repositories(
+        tmp_path,
+        old_source=old_source,
+        new_source=new_source,
+        consumer_source="from vllm.api import Base\n" + child,
+    )
+    before = [item for item in _run(*roots)["findings"] if item["relation"] == "direct_attribute"]
+    assert len(before) == int(removed)
+    if removed:
+        assert before[0]["classification"] == "introduced_break"
+        adapted = (
+            "class Child(Base):\n    def __init__(self): self.payload = 1\n    def read(self): return self.payload\n"
+        )
+        namespace = {}
+        exec(new_source + adapted, namespace)
+        assert namespace["Child"]().read() == 1
+        _write(roots[1], "vllm_ascend/consumer.py", "from vllm.api import Base\n" + adapted)
+        adapted_sha = _commit(roots[1], "adapt the removed field")
+        after = _run(*roots[:4], adapted_sha)
+        assert not [item for item in after["findings"] if item["relation"] == "direct_attribute"]
 
 
 def test_deleted_dataclass_field_is_an_introduced_break(tmp_path: Path) -> None:
@@ -1253,6 +1478,90 @@ def test_deleted_inherited_self_field_is_an_introduced_break(tmp_path: Path) -> 
     assert findings[0]["classification"] == "introduced_break"
     assert findings[0]["details"]["lookup_root"] == "vllm.api.Base"
     assert findings[0]["details"]["resolution_basis"] == "old_fallback_self"
+
+
+def test_read_before_local_write_of_deleted_inherited_field_is_a_break(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source="class Base:\n    def __init__(self):\n        self.payload = True\n",
+        new_source="class Base:\n    def __init__(self):\n        pass\n",
+        consumer_source=(
+            "from vllm.api import Base\n\n"
+            "class Child(Base):\n"
+            "    def use(self):\n"
+            "        if self.payload:\n"
+            "            self.payload = False\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["downstream"]["name"] == "self.payload"
+    assert findings[0]["details"]["resolution_basis"] == "old_fallback_self"
+
+
+def test_deleted_field_on_multiple_inheritance_receiver_is_a_break(tmp_path: Path) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=(
+            "class FirstMixin:\n    pass\n\n"
+            "class SecondMixin:\n    pass\n\n"
+            "class Base(FirstMixin, SecondMixin):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            "        self.payload = True\n"
+        ),
+        new_source=(
+            "class FirstMixin:\n    pass\n\n"
+            "class SecondMixin:\n    pass\n\n"
+            "class Base(FirstMixin, SecondMixin):\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n\n"
+            "    def update_config(self, name, value):\n"
+            "        setattr(self, name, value)\n"
+        ),
+        consumer_source=(
+            "from vllm.api import Base\n\nclass Child(Base):\n    def use(self):\n        return self.payload\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [item for item in report["findings"] if item["relation"] == "direct_attribute"]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["upstream"]["new"]["symbol_kind"] == "missing"
+
+
+def test_deleted_method_called_through_upstream_instance_field_is_a_break(
+    tmp_path: Path,
+) -> None:
+    roots = _call_repositories(
+        tmp_path,
+        old_source=(
+            "class Service:\n"
+            "    def clear(self): return None\n\n"
+            "class Base:\n"
+            "    def setup(self):\n"
+            "        self.service = Service()\n"
+        ),
+        new_source=(
+            "class Service:\n    pass\n\nclass Base:\n    def setup(self):\n        self.service = Service()\n"
+        ),
+        consumer_source=(
+            "from vllm.api import Base\n\nclass Child(Base):\n    def use(self):\n        self.service.clear()\n"
+        ),
+    )
+    report = _run(*roots)
+    findings = [
+        item
+        for item in report["findings"]
+        if item["relation"] == "direct_call" and item["downstream"]["name"] == "self.service.clear"
+    ]
+    assert len(findings) == 1
+    assert findings[0]["classification"] == "introduced_break"
+    assert findings[0]["details"]["resolution_basis"] == "old_fallback_instance_field"
 
 
 def test_deleted_self_field_after_upstream_class_consolidation_is_a_break(tmp_path: Path) -> None:
@@ -1327,6 +1636,10 @@ def test_deleted_verified_override_target_is_an_introduced_break(
     assert overrides[0]["compatibility"]["old"]["compatible"] is True
     assert overrides[0]["compatibility"]["new"]["exists"] is False
     assert overrides[0]["details"]["override_paths"] == [["vllm_ascend.child.Child.run", "vllm.base.Base.run"]]
+    assert overrides[0]["action"] == "review"
+    assert overrides[0]["priority"] == "P2"
+    assert overrides[0]["gates"]["runtime_reachable"] is False
+    assert overrides[0]["details"]["removed_override_target_only"] is True
 
 
 def test_direct_call_required_parameter_is_an_introduced_break(tmp_path: Path) -> None:

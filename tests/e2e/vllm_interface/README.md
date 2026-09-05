@@ -2,6 +2,9 @@
 
 Current implementation and validation handoff: [`VLLM_INTERFACE_HANDOFF_20260812.md`](VLLM_INTERFACE_HANDOFF_20260812.md).
 
+Reviewed full-analyzer benchmarks, scoring, and unresolved triage:
+[`benchmarks/README.md`](benchmarks/README.md).
+
 `singlecard/test_interface_boundaries.py` provides a CPU-only boundary check for vLLM callables coupled to
 vllm-ascend. The existing upstream `vllm-interface` job collects it because that job runs the complete
 `tests/e2e/vllm_interface` directory.

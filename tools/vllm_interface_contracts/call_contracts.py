@@ -962,6 +962,7 @@ class _DirectDependencyResolver:
         ] = {}
         self._function_locals: dict[int, frozenset[str]] = {}
         self._scope_tag_guards: dict[int, set[str]] = {}
+        self._instance_member_types: dict[tuple[str, str], frozenset[str] | None] = {}
 
     def _local_names(
         self,
@@ -1189,6 +1190,194 @@ class _DirectDependencyResolver:
                 classes.append(current.name)
             current = parents.get(id(current))
         return f"{module}.{'.'.join(reversed(classes))}" if classes else None
+
+    @staticmethod
+    def _receiver_member_assignment(
+        node: ast.AST,
+        receiver: str,
+        member: str,
+    ) -> tuple[ast.AST | None, ast.AST | None] | None:
+        """Return the value and annotation for one ``receiver.member`` write."""
+
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            return None
+        targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+        if not any(
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == receiver
+            and target.attr == member
+            for target in targets
+        ):
+            return None
+        annotation = node.annotation if isinstance(node, ast.AnnAssign) else None
+        return node.value, annotation
+
+    def _owner_instance_member_types(
+        self,
+        owner: str,
+        member: str,
+    ) -> frozenset[str] | None:
+        """Infer a unique constructed type for an instance member.
+
+        An empty set means the owner does not assign the member. ``None``
+        means it does assign the member, but the assigned type is not exact.
+        This deliberately accepts assignments outside ``__init__`` because
+        guarded initialization helpers are common in vLLM. Call discovery
+        still requires one unique resolved type across every such write.
+        """
+
+        cache_key = (owner, member)
+        if cache_key in self._instance_member_types:
+            return self._instance_member_types[cache_key]
+        index = self.engine.upstream if owner.startswith("vllm.") else self.engine.downstream
+        class_info = index.find_class(owner)
+        if class_info is None:
+            self._instance_member_types[cache_key] = frozenset()
+            return frozenset()
+
+        resolved_types: set[str] = set()
+        found_assignment = False
+        unresolved_assignment = False
+        method_nodes = {
+            id(node): node
+            for variants in class_info.method_variants.values()
+            for node in variants
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        }
+        method_nodes.update(
+            {
+                id(node): node
+                for node in class_info.methods.values()
+                if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+            }
+        )
+        for method in method_nodes.values():
+            positional = [*method.args.posonlyargs, *method.args.args]
+            receiver = positional[0].arg if positional else None
+            if receiver is None:
+                continue
+            for candidate in _function_scope_nodes(method):
+                assignment = self._receiver_member_assignment(candidate, receiver, member)
+                if assignment is None:
+                    continue
+                found_assignment = True
+                value, annotation = assignment
+                reference_node: ast.AST | None = None
+                if isinstance(value, ast.Call):
+                    reference_node = value.func
+                elif annotation is not None:
+                    reference = _annotation_reference(annotation)
+                    if reference is not None:
+                        try:
+                            reference_node = ast.parse(reference, mode="eval").body
+                        except SyntaxError:
+                            reference_node = None
+                reference = _expression_name(reference_node) if reference_node is not None else None
+                if reference is None:
+                    unresolved_assignment = True
+                    continue
+                resolved = index.canonical_name(index.resolve_reference(class_info.module, reference))
+                if not resolved.startswith(("vllm.", "vllm_ascend.")):
+                    unresolved_assignment = True
+                    continue
+                resolved_types.add(resolved)
+
+        result: frozenset[str] | None
+        if not found_assignment:
+            result = frozenset()
+        elif unresolved_assignment or len(resolved_types) != 1:
+            result = None
+        else:
+            result = frozenset(resolved_types)
+        self._instance_member_types[cache_key] = result
+        return result
+
+    def _self_member_receiver_target(
+        self,
+        node: ast.Call,
+        parents: dict[int, ast.AST],
+        module: str,
+    ) -> tuple[str, str, str, str, str | None, str] | None:
+        """Resolve ``self.<field>.<method>()`` through a proven field type."""
+
+        member_access = _member_access(node)
+        if member_access is None or not isinstance(member_access.value, ast.Attribute):
+            return None
+        field_access = member_access.value
+        function = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        positional = [*function.args.posonlyargs, *function.args.args]
+        receiver = positional[0].arg if positional else None
+        if not (
+            receiver
+            and isinstance(field_access.value, ast.Name)
+            and field_access.value.id == receiver
+            and not self._name_reassigned_before(function, receiver, node)
+        ):
+            return None
+        class_name = self._class_name(node, parents, module)
+        if class_name is None:
+            return None
+        owner_mro = self.engine._linearized_mro(class_name)
+        if not owner_mro.complete:
+            return None
+
+        field_type: str | None = None
+        for owner in owner_mro.owners:
+            candidates = self._owner_instance_member_types(owner, field_access.attr)
+            if candidates is None:
+                return None
+            if candidates:
+                field_type = next(iter(candidates))
+                break
+        if field_type is None:
+            return None
+
+        field_mro = self.engine._linearized_mro(field_type)
+        if not field_mro.complete:
+            return None
+        resolution = self.engine._effective_method_resolution(field_mro.owners, member_access.attr)
+        if (
+            len(resolution.callable_owners) == 1
+            and not resolution.may_be_missing
+            and not resolution.may_be_non_callable
+            and not resolution.has_unresolved_value
+        ):
+            target = f"{resolution.callable_owners[0]}.{member_access.attr}"
+            return (
+                (
+                    target,
+                    "instance",
+                    field_type,
+                    member_access.attr,
+                    None,
+                    "new_exact",
+                )
+                if target.startswith("vllm.")
+                else None
+            )
+
+        definitely_missing = (
+            not resolution.callable_owners
+            and resolution.may_be_missing
+            and not resolution.may_be_non_callable
+            and not resolution.has_unresolved_value
+            and not resolution.blocking_owners
+            and not hasattr(object, member_access.attr)
+        )
+        lookup_root = next((owner for owner in field_mro.owners if owner.startswith("vllm.")), None)
+        if not definitely_missing or lookup_root is None:
+            return None
+        return (
+            f"{lookup_root}.{member_access.attr}",
+            "instance",
+            field_type,
+            member_access.attr,
+            lookup_root,
+            "old_fallback_instance_field",
+        )
 
     def _self_or_super_target(
         self,
@@ -1480,6 +1669,7 @@ class DirectCallDetector(_DirectDependencyResolver):
                 special: tuple[str, str, str, str, str | None, str] | None = None
                 if invocation_kind == "python_call":
                     special = self._self_or_super_target(node, parents, module_info.name)
+                    special = special or self._self_member_receiver_target(node, parents, module_info.name)
                     special = special or self._annotated_instance_target(node, function, module_info)
                 expression = _expression_name(callable_node)
                 root = expression.split(".", 1)[0] if expression is not None else None
@@ -1641,8 +1831,86 @@ class DirectAttributeDetector(_DirectDependencyResolver):
         self._defined_member_cache[cache_key] = False
         return False
 
-    def _local_owner_defines_member(self, owner: str, member: str) -> bool:
-        return self._index_owner_defines_member(self.engine.downstream, owner, member)
+    @staticmethod
+    def _node_position(node: ast.AST, *, end: bool = False) -> tuple[int, int]:
+        line_name = "end_lineno" if end else "lineno"
+        column_name = "end_col_offset" if end else "col_offset"
+        return (
+            getattr(node, line_name, getattr(node, "lineno", 0)),
+            getattr(node, column_name, getattr(node, "col_offset", 0)),
+        )
+
+    def _local_owner_defines_member_before_read(
+        self,
+        owner: str,
+        member: str,
+        read: ast.Attribute,
+        parents: dict[int, ast.AST],
+    ) -> bool:
+        """Prove that downstream owns a member before this exact read.
+
+        A write in an unrelated method, or later in the same method, does not
+        initialize a field before it is read. Constructor writes retain their
+        class-wide meaning for reads in other methods.
+        """
+
+        index = self.engine.downstream
+        if index.find_value(f"{owner}.{member}") is not None:
+            return True
+        if index.find_callable(f"{owner}.{member}") is not None:
+            return True
+        class_info = index.classes.get(owner)
+        if class_info is None:
+            return False
+        current = _nearest(read, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
+        read_position = self._node_position(read)
+        method_nodes = {
+            id(node): node
+            for variants in class_info.method_variants.values()
+            for node in variants
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        }
+        method_nodes.update(
+            {
+                id(node): node
+                for node in class_info.methods.values()
+                if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+            }
+        )
+        for method in method_nodes.values():
+            if method is not current and method.name != "__init__":
+                continue
+            positional = [*method.args.posonlyargs, *method.args.args]
+            receiver = positional[0].arg if positional else None
+            if receiver is None:
+                continue
+            for candidate in _function_scope_nodes(method):
+                assignment = self._receiver_member_assignment(candidate, receiver, member)
+                if assignment is None:
+                    continue
+                value, _annotation = assignment
+                if isinstance(candidate, ast.AnnAssign) and value is None:
+                    continue
+                if method is current and self._node_position(candidate, end=True) >= read_position:
+                    continue
+                return True
+            # ``setattr`` is handled separately because it does not carry a
+            # normal assignment target.
+            for candidate in _function_scope_nodes(method):
+                if not (
+                    isinstance(candidate, ast.Call)
+                    and (_expression_name(candidate.func) or "").rsplit(".", 1)[-1] == "setattr"
+                    and len(candidate.args) >= 2
+                    and isinstance(candidate.args[0], ast.Name)
+                    and candidate.args[0].id == receiver
+                    and isinstance(candidate.args[1], ast.Constant)
+                    and candidate.args[1].value == member
+                ):
+                    continue
+                if method is current and self._node_position(candidate, end=True) >= read_position:
+                    continue
+                return True
+        return False
 
     def _self_or_super_attribute_target(
         self,
@@ -1690,10 +1958,15 @@ class DirectAttributeDetector(_DirectDependencyResolver):
                         "instance",
                         class_name,
                         node.attr,
-                        None,
+                        lookup_root,
                         "new_exact",
                     )
-            elif self._local_owner_defines_member(owner, node.attr):
+            elif self._local_owner_defines_member_before_read(
+                owner,
+                node.attr,
+                node,
+                parents,
+            ):
                 return None
         if hasattr(object, node.attr):
             return None
@@ -1799,7 +2072,10 @@ class DirectAttributeDetector(_DirectDependencyResolver):
                     lookup_root=lookup_root,
                     resolution_basis=resolution_basis,
                 )
-                if lookup_root is not None:
+                # A proven self/super read keeps its downstream receiver for
+                # evidence, but snapshots must look up its upstream MRO root.
+                # Only absent-at-new candidates need historical discovery.
+                if resolution_basis.startswith("old_fallback"):
                     self.historical_attribute_candidates.append(dependency)
                 else:
                     dependencies.append(dependency)

@@ -4,6 +4,66 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v2.7.0 - reviewed benchmarks and inherited field lookup
+
+- Proven self/super attribute dependencies now retain an upstream lookup root
+  alongside their downstream receiver. Both range comparison and current-pair
+  validation resolve fields in the upstream snapshot rather than attempting to
+  resolve an Ascend class in a vLLM-only index. The complete downstream MRO and
+  local shadow checks still gate discovery; ambiguous initialization remains
+  unresolved. Generator 0.46.0 invalidates persisted dependency graphs.
+- Added source-labelled PR benchmarks and a report-only scorer with exact input
+  and full-scenario checks. It verifies classification, priority, evidence sites,
+  and root grouping; unlabelled findings remain unassessed.
+- Added unresolved triage by missing-evidence category and repeated dependency,
+  retaining all original finding IDs and source locations.
+- Added independent runtime field witnesses for unchanged, removed, and repaired
+  consumers, plus multi-level inheritance and conditional-initialization tests.
+
+## range analyzer v2.6.0 - runtime module attributes
+
+- Module attribute reads now use runtime bindings instead of treating
+  `TYPE_CHECKING` declarations or annotation-only names as runtime values.
+  Unshadowed `typing.TYPE_CHECKING` imports and aliases are recognized.
+- A bounded module `__getattr__` backed by a literal string-key dictionary
+  can prove attribute presence or deletion. Static module bindings take
+  precedence over the dynamic getter. Analysis never executes upstream code.
+- Registry mutation, aliases, escaping dictionaries, unknown keys and
+  unsupported getters remain unresolved. Callback value computation and
+  arbitrary module side effects are not interpreted.
+- Already discovered attribute reads with unresolved endpoints remain in
+  the full report as P2 reviews, including unchanged unknown-to-unknown
+  comparisons. They do not pass the proven-contract-change gate.
+- Snapshot cache schema 5 invalidates old endpoint results and persists the
+  new module contract index. Range output schema remains 14.
+- Targeted PR13477 replay proves three P1 introduced attribute breaks:
+  `vllm.envs.Q_SCALE_CONSTANT`, `K_SCALE_CONSTANT`, and `V_SCALE_CONSTANT`.
+  Old getters return 200/200/100; new getters raise `AttributeError`; the
+  downstream PR removes those exact three reads. This targeted verification
+  does not replace or relabel the previous full scan.
+
+## range analyzer v2.5.0 - ordered fields and chained receivers
+
+- Downstream self-field reads are no longer hidden by a write that occurs
+  later in the same method or only in an unrelated method. Proven constructor
+  initialization still suppresses false upstream dependencies.
+- A removed instance field is proven missing across multiple inheritance when
+  every statically resolved base proves absence; ambiguous or external bases
+  remain unresolved. An unrelated method's unconstrained dynamic `setattr`
+  no longer makes every possible field on the class appear unresolved.
+- Direct-call discovery resolves `self.<field>.<method>(...)` when one exact
+  constructor type for the field can be derived from the complete downstream
+  and upstream MRO. Historical comparison can therefore report a method
+  removed from an upstream-owned field type.
+- An unchanged, exactly incompatible Triton monkey patch is classified as a
+  high-confidence P2 preexisting review instead of an unresolved range delta.
+- Removing an upstream declaration that a downstream class merely overrides
+  is a P2 review unless an independent direct or super call proves runtime
+  reachability. This keeps harmless orphan methods out of required work.
+- Generator `0.45.0` and range analyzer `2.5.0` invalidate direct-call and
+  direct-attribute dependency caches because their discovery semantics
+  changed.
+
 ## range analyzer v2.4.0 - full-contract priority and root-cause counts
 
 - Full `main2main` analysis now reports exact optional-only signature additions
@@ -456,33 +516,33 @@ generator problem.
   were neither persisted nor compared, receiver binding collapsed invalid and
   unknown cases, and exact signature compatibility was not checked.
 - Changes:
-  - schema v6 serializes and reloads the upstream, downstream-definition, and
+    - schema v6 serializes and reloads the upstream, downstream-definition, and
     installed runtime contracts without changing relation endpoint identity;
-  - grouping includes the upstream runtime contract, while relation comparison
+    - grouping includes the upstream runtime contract, while relation comparison
     reports contract changes separately and ignores the one-time schema-v5 to
     schema-v6 migration when the baseline contains no contract;
-  - descriptor and signature allowlists are independent. A source-SHA-pinned
+    - descriptor and signature allowlists are independent. A source-SHA-pinned
     descriptor classification no longer silently proves that a decorator is
     signature-transparent;
-  - receiver binding now keeps a varargs-only method exact, marks a callable
+    - receiver binding now keeps a varargs-only method exact, marks a callable
     with no positional receiver slot invalid, and leaves the bound signature
     unknown when the installed descriptor kind is unknown;
-  - exact upstream call shapes are bound against the installed downstream
+    - exact upstream call shapes are bound against the installed downstream
     signature in the compatibility direction. Missing optional keywords,
     renamed keyword-capable parameters, extra downstream requirements, async
     protocol changes, and missing `*args`/`**kwargs` acceptance become
     supplemental `signature_incompatible` risks;
-  - known descriptor mismatches remain owned by the descriptor finding instead
+    - known descriptor mismatches remain owned by the descriptor finding instead
     of producing a duplicate derived signature risk;
-  - deduplication merges runtime contracts across occurrences. Different
+    - deduplication merges runtime contracts across occurrences. Different
     reachable variants retain the relation but make its installed contract
     unknown and add `conditional_signature_contract` review evidence.
 - Safety boundaries:
-  - compatibility is evaluated only when both runtime contracts are exact;
-  - unknown decorators and unknown descriptors are never guessed;
-  - a schema-v5 baseline remains readable and does not create a false contract
+    - compatibility is evaluated only when both runtime contracts are exact;
+    - unknown decorators and unknown descriptors are never guessed;
+    - a schema-v5 baseline remains readable and does not create a false contract
     change solely because the new generator can now persist contracts;
-  - Findings supplement the verified relation; they do not delete the
+    - Findings supplement the verified relation; they do not delete the
     downstream dependency edge.
 - Test evidence: all 188 isolated generator and independent-auditor tests pass;
   Ruff and `git diff --check` pass.
@@ -512,23 +572,23 @@ generator problem.
   mixes the explicit `self`/`cls` parameter with the interface seen after
   Python binds a method to an instance or class.
 - Changes:
-  - every verified override and monkey patch now keeps four distinct views:
+    - every verified override and monkey patch now keeps four distinct views:
     source definition, runtime entry, introspection-reported signature, and
     bound-call signature;
-  - `functools.wraps(target)` keeps the wrapper's real runtime entry while
+    - `functools.wraps(target)` keeps the wrapper's real runtime entry while
     recording the target signature exposed by introspection and the exact
     forwarded target;
-  - descriptor binding removes a receiver only for an ordinary method,
+    - descriptor binding removes a receiver only for an ordinary method,
     classmethod, or property installed in a class namespace; module and
     instance writes do not borrow class binding semantics;
-  - decorator effects are processed from inner to outer.  Builtin descriptor
+    - decorator effects are processed from inner to outer.  Builtin descriptor
     decorators, standard transparent decorators, and exact source-SHA-pinned
     adapters stay exact; every other runtime transform fails closed with a
     supplemental `unknown_signature_transform` review;
-  - exact decorator references are retained by AST-node identity when patch
+    - exact decorator references are retained by AST-node identity when patch
     scanning reconstructs local functions.  This fixes a false unknown result
     for module-level `@classmethod` functions later installed on a class;
-  - existing descriptor tests now assert descriptor and signature findings
+    - existing descriptor tests now assert descriptor and signature findings
     separately.  A decorator may have a known descriptor kind but still have
     an unknown runtime calling convention, so suppressing one dimension with
     the other would hide a real dependency risk.
@@ -563,45 +623,45 @@ generator problem.
   pinned source pair this hid ten real override differences, including
   `Platform.num_compute_units`, whose parameter names still match.
 - Changes:
-  - schema v5 records the upstream definition kind, downstream definition
+    - schema v5 records the upstream definition kind, downstream definition
     kind, and the kind actually installed by a patch; descriptor fields stay
     outside relation identity so a binding change is not misreported as a
     removed/new edge;
-  - a known mismatch or unknown/conditional kind keeps the verified Relation
+    - a known mismatch or unknown/conditional kind keeps the verified Relation
     and adds a supplemental review finding; the independent coverage auditor
     ignores supplemental findings as dispositions, avoiding a false
     `verified + review` conflict;
-  - class-body decorators and explicit `property(...)`, `classmethod(...)`,
+    - class-body decorators and explicit `property(...)`, `classmethod(...)`,
     and `staticmethod(...)` wrappers are interpreted in Python application
     order.  Unknown outer decorators are not guessed, while an outer proven
     descriptor wrapper remains decisive;
-  - patch definition kind and installed kind are separate, preserving cases
+    - patch definition kind and installed kind are separate, preserving cases
     such as an ordinary getter installed with `property(getter)` and
     `staticmethod(lambda ...)`;
-  - class, module, and typed-runtime-instance targets are distinguished because
+    - class, module, and typed-runtime-instance targets are distinguished because
     only writes into a class namespace install descriptors;
-  - an instance write no longer erases the descriptor kind of the upstream
+    - an instance write no longer erases the descriptor kind of the upstream
     class member.  This preserves a real `classmethod -> instance attribute`
     mismatch, while the established `ordinary -> ordinary instance function`
     binding remains an intentional equivalent case;
-  - semantic adapters for `vllm.tracing.instrument` and
+    - semantic adapters for `vllm.tracing.instrument` and
     `torch.inference_mode` are enabled only for the exact pinned source SHAs;
     an unregistered source version remains `unknown` instead of inheriting an
     unverified assumption.
-  - descriptor names are now resolved from the normal-path binding state at
+    - descriptor names are now resolved from the normal-path binding state at
     definition time.  This respects dead branches, deletion, import aliases,
     later rebinding, a missing `builtins` import, and class-local shadowing;
     conditional classmethod/staticmethod aliases remain explicit variants;
-  - property getter, setter, and deleter definitions are retained as three
+    - property getter, setter, and deleter definitions are retained as three
     separate callable contracts.  The getter remains the read signature after
     a later setter/deleter definition, and an accessor is accepted only when
     the preceding normal-path binding is proved to be a property.
-  - class assignment aliases are materialized from every active control-flow
+    - class assignment aliases are materialized from every active control-flow
     branch and keep distinct descriptor variants.  A staticmethod read through
     another class becomes an ordinary method when installed, a property stays
     a property, and a bound classmethod object remains unknown instead of
     being copied as a new classmethod;
-  - `property(getter)` assignments now seed the same accessor state used by
+    - `property(getter)` assignments now seed the same accessor state used by
     `@name.setter`, and patch wrappers resolve the live module/function binding
     rather than trusting the wrapper's spelling or stale import entry.
 - First fixed-source run (before class/module/instance refinement): 971
@@ -610,11 +670,11 @@ generator problem.
   mismatches are source facts, while most unknowns were analyzer errors caused
   by treating whole-class and module-level replacements as class descriptors.
 - Additional fixed-source audit established the expected stable result:
-  - all 655 overrides have known kinds and retain ten source mismatches;
-  - all 124 patches have an installed-kind distribution of 66 not-applicable,
+    - all 655 overrides have known kinds and retain ten source mismatches;
+    - all 124 patches have an installed-kind distribution of 66 not-applicable,
     50 ordinary, 3 classmethod, 4 staticmethod, and 1 property, retaining five
     source mismatches;
-  - three module-level `@classmethod` replacements must remain classmethod when
+    - three module-level `@classmethod` replacements must remain classmethod when
     installed into a class, while the temporary
     `current_platform.verify_quantization` write is an instance attribute and
     therefore has no installed descriptor kind.
@@ -649,43 +709,43 @@ generator problem.
   `8079a7892`. Additional red-test checkpoints cover negative `hasattr`,
   wrapper reachability, and builtin `super()` targets.
 - Problems fixed:
-  - implicit exception scanning walked deferred lambda bodies and skipped
+    - implicit exception scanning walked deferred lambda bodies and skipped
     short-circuit rules, while `assert False` did not produce an exact
     `AssertionError` path;
-  - a negative `hasattr` path could still be emitted as a verified patch, and
+    - a negative `hasattr` path could still be emitted as a verified patch, and
     `hasattr` did not account for bound values or inherited members;
-  - downstream methods and upstream base classes that were callable/classes
+    - downstream methods and upstream base classes that were callable/classes
     on only some normal paths could be treated as unconditional;
-  - same-name conditional class definitions overwrote one another, losing
+    - same-name conditional class definitions overwrote one another, losing
     callable signature variants;
-  - class-body `staticmethod(_impl)` and `classmethod(_impl)` assignments
+    - class-body `staticmethod(_impl)` and `classmethod(_impl)` assignments
     exposed `_impl` instead of the installed member, and lost conditional
     source presence; module-level descriptor wrappers were incorrectly
     promoted to callable endpoints;
-  - a callable written over a definitely non-callable final member was called
+    - a callable written over a definitely non-callable final member was called
     a field mutation instead of a possible stale interface patch;
-  - a downstream `super().same_method(...)` call disappeared when the upstream
+    - a downstream `super().same_method(...)` call disappeared when the upstream
     method was removed, while dead calls and methods supplied by `object` could
     be false positives.
 - Changes:
-  - evaluate expression exceptions only on paths that execute now; model
+    - evaluate expression exceptions only on paths that execute now; model
     assertion success and exact `AssertionError` exits separately;
-  - use final binding alternatives and complete MRO lookup for callable,
+    - use final binding alternatives and complete MRO lookup for callable,
     class, value, unbound, and `hasattr` presence;
-  - aggregate every final same-name class variant and every method binding,
+    - aggregate every final same-name class variant and every method binding,
     adding `unbound` for a variant that lacks the member; differing conditional
     base shapes make the MRO incomplete rather than selecting one branch;
-  - propagate final kinds and callable signatures through provable class-body
+    - propagate final kinds and callable signatures through provable class-body
     aliases while keeping the installed endpoint name;
-  - report a missing upstream same-name `super()` target only for a reachable
+    - report a missing upstream same-name `super()` target only for a reachable
     direct call, a complete MRO, and a method not supplied by `object`.
 - Safety boundaries:
-  - an incomplete inheritance chain remains review and is never guessed;
-  - a genuine missing upstream class, patch target, or direct `super()` target
+    - an incomplete inheritance chain remains review and is never guessed;
+    - a genuine missing upstream class, patch target, or direct `super()` target
     remains a non-generator risk;
-  - a downstream missing-member injection remains expected and is not turned
+    - a downstream missing-member injection remains expected and is not turned
     into a verified relation;
-  - builtin descriptor wrappers are recognized only in a class namespace with
+    - builtin descriptor wrappers are recognized only in a class namespace with
     one positional argument and no keywords.
 - Test evidence: all 137 isolated generator/auditor tests pass. The new
   fixtures cover assertion flow, short-circuit calls, custom exception
@@ -1438,11 +1498,11 @@ generator problem.
   upstream risks, 2 expected injections, 1 inactive branch, and 23 reviews.
   Eighteen findings are still marked as generator work for later iterations.
 - Generic rules added in this iteration:
-  - a missing inherited base is an upstream risk;
-  - a missing patch member under `not hasattr(...)` is an expected injection;
-  - a missing patch member under `hasattr(...)` is an inactive branch;
-  - a missing member on a known upstream owner is an upstream risk;
-  - an unknown patch owner remains a generator review instead of being guessed.
+    - a missing inherited base is an upstream risk;
+    - a missing patch member under `not hasattr(...)` is an expected injection;
+    - a missing patch member under `hasattr(...)` is an inactive branch;
+    - a missing member on a known upstream owner is an upstream risk;
+    - an unknown patch owner remains a generator review instead of being guessed.
 - Reason: later parser fixes must reclassify only genuine generator gaps. They
   must not make real upstream incompatibilities disappear merely to reduce the
   unresolved count.

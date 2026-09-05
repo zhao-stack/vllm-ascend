@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "id": "pr14131-independent-contracts",
+  "split": "holdout",
+  "inputs": {
+    "vllm_old_sha": "58d3918e3ea0a544ffedadad2ba84559e9c51d8f",
+    "vllm_new_sha": "cdc4824a21eaa986d4d1fee90a7e6465c9f706e6",
+    "vllm_ascend_sha": "b1038f13d729a96e183745610c52b997188b51e7",
+    "external_sources": {},
+    "scenario": "main2main",
+    "profile": "exact-contracts"
+  },
+  "adapted_sha": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
+  "coverage": "Three source-frozen acceptance cases before the first scan; broader changed-file audit is separate.",
+  "cases": [
+    {
+      "id": "input-batch-make-dummy-optional-parameter",
+      "rationale": "Upstream InputBatch.make_dummy adds optional max_query_len. AscendInputBatch.make_dummy keeps the old signature before adaptation and adds the parameter in the main lane after adaptation.",
+      "evidence_kind": "interface_alignment",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/14131",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "override",
+            "contract_kind": "call_arguments",
+            "downstream.file": "vllm_ascend/worker/v2/input_batch.py",
+            "downstream.owner": "AscendInputBatch",
+            "downstream.name": "make_dummy"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "mamba-temporal-tiles-keyword",
+      "rationale": "The new upstream Triton kernel accepts TEMPORAL_TILES=1. The old and baseline downstream signatures do not have it; the adapted main-lane kernel adds it. Verify strict patch signature alignment.",
+      "evidence_kind": "interface_alignment",
+      "root_count": 1,
+      "evidence": ["Exact old/new vllm/v1/worker/mamba_utils.py and baseline/adapted vllm_ascend/ops/triton/mamba/postprocess.py definitions; CPython parameter binding."],
+      "checks": [{
+        "match": {"relation": "monkey_patch", "contract_kind": "call_arguments", "downstream.file": "vllm_ascend/ops/triton/mamba/postprocess.py", "downstream.name": "postprocess_mamba_fused_kernel"},
+        "count": 1,
+        "expected": {"classification": "introduced_break", "action": "modify", "priority": "P0"}
+      }]
+    },
+    {
+      "id": "unchanged-inherited-top-k",
+      "rationale": "BaseRouter initializes self.top_k at both upstream endpoints. The 310P router change concerns tensor dtype, not the presence of this inherited field.",
+      "evidence_kind": "negative_control",
+      "root_count": 0,
+      "evidence": ["Both exact upstream BaseRouter.__init__ definitions assign self.top_k = top_k at line 181; PR #14131 adds a dtype conversion in the downstream consumer."],
+      "checks": [{
+        "match": {"relation": "direct_attribute", "details.member": "top_k", "downstream.file": "vllm_ascend/_310p/fused_moe/grouped_topk_router.py"},
+        "count": 0,
+        "expected": {}
+      }]
+    }
+  ]
+}

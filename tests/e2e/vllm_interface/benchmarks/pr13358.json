@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "id": "pr13358-reviewed-contracts",
+  "split": "development",
+  "inputs": {
+    "vllm_old_sha": "d02df748bf9efd99022f1a062597dc3cb3808485",
+    "vllm_new_sha": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+    "vllm_ascend_sha": "e8f25e304da9652eb10067b51c985c2e155aa587",
+    "external_sources": {},
+    "scenario": "main2main",
+    "profile": "exact-contracts"
+  },
+  "adapted_sha": "bf016a1bc151ec1afcdeee50a9542b123009ce93",
+  "coverage": "Three reviewed upstream contract roots with four consumer checks; other findings remain unassessed. The original development manifest incorrectly treated the two Mooncake consumers as independent roots; its first failing score is retained in the validation record.",
+  "cases": [
+    {
+      "id": "mooncake-shared-upstream-state-requirement",
+      "rationale": "One new upstream requires_kv_delivery property reads _kv_transfer_config. Both pinned downstream constructors lack the state: retain two affected-consumer checks under the single upstream-cause root.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13358",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "inherited_state",
+            "contract_kind": "required_instance_attribute",
+            "downstream.file": "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_connector.py",
+            "details.required_attribute": "_kv_transfer_config"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        },
+        {
+          "match": {
+            "relation": "inherited_state",
+            "contract_kind": "required_instance_attribute",
+            "downstream.file": "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake_hybrid_connector.py",
+            "details.required_attribute": "_kv_transfer_config"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "dflash-triton-added-arguments",
+      "rationale": "The upstream Triton launch adds output/input temperature and seed pointers, which the installed downstream kernel does not accept.",
+      "evidence_kind": "runtime_contract",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13358",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "monkey_patch",
+            "contract_kind": "call_arguments",
+            "downstream.file": "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py",
+            "downstream.name": "_prepare_dflash_inputs_kernel_ascend"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P0",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "mla-new-optional-parameters",
+      "rationale": "The wrapper adds non_causal_multi_token_decode and allow_short_prefill_indexer_scoring_skip; downstream must retain full interface substitutability.",
+      "evidence_kind": "interface_alignment",
+      "root_count": 1,
+      "evidence": [
+        "https://github.com/vllm-project/vllm-ascend/pull/13358",
+        "Reviewed exact old/new upstream definitions and pinned downstream uses; see accompanying evidence.md."
+      ],
+      "checks": [
+        {
+          "match": {
+            "relation": "override",
+            "contract_kind": "call_arguments",
+            "downstream.file": "vllm_ascend/ops/mla.py",
+            "downstream.owner": "AscendMultiHeadLatentAttention",
+            "downstream.name": "__init__"
+          },
+          "count": 1,
+          "expected": {
+            "classification": "introduced_break",
+            "action": "modify",
+            "priority": "P1",
+            "gates.relationship_verified": true,
+            "gates.contract_changed": true,
+            "gates.runtime_reachable": true,
+            "gates.version_lane_matches": true
+          }
+        }
+      ]
+    }
+  ]
+}
