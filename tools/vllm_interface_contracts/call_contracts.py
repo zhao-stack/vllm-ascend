@@ -1781,6 +1781,23 @@ class DirectAttributeDetector(_DirectDependencyResolver):
         super().__init__(engine)
         self.historical_attribute_candidates: list[DirectAttributeDependency] = []
         self._defined_member_cache: dict[tuple[int, str, str], bool] = {}
+        self._patch_receivers: dict[int, set[str]] = {}
+        for relation in engine.relations:
+            if (
+                relation.relation != "monkey_patch"
+                or relation.upstream_package != "vllm"
+                or relation.upstream_owner is None
+                or relation.installed_descriptor_kind != "ordinary"
+            ):
+                continue
+            module = relation.downstream_file.removesuffix(".py").replace("/", ".")
+            target = ".".join(p for p in (module, relation.downstream_owner, relation.downstream_name) if p)
+            replacement = engine.downstream.find_callable(target)
+            upstream_module = relation.upstream_file.removesuffix(".py").replace("/", ".")
+            upstream_module = upstream_module.removesuffix(".__init__")
+            owner = f"{upstream_module}.{relation.upstream_owner}"
+            if replacement is not None and replacement.node is not None and engine.upstream.find_class(owner):
+                self._patch_receivers.setdefault(id(replacement.node), set()).add(owner)
 
     def _index_owner_defines_member(self, index: RepositoryIndex, owner: str, member: str) -> bool:
         cache_key = (id(index), owner, member)
@@ -1942,6 +1959,17 @@ class DirectAttributeDetector(_DirectDependencyResolver):
             return None
         class_name = self._class_name(node, parents, module)
         if class_name is None:
+            patch_receivers = self._patch_receivers.get(id(function), set())
+            if is_receiver and len(patch_receivers) == 1:
+                patch_receiver = next(iter(patch_receivers))
+                return (
+                    f"{patch_receiver}.{node.attr}",
+                    "instance",
+                    patch_receiver,
+                    node.attr,
+                    patch_receiver,
+                    "verified_method_patch_receiver",
+                )
             return None
         mro = self.engine._linearized_mro(class_name)
         if not mro.complete:

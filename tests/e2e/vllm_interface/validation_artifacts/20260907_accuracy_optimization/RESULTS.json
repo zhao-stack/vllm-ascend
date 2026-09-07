@@ -1,0 +1,3100 @@
+{
+  "engine_source_sha256": "05f1290bb81e08d34e94f55f54a524e67430dc9432c60df0b7fe972cba70c142",
+  "generator_version": "0.47.0",
+  "range_analyzer_version": "2.8.0",
+  "policy": "Strict interface alignment, with runtime and conditional evidence distinguished from workload execution",
+  "quality_checks": [
+    {
+      "check": "pytest",
+      "exit_code": 0,
+      "seconds": 263.43
+    },
+    {
+      "check": "mypy-3.10",
+      "exit_code": 0,
+      "seconds": 0.966
+    },
+    {
+      "check": "mypy-3.11",
+      "exit_code": 0,
+      "seconds": 0.838
+    },
+    {
+      "check": "mypy-3.12",
+      "exit_code": 0,
+      "seconds": 0.812
+    },
+    {
+      "check": "ruff-lint",
+      "exit_code": 0,
+      "seconds": 0.186
+    },
+    {
+      "check": "ruff-format",
+      "exit_code": 0,
+      "seconds": 0.157
+    },
+    {
+      "check": "compileall",
+      "exit_code": 0,
+      "seconds": 0.166
+    },
+    {
+      "check": "diff-check",
+      "exit_code": 0,
+      "seconds": 0.214
+    }
+  ],
+  "scoped_adjudication": {
+    "actionable_consumers_reviewed": 47,
+    "sample_local_roots_reviewed": 35,
+    "confirmed_false_positive_consumers": 0,
+    "global_accuracy": null,
+    "global_recall": null
+  },
+  "runs": {
+    "pr13477": {
+      "inputs": {
+        "upstream_old": "0351e9aa1fdf1a51329d1906881528dfe61fc88e",
+        "upstream_new": "58d3918e3ea0a544ffedadad2ba84559e9c51d8f",
+        "ascend_baseline": "cda592a6407cba7870c45b15a871ab40192b4e4f",
+        "ascend_merged": "c7972a3dcaad34c3293f1a68223b800d6dc0865a",
+        "scenario": "main2main",
+        "external_sources": {}
+      },
+      "original_manifest_sha256": "4a64e039a3e9d81044536db15cb99bc73afb21dd7aefc2216935ee00e39ec77f",
+      "frozen_cases_passed": 11,
+      "frozen_cases_total": 11,
+      "summary": {
+        "relations": 1094,
+        "relations_collected": 1094,
+        "direct_call_dependencies": 5012,
+        "direct_attribute_dependencies": 3043,
+        "inherited_state_dependencies": 85,
+        "generator_findings": 214,
+        "total": 670,
+        "root_causes": 288,
+        "by_relation": {
+          "direct_attribute": 384,
+          "direct_call": 30,
+          "direct_import": 3,
+          "inheritance": 2,
+          "inherited_state": 61,
+          "monkey_patch": 32,
+          "override": 158
+        },
+        "by_contract": {
+          "analysis_evidence": 55,
+          "attribute_presence": 384,
+          "call_arguments": 152,
+          "call_target_presence": 13,
+          "replacement_return": 1,
+          "required_instance_attribute": 61,
+          "symbol_presence": 3,
+          "target_presence": 1
+        },
+        "actionable_introduced_break": 10,
+        "actionable_introduced_findings": 16,
+        "introduced_break_root_causes": 11,
+        "review_root_causes": 278,
+        "by_action": {
+          "dismiss": 1,
+          "modify": 16,
+          "review": 653
+        },
+        "introduced_break": 17,
+        "compatibility_warning": 56,
+        "preexisting": 128,
+        "fixed": 0,
+        "analysis_unresolved": 469
+      },
+      "missing_previous_consumers": [],
+      "workflow_seconds": {
+        "validate": 911.3646226000001,
+        "predict": 1464.0004379000002,
+        "evaluate": 0.8582081999993534
+      },
+      "stage_timings_seconds": {
+        "downstream_scanning_parsing": 4.612933,
+        "downstream_relation_generation": 174.82938,
+        "monkey_patch_generation": 242.489318,
+        "upstream_old_new_snapshot_index": 591.096694,
+        "contract_comparison": 1907.560987,
+        "report_generation": 0.161397,
+        "total": 1452.693765,
+        "total_with_report": 1452.855162
+      },
+      "actionable": [
+        {
+          "id": "60b6a3781792b4da",
+          "root_cause_id": "b44c74f429b29b73",
+          "relation": "direct_attribute",
+          "contract_kind": "attribute_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/layer/attention/layer.py",
+            "owner": "DSAAttention",
+            "name": "envs.Q_SCALE_CONSTANT",
+            "line": 154
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/envs.py",
+              "owner": null,
+              "name": "Q_SCALE_CONSTANT",
+              "line": 1331,
+              "symbol_kind": "attribute"
+            },
+            "new": {
+              "file": "vllm/envs.py",
+              "owner": null,
+              "name": "Q_SCALE_CONSTANT",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "upstream member exists"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream member does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "ac1502124bb81583",
+          "root_cause_id": "d4565172c55ebd21",
+          "relation": "direct_attribute",
+          "contract_kind": "attribute_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/layer/attention/layer.py",
+            "owner": "DSAAttention",
+            "name": "envs.K_SCALE_CONSTANT",
+            "line": 155
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/envs.py",
+              "owner": null,
+              "name": "K_SCALE_CONSTANT",
+              "line": 1333,
+              "symbol_kind": "attribute"
+            },
+            "new": {
+              "file": "vllm/envs.py",
+              "owner": null,
+              "name": "K_SCALE_CONSTANT",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "upstream member exists"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream member does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "b8f8326d3c6fa042",
+          "root_cause_id": "1558514e02168fd3",
+          "relation": "direct_attribute",
+          "contract_kind": "attribute_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/layer/attention/layer.py",
+            "owner": "DSAAttention",
+            "name": "envs.V_SCALE_CONSTANT",
+            "line": 156
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/envs.py",
+              "owner": null,
+              "name": "V_SCALE_CONSTANT",
+              "line": 1335,
+              "symbol_kind": "attribute"
+            },
+            "new": {
+              "file": "vllm/envs.py",
+              "owner": null,
+              "name": "V_SCALE_CONSTANT",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "upstream member exists"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream member does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "374a2bc426f1cb12",
+          "root_cause_id": "07eb43473d0d4358",
+          "relation": "direct_attribute",
+          "contract_kind": "attribute_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_fused_moe.py",
+            "owner": null,
+            "name": "_fused_moe_layer.FusedMoE",
+            "line": 48
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/layer.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": 100,
+              "symbol_kind": "attribute"
+            },
+            "new": {
+              "file": "vllm/model_executor/layers/fused_moe/layer.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "upstream member exists"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream member does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "70274849b09a602b",
+          "root_cause_id": "e39ca524134f2a34",
+          "relation": "direct_attribute",
+          "contract_kind": "attribute_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/model_runner_v1.py",
+            "owner": "NPUModelRunner",
+            "name": "self.calculate_kv_scales",
+            "line": 2090
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu_model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "calculate_kv_scales",
+              "line": 502,
+              "symbol_kind": "attribute"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu_model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "calculate_kv_scales",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "upstream member exists"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream member does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "ac093882f5c967aa",
+          "root_cause_id": "07eb43473d0d4358",
+          "relation": "direct_call",
+          "contract_kind": "call_target_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/deepseek_v4.py",
+            "owner": "DeepseekV4MoE",
+            "name": "FusedMoE",
+            "line": 436
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/layer.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": 100,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/model_executor/layers/fused_moe/__init__.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream call target does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "c4d27d2e89beb40a",
+          "root_cause_id": "07eb43473d0d4358",
+          "relation": "direct_call",
+          "contract_kind": "call_target_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/minimax_m3/minimax_m3.py",
+            "owner": "MiniMaxM3MoE",
+            "name": "FusedMoE",
+            "line": 549
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/layer.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": 100,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/model_executor/layers/fused_moe/__init__.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream call target does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "fa1a4a7f7d20a1d1",
+          "root_cause_id": "c98d5b2e910e0ecd",
+          "relation": "direct_call",
+          "contract_kind": "call_target_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/model_runner_v1.py",
+            "owner": "NPUModelRunner",
+            "name": "self.routed_experts_capturer.clear_buffer",
+            "line": 1783
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/routed_experts_capturer.py",
+              "owner": "RoutedExpertsCapturer",
+              "name": "clear_buffer",
+              "line": 217,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/model_executor/layers/fused_moe/routed_experts_capturer.py",
+              "owner": "RoutedExpertsCapturer",
+              "name": "clear_buffer",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream call target does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "815656c032607674",
+          "root_cause_id": "07eb43473d0d4358",
+          "relation": "direct_import",
+          "contract_kind": "symbol_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/deepseek_v4.py",
+            "owner": null,
+            "name": "FusedMoE",
+            "line": 47
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/__init__.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": 21,
+              "symbol_kind": null
+            },
+            "new": {
+              "file": null,
+              "owner": null,
+              "name": "FusedMoE",
+              "line": null,
+              "symbol_kind": null
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "import target exists at old"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "old import path no longer resolves at new"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "5533146216a9d089",
+          "root_cause_id": "07eb43473d0d4358",
+          "relation": "direct_import",
+          "contract_kind": "symbol_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/minimax_m3/minimax_m3.py",
+            "owner": null,
+            "name": "FusedMoE",
+            "line": 43
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/__init__.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": 21,
+              "symbol_kind": null
+            },
+            "new": {
+              "file": null,
+              "owner": null,
+              "name": "FusedMoE",
+              "line": null,
+              "symbol_kind": null
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "import target exists at old"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "old import path no longer resolves at new"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "6dc74ee091e73225",
+          "root_cause_id": "07eb43473d0d4358",
+          "relation": "direct_import",
+          "contract_kind": "symbol_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/ops/fused_moe/fused_moe.py",
+            "owner": null,
+            "name": "FusedMoE",
+            "line": 21
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/layer.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": 100,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": null,
+              "owner": null,
+              "name": "FusedMoE",
+              "line": null,
+              "symbol_kind": null
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "import target exists at old"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "old import path no longer resolves at new"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "36116c6a77e3681c",
+          "root_cause_id": "07eb43473d0d4358",
+          "relation": "monkey_patch",
+          "contract_kind": "target_presence",
+          "priority": "P0",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_fused_moe.py",
+            "owner": null,
+            "name": "_ascend_FusedMoE",
+            "line": 174
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/fused_moe/layer.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": 100,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/model_executor/layers/fused_moe/layer.py",
+              "owner": null,
+              "name": "FusedMoE",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "upstream target exists at old"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream target was removed at new"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "5cccd2621e295338",
+          "root_cause_id": "c0d71e8ef9aeac2b",
+          "relation": "monkey_patch",
+          "contract_kind": "call_arguments",
+          "priority": "P0",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/sample/gumbel.py",
+            "owner": null,
+            "name": "gumbel_sample",
+            "line": 22
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/sample/gumbel.py",
+              "owner": null,
+              "name": "gumbel_sample",
+              "line": 215,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/sample/gumbel.py",
+              "owner": null,
+              "name": "gumbel_sample",
+              "line": 215,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "a78cc77587b26128",
+          "root_cause_id": "6bd3b91ad05cfc0f",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/distributed/weight_transfer/npu_ipc_engine.py",
+            "owner": "NPUIPCTrainerWeightTransferEngine",
+            "name": "trainer_init",
+            "line": 613
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/distributed/weight_transfer/ipc_engine.py",
+              "owner": "IPCTrainerWeightTransferEngine",
+              "name": "trainer_init",
+              "line": 289,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/distributed/weight_transfer/ipc_engine.py",
+              "owner": "IPCTrainerWeightTransferEngine",
+              "name": "trainer_init",
+              "line": 289,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "1b30f0b36844fb96",
+          "root_cause_id": "765cd5c3a08135f4",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_mla_prefill_backend.py",
+            "owner": "AscendMLAPrefillBackend",
+            "name": "run_prefill_context_chunk",
+            "line": 38
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/attention/backends/mla/prefill/base.py",
+              "owner": "MLAPrefillBackend",
+              "name": "run_prefill_context_chunk",
+              "line": 176,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/attention/backends/mla/prefill/base.py",
+              "owner": "MLAPrefillBackend",
+              "name": "run_prefill_context_chunk",
+              "line": 176,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "e33efa44aebb0672",
+          "root_cause_id": "7b835726819591aa",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/simple_kv_offload/worker.py",
+            "owner": "SimpleCPUOffloadNPUWorker",
+            "name": "__init__",
+            "line": 62
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/simple_kv_offload/worker.py",
+              "owner": "SimpleCPUOffloadWorker",
+              "name": "__init__",
+              "line": 28,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/simple_kv_offload/worker.py",
+              "owner": "SimpleCPUOffloadWorker",
+              "name": "__init__",
+              "line": 29,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        }
+      ]
+    },
+    "pr14131": {
+      "inputs": {
+        "upstream_old": "58d3918e3ea0a544ffedadad2ba84559e9c51d8f",
+        "upstream_new": "cdc4824a21eaa986d4d1fee90a7e6465c9f706e6",
+        "ascend_baseline": "b1038f13d729a96e183745610c52b997188b51e7",
+        "ascend_merged": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        "scenario": "main2main",
+        "external_sources": {}
+      },
+      "original_manifest_sha256": "b165f53862b12dd7745ac114f98431e81279df554fc13660dcc7d35fd635ad6a",
+      "frozen_cases_passed": 3,
+      "frozen_cases_total": 3,
+      "summary": {
+        "relations": 1138,
+        "relations_collected": 1138,
+        "direct_call_dependencies": 5588,
+        "direct_attribute_dependencies": 3234,
+        "inherited_state_dependencies": 130,
+        "generator_findings": 212,
+        "total": 718,
+        "root_causes": 303,
+        "by_relation": {
+          "direct_attribute": 400,
+          "direct_call": 49,
+          "direct_import": 1,
+          "inheritance": 1,
+          "inherited_state": 55,
+          "monkey_patch": 41,
+          "override": 171
+        },
+        "by_contract": {
+          "analysis_evidence": 52,
+          "attribute_presence": 400,
+          "call_arguments": 197,
+          "call_target_presence": 8,
+          "dataclass_field_order": 1,
+          "replacement_return": 4,
+          "required_instance_attribute": 55,
+          "symbol_presence": 1
+        },
+        "actionable_introduced_break": 20,
+        "actionable_introduced_findings": 24,
+        "introduced_break_root_causes": 20,
+        "review_root_causes": 290,
+        "by_action": {
+          "dismiss": 4,
+          "modify": 24,
+          "review": 690
+        },
+        "introduced_break": 24,
+        "compatibility_warning": 58,
+        "preexisting": 128,
+        "fixed": 3,
+        "analysis_unresolved": 505
+      },
+      "missing_previous_consumers": [],
+      "workflow_seconds": {
+        "validate": 973.8846389000009,
+        "predict": 1620.6086717999988,
+        "evaluate": 0.8105539000007411
+      },
+      "stage_timings_seconds": {
+        "downstream_scanning_parsing": 4.848571,
+        "downstream_relation_generation": 191.744759,
+        "monkey_patch_generation": 278.883683,
+        "upstream_old_new_snapshot_index": 644.232577,
+        "contract_comparison": 2124.255953,
+        "report_generation": 0.174076,
+        "total": 1609.301054,
+        "total_with_report": 1609.47513
+      },
+      "actionable": [
+        {
+          "id": "982c93ac1b455b5e",
+          "root_cause_id": "c5ca5311e9e56c86",
+          "relation": "direct_attribute",
+          "contract_kind": "attribute_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_vision.py",
+            "owner": null,
+            "name": "self.running_mean",
+            "line": 42
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/models/vision.py",
+              "owner": "FusedInputNorm",
+              "name": "running_mean",
+              "line": null,
+              "symbol_kind": "instance_field"
+            },
+            "new": {
+              "file": "vllm/model_executor/models/vision.py",
+              "owner": "FusedInputNorm",
+              "name": "running_mean",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "literal nn.Module buffer registered on every constructor path"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "previously registered buffer is absent from the closed new layout"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "9cb7bc50bcd9d939",
+          "root_cause_id": "c996e4a26a121fca",
+          "relation": "direct_attribute",
+          "contract_kind": "attribute_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_vision.py",
+            "owner": null,
+            "name": "self.running_var",
+            "line": 43
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/models/vision.py",
+              "owner": "FusedInputNorm",
+              "name": "running_var",
+              "line": null,
+              "symbol_kind": "instance_field"
+            },
+            "new": {
+              "file": "vllm/model_executor/models/vision.py",
+              "owner": "FusedInputNorm",
+              "name": "running_var",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "literal nn.Module buffer registered on every constructor path"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "previously registered buffer is absent from the closed new layout"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "292161fd5be87119",
+          "root_cause_id": "505c7412d642a946",
+          "relation": "direct_call",
+          "contract_kind": "call_target_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/worker/patch_qwen3_5.py",
+            "owner": null,
+            "name": "_all_gather_hidden_and_residual",
+            "line": 177
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/models/qwen3_next.py",
+              "owner": null,
+              "name": "_all_gather_hidden_and_residual",
+              "line": 571,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/model_executor/models/qwen3_next.py",
+              "owner": null,
+              "name": "_all_gather_hidden_and_residual",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream call target does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "cad4317144dfd8ed",
+          "root_cause_id": "aec3ad51698304ee",
+          "relation": "direct_call",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/model_runner.py",
+            "owner": "NPUModelRunner",
+            "name": "sort_batch_req_ids",
+            "line": 221
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/model_runner.py",
+              "owner": null,
+              "name": "sort_batch_req_ids",
+              "line": 1787,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/model_runner.py",
+              "owner": null,
+              "name": "sort_batch_req_ids",
+              "line": 1974,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "call arguments do not bind: missing a required argument: 'decode_query_len'"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "6fbef242dae8a3f8",
+          "root_cause_id": "505c7412d642a946",
+          "relation": "direct_import",
+          "contract_kind": "symbol_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/worker/patch_qwen3_5.py",
+            "owner": null,
+            "name": "_all_gather_hidden_and_residual",
+            "line": 31
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/models/qwen3_next.py",
+              "owner": null,
+              "name": "_all_gather_hidden_and_residual",
+              "line": 571,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": null,
+              "owner": null,
+              "name": "_all_gather_hidden_and_residual",
+              "line": null,
+              "symbol_kind": null
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "import target exists at old"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "old import path no longer resolves at new"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "b6546c70460a270e",
+          "root_cause_id": "3b721747f911cbd0",
+          "relation": "inheritance",
+          "contract_kind": "dataclass_field_order",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/input_batch.py",
+            "owner": null,
+            "name": "AscendInputBatch",
+            "line": 71
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/input_batch.py",
+              "owner": null,
+              "name": "InputBatch",
+              "line": 37,
+              "symbol_kind": "class"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/input_batch.py",
+              "owner": null,
+              "name": "InputBatch",
+              "line": 42,
+              "symbol_kind": "class"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "old dataclass initializer field order"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "non-default argument 'seq_lens_np' follows default argument 'max_query_len'"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "3a72158009fed8de",
+          "root_cause_id": "c31391a791cff697",
+          "relation": "inherited_state",
+          "contract_kind": "required_instance_attribute",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/distributed/kv_transfer/kv_pool/kv_offload/native/cpu_npu.py",
+            "owner": "NPUOffloadingWorker",
+            "name": "__init__",
+            "line": 270
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/kv_offload/cpu/gpu_worker.py",
+              "owner": "CPUOffloadingWorker",
+              "name": "shutdown",
+              "line": 550,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/kv_offload/cpu/gpu_worker.py",
+              "owner": "CPUOffloadingWorker",
+              "name": "shutdown",
+              "line": 844,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "the old inherited callable did not read _mmap_region"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "downstream constructor vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.native.cpu_npu.NPUOffloadingWorker neither assigns _mmap_region nor calls super().__init__()"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": []
+        },
+        {
+          "id": "6177dc8324ca9f65",
+          "root_cause_id": "aedd9924fe7eab55",
+          "relation": "inherited_state",
+          "contract_kind": "required_instance_attribute",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+            "owner": "AscendHybridKVCacheCoordinator",
+            "name": "__init__",
+            "line": 77
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/core/kv_cache_coordinator.py",
+              "owner": "HybridKVCacheCoordinator",
+              "name": "cache_blocks",
+              "line": 652,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/core/kv_cache_coordinator.py",
+              "owner": "HybridKVCacheCoordinator",
+              "name": "cache_blocks",
+              "line": 707,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "the old inherited callable did not read num_reprefillable_tokens"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "downstream constructor vllm_ascend.patch.platform.patch_kv_cache_coordinator.AscendHybridKVCacheCoordinator neither assigns num_reprefillable_tokens nor calls super().__init__()"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": [
+            {
+              "kind": "constructor_enables_collection_element_flag",
+              "collection": "single_type_managers",
+              "flag": "use_eagle",
+              "assignment_lines": [
+                251
+              ],
+              "read_condition": "manager.use_eagle",
+              "initialization_helper_calls": [
+                {
+                  "helper": "verify_and_split_kv_cache_groups",
+                  "constructor_call_line": 166
+                }
+              ],
+              "path_conditions": [
+                "manager.use_eagle and aligned_num_computed_tokens > 0"
+              ],
+              "scope": "conditional_interface_contract_not_all_workloads"
+            }
+          ]
+        },
+        {
+          "id": "be34adf1888b58a7",
+          "root_cause_id": "372e92fe74de01a1",
+          "relation": "monkey_patch",
+          "contract_kind": "call_arguments",
+          "priority": "P0",
+          "downstream": {
+            "file": "vllm_ascend/ops/triton/mamba/postprocess.py",
+            "owner": null,
+            "name": "postprocess_mamba_fused_kernel",
+            "line": 200
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/mamba_utils.py",
+              "owner": null,
+              "name": "postprocess_mamba_fused_kernel",
+              "line": 154,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/mamba_utils.py",
+              "owner": null,
+              "name": "postprocess_mamba_fused_kernel",
+              "line": 250,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "2b5afdd955c93d2c",
+          "root_cause_id": "332e14797f16a2c1",
+          "relation": "monkey_patch",
+          "contract_kind": "call_arguments",
+          "priority": "P0",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+            "owner": null,
+            "name": "get_kv_cache_coordinator",
+            "line": 455
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/core/kv_cache_coordinator.py",
+              "owner": null,
+              "name": "get_kv_cache_coordinator",
+              "line": 851,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/core/kv_cache_coordinator.py",
+              "owner": null,
+              "name": "get_kv_cache_coordinator",
+              "line": 917,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "exact_interface_call_pair",
+            "old_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "kv_cache_config",
+                "max_model_len",
+                "max_in_flight_tokens",
+                "use_eagle",
+                "enable_caching",
+                "enable_kv_cache_events",
+                "dcp_world_size",
+                "pcp_world_size",
+                "scheduler_block_size",
+                "hash_block_size",
+                "metrics_collector"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "kv_cache_config",
+                "max_model_len",
+                "max_in_flight_tokens",
+                "use_eagle",
+                "enable_caching",
+                "enable_kv_cache_events",
+                "dcp_world_size",
+                "pcp_world_size",
+                "scheduler_block_size",
+                "hash_block_size",
+                "metrics_collector",
+                "num_prefill_lookahead"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "num_prefill_lookahead"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'num_prefill_lookahead'"
+          },
+          "historical_finding_id": "567e10f612630691",
+          "condition_evidence": null
+        },
+        {
+          "id": "4aacc742761e28b0",
+          "root_cause_id": "2946ebcfb9e099ce",
+          "relation": "monkey_patch",
+          "contract_kind": "call_arguments",
+          "priority": "P0",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/model_runner.py",
+            "owner": null,
+            "name": "factory",
+            "line": 544
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": null,
+              "name": "ModelCudaGraphManager",
+              "line": 422,
+              "symbol_kind": "constructor"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": null,
+              "name": "ModelCudaGraphManager",
+              "line": 441,
+              "symbol_kind": "constructor"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "cfff08d08129e2a6",
+          "root_cause_id": "336033fb4d452d47",
+          "relation": "monkey_patch",
+          "contract_kind": "call_arguments",
+          "priority": "P0",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/structured_outputs.py",
+            "owner": null,
+            "name": "_apply_grammar_bitmask_kernel",
+            "line": 39
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/structured_outputs.py",
+              "owner": null,
+              "name": "_apply_grammar_bitmask_kernel",
+              "line": 86,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/structured_outputs.py",
+              "owner": null,
+              "name": "_apply_grammar_bitmask_kernel",
+              "line": 102,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "2690a516800c25c4",
+          "root_cause_id": "76b1137062c60e0e",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/_310p/model_runner_310p.py",
+            "owner": "NPUModelRunner310",
+            "name": "_dummy_run",
+            "line": 571
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu_model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "_dummy_run",
+              "line": 5900,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu_model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "_dummy_run",
+              "line": 5934,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "exact_interface_call_pair",
+            "old_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "num_tokens",
+                "cudagraph_runtime_mode",
+                "force_attention",
+                "uniform_decode",
+                "allow_microbatching",
+                "skip_eplb",
+                "is_profile",
+                "create_mixed_batch",
+                "remove_lora",
+                "is_graph_capturing",
+                "num_active_loras",
+                "profile_seq_lens"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "num_tokens",
+                "cudagraph_runtime_mode",
+                "force_attention",
+                "uniform_decode",
+                "allow_microbatching",
+                "skip_eplb",
+                "is_profile",
+                "create_mixed_batch",
+                "remove_lora",
+                "is_graph_capturing",
+                "num_active_loras",
+                "profile_seq_lens",
+                "randomize_inputs"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "randomize_inputs"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'randomize_inputs'"
+          },
+          "historical_finding_id": "51d2da572ac3a56e",
+          "condition_evidence": null
+        },
+        {
+          "id": "33d477320110a1ac",
+          "root_cause_id": "ea5c5831c397da62",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/distributed/kv_transfer/kv_pool/kv_offload/native/cpu_npu.py",
+            "owner": "NPUOffloadingWorker",
+            "name": "__init__",
+            "line": 270
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/kv_offload/cpu/gpu_worker.py",
+              "owner": "CPUOffloadingWorker",
+              "name": "__init__",
+              "line": 472,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/kv_offload/cpu/gpu_worker.py",
+              "owner": "CPUOffloadingWorker",
+              "name": "__init__",
+              "line": 748,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "local_constructor_interface_alignment",
+            "file": "vllm_ascend/distributed/kv_transfer/kv_pool/kv_offload/native/npu.py",
+            "line": 78,
+            "scope": "vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.native.npu.NPUOffloadingSpec.create_worker",
+            "old_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "kv_caches",
+                "blocks_per_chunk",
+                "num_cpu_blocks"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "kv_caches",
+                "blocks_per_chunk",
+                "num_cpu_blocks",
+                "canonical_layout"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "canonical_layout"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'canonical_layout'",
+            "runtime_dispatch_proven": false
+          },
+          "historical_finding_id": "1c8e109e872edc9f",
+          "condition_evidence": null
+        },
+        {
+          "id": "f1760618b70d25f1",
+          "root_cause_id": "a6b0c481b917e0cf",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/deepseek_v4/model.py",
+            "owner": "AscendDeepseekV4SWACache",
+            "name": "__init__",
+            "line": 95
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/attention/backends/mla/sparse_swa.py",
+              "owner": "DeepseekV4SWACache",
+              "name": "__init__",
+              "line": 57,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/attention/backends/mla/sparse_swa.py",
+              "owner": "DeepseekV4SWACache",
+              "name": "__init__",
+              "line": 57,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "282506a6e1f06918",
+          "root_cause_id": "a9d736429504cded",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_kv_cache_coordinator.py",
+            "owner": "AscendHybridKVCacheCoordinator",
+            "name": "__init__",
+            "line": 77
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/core/kv_cache_coordinator.py",
+              "owner": "HybridKVCacheCoordinator",
+              "name": "__init__",
+              "line": 527,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/core/kv_cache_coordinator.py",
+              "owner": "HybridKVCacheCoordinator",
+              "name": "__init__",
+              "line": 565,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "exact_interface_call_pair",
+            "old_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "kv_cache_config",
+                "max_model_len",
+                "max_in_flight_tokens",
+                "use_eagle",
+                "enable_caching",
+                "enable_kv_cache_events",
+                "dcp_world_size",
+                "pcp_world_size",
+                "scheduler_block_size",
+                "hash_block_size",
+                "metrics_collector"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "kv_cache_config",
+                "max_model_len",
+                "max_in_flight_tokens",
+                "use_eagle",
+                "enable_caching",
+                "enable_kv_cache_events",
+                "dcp_world_size",
+                "pcp_world_size",
+                "scheduler_block_size",
+                "hash_block_size",
+                "metrics_collector",
+                "num_prefill_lookahead"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "num_prefill_lookahead"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'num_prefill_lookahead'"
+          },
+          "historical_finding_id": "b7988f451d170a38",
+          "condition_evidence": null
+        },
+        {
+          "id": "5dbdaecf3a15e00f",
+          "root_cause_id": "5e314528a22af02d",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/patch/platform/patch_mla_prefill_backend.py",
+            "owner": "AscendMLAPrefillBackend",
+            "name": "run_prefill_context_chunk",
+            "line": 38
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/attention/backends/mla/prefill/base.py",
+              "owner": "MLAPrefillBackend",
+              "name": "run_prefill_context_chunk",
+              "line": 176,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/attention/backends/mla/prefill/base.py",
+              "owner": "MLAPrefillBackend",
+              "name": "run_prefill_context_chunk",
+              "line": 179,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "exact_interface_call_pair",
+            "old_call": {
+              "positional_count": 1,
+              "keyword_names": [
+                "q",
+                "k",
+                "v"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 1,
+              "keyword_names": [
+                "q",
+                "k",
+                "v",
+                "out"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "out"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'out'"
+          },
+          "historical_finding_id": "17a6e6ce1f66ad61",
+          "condition_evidence": null
+        },
+        {
+          "id": "1325fa6193097c33",
+          "root_cause_id": "76b1137062c60e0e",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/model_runner_v1.py",
+            "owner": "NPUModelRunner",
+            "name": "_dummy_run",
+            "line": 3139
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu_model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "_dummy_run",
+              "line": 5900,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu_model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "_dummy_run",
+              "line": 5934,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "exact_interface_call_pair",
+            "old_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "num_tokens",
+                "cudagraph_runtime_mode",
+                "force_attention",
+                "uniform_decode",
+                "allow_microbatching",
+                "skip_eplb",
+                "is_profile",
+                "create_mixed_batch",
+                "remove_lora",
+                "is_graph_capturing",
+                "num_active_loras",
+                "profile_seq_lens"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 0,
+              "keyword_names": [
+                "num_tokens",
+                "cudagraph_runtime_mode",
+                "force_attention",
+                "uniform_decode",
+                "allow_microbatching",
+                "skip_eplb",
+                "is_profile",
+                "create_mixed_batch",
+                "remove_lora",
+                "is_graph_capturing",
+                "num_active_loras",
+                "profile_seq_lens",
+                "randomize_inputs"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "randomize_inputs"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'randomize_inputs'"
+          },
+          "historical_finding_id": "9bfb71c1f3a7383e",
+          "condition_evidence": null
+        },
+        {
+          "id": "5a70963631e85178",
+          "root_cause_id": "2946ebcfb9e099ce",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/aclgraph_utils.py",
+            "owner": "ModelAclGraphManager",
+            "name": "__init__",
+            "line": 71
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": "ModelCudaGraphManager",
+              "name": "__init__",
+              "line": 425,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": "ModelCudaGraphManager",
+              "name": "__init__",
+              "line": 444,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "exact_interface_call_pair",
+            "old_call": {
+              "positional_count": 5,
+              "keyword_names": [],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 5,
+              "keyword_names": [
+                "varlen_decode"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "varlen_decode"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'varlen_decode'"
+          },
+          "historical_finding_id": "09e6ae1503206cf6",
+          "condition_evidence": null
+        },
+        {
+          "id": "da1bdcb3505f4ff4",
+          "root_cause_id": "4bc1f131a756a95b",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/input_batch.py",
+            "owner": "AscendInputBatch",
+            "name": "make_dummy",
+            "line": 76
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/input_batch.py",
+              "owner": "InputBatch",
+              "name": "make_dummy",
+              "line": 103,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/input_batch.py",
+              "owner": "InputBatch",
+              "name": "make_dummy",
+              "line": 116,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "f1db22c849b30ae1",
+          "root_cause_id": "b2c09999a7d3ffb1",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/model_runner.py",
+            "owner": "NPUModelRunner",
+            "name": "execute_model",
+            "line": 172
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "execute_model",
+              "line": 1248,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "execute_model",
+              "line": 1390,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "105778d2ab952a11",
+          "root_cause_id": "6e4b305d937fefb5",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/model_runner.py",
+            "owner": "NPUModelRunner",
+            "name": "prepare_inputs",
+            "line": 206
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "prepare_inputs",
+              "line": 971,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/model_runner.py",
+              "owner": "GPUModelRunner",
+              "name": "prepare_inputs",
+              "line": 1093,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "2a0c6a5d5068d885",
+          "root_cause_id": "54cb1f508353674a",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/spec_decode/dflash/aclgraph.py",
+            "owner": "DFlashAclGraphManager",
+            "name": "__init__",
+            "line": 27
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": "CudaGraphManager",
+              "name": "__init__",
+              "line": 109,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": "CudaGraphManager",
+              "name": "__init__",
+              "line": 103,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "replacement accepts the old witness call"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "replacement rejects only the added witness keywords"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": {
+            "kind": "exact_interface_call_pair",
+            "old_call": {
+              "positional_count": 5,
+              "keyword_names": [],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "new_call": {
+              "positional_count": 5,
+              "keyword_names": [
+                "varlen_decode"
+              ],
+              "dynamic_starargs": false,
+              "dynamic_kwargs": false
+            },
+            "added_keywords": [
+              "varlen_decode"
+            ],
+            "rejection": "call arguments do not bind: got an unexpected keyword argument 'varlen_decode'"
+          },
+          "historical_finding_id": "4d634fdef2f1cfea",
+          "condition_evidence": null
+        },
+        {
+          "id": "c9d46191c3f18113",
+          "root_cause_id": "54cb1f508353674a",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/spec_decode/eagle/aclgraph.py",
+            "owner": "EagleAclGraphManager",
+            "name": "__init__",
+            "line": 36
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": "CudaGraphManager",
+              "name": "__init__",
+              "line": 109,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/cudagraph_utils.py",
+              "owner": "CudaGraphManager",
+              "name": "__init__",
+              "line": 103,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        }
+      ]
+    },
+    "pr14746": {
+      "inputs": {
+        "upstream_old": "cdc4824a21eaa986d4d1fee90a7e6465c9f706e6",
+        "upstream_new": "ba07e4a48fc951300d97eb506217dd530583dea3",
+        "ascend_baseline": "5d8d640ca7b44ccfd3c5d5e4c09f465a6152069b",
+        "ascend_merged": "649582947376908c69e4759c79fadd62ce898ac5",
+        "scenario": "main2main",
+        "external_sources": {}
+      },
+      "original_manifest_sha256": "38c6dec2f40d6a645810022910c4f428c6074912983c40fca5e6e53559aa89bf",
+      "frozen_cases_passed": 3,
+      "frozen_cases_total": 3,
+      "summary": {
+        "relations": 1157,
+        "relations_collected": 1157,
+        "direct_call_dependencies": 5576,
+        "direct_attribute_dependencies": 3222,
+        "inherited_state_dependencies": 79,
+        "generator_findings": 215,
+        "total": 667,
+        "root_causes": 282,
+        "by_relation": {
+          "direct_attribute": 403,
+          "direct_call": 42,
+          "direct_import": 1,
+          "inherited_state": 27,
+          "monkey_patch": 37,
+          "override": 157
+        },
+        "by_contract": {
+          "analysis_evidence": 53,
+          "attribute_presence": 403,
+          "call_arguments": 170,
+          "call_target_presence": 11,
+          "replacement_return": 1,
+          "required_instance_attribute": 27,
+          "return_usage": 1,
+          "symbol_presence": 1
+        },
+        "actionable_introduced_break": 5,
+        "actionable_introduced_findings": 7,
+        "introduced_break_root_causes": 5,
+        "review_root_causes": 278,
+        "by_action": {
+          "modify": 7,
+          "review": 660
+        },
+        "introduced_break": 7,
+        "compatibility_warning": 28,
+        "preexisting": 131,
+        "fixed": 0,
+        "analysis_unresolved": 501
+      },
+      "missing_previous_consumers": [],
+      "workflow_seconds": {
+        "validate": 985.2928687999993,
+        "predict": 1611.4984284000002,
+        "evaluate": 0.8698996999992232
+      },
+      "stage_timings_seconds": {
+        "downstream_scanning_parsing": 5.196179,
+        "downstream_relation_generation": 197.225524,
+        "monkey_patch_generation": 296.496562,
+        "upstream_old_new_snapshot_index": 580.72331,
+        "contract_comparison": 2009.581239,
+        "report_generation": 0.144422,
+        "total": 1600.465448,
+        "total_with_report": 1600.60987
+      },
+      "actionable": [
+        {
+          "id": "9a376fa3eb309a05",
+          "root_cause_id": "4e8e1ab3b070a588",
+          "relation": "direct_call",
+          "contract_kind": "call_target_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/attention/attention_v1.py",
+            "owner": "AscendAttentionPCPImpl",
+            "name": "_gather_prefill_cache_inputs",
+            "line": 1767
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/attention/pcp.py",
+              "owner": null,
+              "name": "_gather_prefill_cache_inputs",
+              "line": 11,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/model_executor/layers/attention/pcp.py",
+              "owner": null,
+              "name": "_gather_prefill_cache_inputs",
+              "line": null,
+              "symbol_kind": "missing"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "upstream call target does not exist"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "4c8cd74262e922ee",
+          "root_cause_id": "6f3015119b6aa9f5",
+          "relation": "direct_call",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/distributed/eplb_state.py",
+            "owner": "AscendEplbState",
+            "name": "super().from_mapping",
+            "line": 161
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/distributed/eplb/eplb_state.py",
+              "owner": "EplbState",
+              "name": "from_mapping",
+              "line": 1052,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/distributed/eplb/eplb_state.py",
+              "owner": "EplbState",
+              "name": "from_mapping",
+              "line": 1048,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "call arguments do not bind: got an unexpected keyword argument 'num_valid_physical_experts'"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "505bde3eeeb231b3",
+          "root_cause_id": "34d210bbc5d4596f",
+          "relation": "direct_call",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/models/deepseek_mtp.py",
+            "owner": "AscendGlmMoeDsaForCausalLM",
+            "name": "AutoWeightsLoader",
+            "line": 72
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/models/utils.py",
+              "owner": null,
+              "name": "AutoWeightsLoader",
+              "line": 172,
+              "symbol_kind": "constructor"
+            },
+            "new": {
+              "file": "vllm/model_executor/models/utils.py",
+              "owner": null,
+              "name": "AutoWeightsLoader",
+              "line": 199,
+              "symbol_kind": "constructor"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "call arguments bind to the callable contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "call arguments do not bind: got an unexpected keyword argument 'skip_prefixes'"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "e909a335be2a930d",
+          "root_cause_id": "4e8e1ab3b070a588",
+          "relation": "direct_import",
+          "contract_kind": "symbol_presence",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/attention/attention_v1.py",
+            "owner": null,
+            "name": "_gather_prefill_cache_inputs",
+            "line": 26
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/model_executor/layers/attention/pcp.py",
+              "owner": null,
+              "name": "_gather_prefill_cache_inputs",
+              "line": 11,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/attention/ops/pcp.py",
+              "owner": null,
+              "name": "_gather_prefill_cache_inputs",
+              "line": null,
+              "symbol_kind": null
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "import target exists at old"
+            },
+            "new": {
+              "exists": false,
+              "compatible": false,
+              "reason": "old import path no longer resolves at new"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "5c511002077dd2b7",
+          "root_cause_id": "df9ddda5540ebdf6",
+          "relation": "monkey_patch",
+          "contract_kind": "call_arguments",
+          "priority": "P0",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/spec_decode/dflash/speculator.py",
+            "owner": null,
+            "name": "_prepare_dflash_inputs_kernel_ascend",
+            "line": 43
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
+              "owner": null,
+              "name": "_prepare_dflash_inputs_kernel",
+              "line": 472,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py",
+              "owner": null,
+              "name": "_prepare_dflash_inputs_kernel",
+              "line": 490,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "45aee2d31dd3cee9",
+          "root_cause_id": "6f3015119b6aa9f5",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/distributed/eplb_state.py",
+            "owner": "AscendEplbState",
+            "name": "from_mapping",
+            "line": 152
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/distributed/eplb/eplb_state.py",
+              "owner": "EplbState",
+              "name": "from_mapping",
+              "line": 1052,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/distributed/eplb/eplb_state.py",
+              "owner": "EplbState",
+              "name": "from_mapping",
+              "line": 1048,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        },
+        {
+          "id": "a8a161c4c79f69b1",
+          "root_cause_id": "0a694fb8a3794101",
+          "relation": "override",
+          "contract_kind": "call_arguments",
+          "priority": "P1",
+          "downstream": {
+            "file": "vllm_ascend/worker/v2/eplb.py",
+            "owner": "AscendEPLBController",
+            "name": "setup_from_mapping",
+            "line": 86
+          },
+          "upstream": {
+            "old": {
+              "file": "vllm/v1/worker/gpu/eplb_utils.py",
+              "owner": "EPLBController",
+              "name": "setup_from_mapping",
+              "line": 142,
+              "symbol_kind": "callable"
+            },
+            "new": {
+              "file": "vllm/v1/worker/gpu/eplb_utils.py",
+              "owner": "EPLBController",
+              "name": "setup_from_mapping",
+              "line": 142,
+              "symbol_kind": "callable"
+            }
+          },
+          "compatibility": {
+            "old": {
+              "exists": true,
+              "compatible": true,
+              "reason": "downstream accepts the upstream call contract"
+            },
+            "new": {
+              "exists": true,
+              "compatible": false,
+              "reason": "downstream does not accept the upstream call contract"
+            }
+          },
+          "gates": {
+            "relationship_verified": true,
+            "contract_changed": true,
+            "runtime_reachable": true,
+            "version_lane_matches": true
+          },
+          "delta_witness": null,
+          "historical_finding_id": null,
+          "condition_evidence": null
+        }
+      ]
+    }
+  },
+  "additional_source_witnesses": {
+    "passed": true,
+    "consumer_count": 5,
+    "upstream_contract_count": 4,
+    "new_roots_beyond_previous_and_planned_cases": 3,
+    "cases": [
+      {
+        "case": "runner-randomize-inputs",
+        "upstream": "vllm/v1/worker/gpu_model_runner.py:GPUModelRunner._dummy_run",
+        "downstream": "vllm_ascend/worker/model_runner_v1.py:NPUModelRunner._dummy_run",
+        "added_keyword": "randomize_inputs",
+        "old_signature": "(self, num_tokens, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, allow_microbatching=None, skip_eplb=None, is_profile=None, create_mixed_batch=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None)",
+        "new_signature": "(self, num_tokens, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, allow_microbatching=None, skip_eplb=None, is_profile=None, create_mixed_batch=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None, randomize_inputs=None)",
+        "baseline_signature": "(self, num_tokens, with_prefill=None, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, is_profile=None, create_mixed_batch=None, allow_microbatching=None, skip_eplb=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None, profile_cpp=None)",
+        "merged_signature": "(self, num_tokens, with_prefill=None, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, is_profile=None, create_mixed_batch=None, allow_microbatching=None, skip_eplb=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None, profile_cpp=None)",
+        "checks": {
+          "baseline_old_shape": {
+            "accepts": true
+          },
+          "baseline_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'randomize_inputs'"
+          },
+          "merged_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'randomize_inputs'"
+          },
+          "upstream_old_shape": {
+            "accepts": true
+          },
+          "upstream_new_shape": {
+            "accepts": true
+          }
+        },
+        "local_call_line": null,
+        "downstream_file_unchanged_in_pr": true,
+        "verdict": "true_positive_under_strict_interface_alignment",
+        "pr_adaptation": "omitted",
+        "runtime_dispatch_proven": false,
+        "scope": "Concrete signature witness, not workload execution"
+      },
+      {
+        "case": "310p-randomize-inputs",
+        "upstream": "vllm/v1/worker/gpu_model_runner.py:GPUModelRunner._dummy_run",
+        "downstream": "vllm_ascend/_310p/model_runner_310p.py:NPUModelRunner310._dummy_run",
+        "added_keyword": "randomize_inputs",
+        "old_signature": "(self, num_tokens, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, allow_microbatching=None, skip_eplb=None, is_profile=None, create_mixed_batch=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None)",
+        "new_signature": "(self, num_tokens, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, allow_microbatching=None, skip_eplb=None, is_profile=None, create_mixed_batch=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None, randomize_inputs=None)",
+        "baseline_signature": "(self, num_tokens, with_prefill=None, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, is_profile=None, create_mixed_batch=None, allow_microbatching=None, skip_eplb=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None)",
+        "merged_signature": "(self, num_tokens, with_prefill=None, cudagraph_runtime_mode=None, force_attention=None, uniform_decode=None, is_profile=None, create_mixed_batch=None, allow_microbatching=None, skip_eplb=None, remove_lora=None, is_graph_capturing=None, num_active_loras=None, profile_seq_lens=None)",
+        "checks": {
+          "baseline_old_shape": {
+            "accepts": true
+          },
+          "baseline_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'randomize_inputs'"
+          },
+          "merged_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'randomize_inputs'"
+          },
+          "upstream_old_shape": {
+            "accepts": true
+          },
+          "upstream_new_shape": {
+            "accepts": true
+          }
+        },
+        "local_call_line": null,
+        "downstream_file_unchanged_in_pr": true,
+        "verdict": "true_positive_under_strict_interface_alignment",
+        "pr_adaptation": "omitted",
+        "runtime_dispatch_proven": false,
+        "scope": "Concrete signature witness, not workload execution"
+      },
+      {
+        "case": "mla-prefill-out",
+        "upstream": "vllm/v1/attention/backends/mla/prefill/base.py:MLAPrefillBackend.run_prefill_context_chunk",
+        "downstream": "vllm_ascend/patch/platform/patch_mla_prefill_backend.py:AscendMLAPrefillBackend.run_prefill_context_chunk",
+        "added_keyword": "out",
+        "old_signature": "(self, chunk, q, k, v)",
+        "new_signature": "(self, chunk, q, k, v, out=None)",
+        "baseline_signature": "(self, chunk_idx, q, k, v)",
+        "merged_signature": "(self, chunk_idx, q, k, v)",
+        "checks": {
+          "baseline_old_shape": {
+            "accepts": true
+          },
+          "baseline_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'out'"
+          },
+          "merged_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'out'"
+          },
+          "upstream_old_shape": {
+            "accepts": true
+          },
+          "upstream_new_shape": {
+            "accepts": true
+          }
+        },
+        "local_call_line": null,
+        "downstream_file_unchanged_in_pr": true,
+        "verdict": "true_positive_under_strict_interface_alignment",
+        "pr_adaptation": "omitted",
+        "runtime_dispatch_proven": false,
+        "scope": "Concrete signature witness, not workload execution"
+      },
+      {
+        "case": "dflash-varlen-decode",
+        "upstream": "vllm/v1/worker/gpu/cudagraph_utils.py:CudaGraphManager.__init__",
+        "downstream": "vllm_ascend/worker/v2/spec_decode/dflash/aclgraph.py:DFlashAclGraphManager.__init__",
+        "added_keyword": "varlen_decode",
+        "old_signature": "(self, vllm_config, device, cudagraph_mode, decode_query_len, lora_capture_cases=None)",
+        "new_signature": "(self, vllm_config, device, cudagraph_mode, decode_query_len, lora_capture_cases=None, varlen_decode=None)",
+        "baseline_signature": "(self, vllm_config, device, cudagraph_mode, decode_query_len, speculator=None)",
+        "merged_signature": "(self, vllm_config, device, cudagraph_mode, decode_query_len, speculator=None)",
+        "checks": {
+          "baseline_old_shape": {
+            "accepts": true
+          },
+          "baseline_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'varlen_decode'"
+          },
+          "merged_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'varlen_decode'"
+          },
+          "upstream_old_shape": {
+            "accepts": true
+          },
+          "upstream_new_shape": {
+            "accepts": true
+          }
+        },
+        "local_call_line": null,
+        "downstream_file_unchanged_in_pr": true,
+        "verdict": "true_positive_under_strict_interface_alignment",
+        "pr_adaptation": "omitted",
+        "runtime_dispatch_proven": false,
+        "scope": "Concrete signature witness, not workload execution"
+      },
+      {
+        "case": "offload-canonical-layout",
+        "upstream": "vllm/v1/kv_offload/cpu/gpu_worker.py:CPUOffloadingWorker.__init__",
+        "downstream": "vllm_ascend/distributed/kv_transfer/kv_pool/kv_offload/native/cpu_npu.py:NPUOffloadingWorker.__init__",
+        "added_keyword": "canonical_layout",
+        "old_signature": "(self, kv_caches, blocks_per_chunk, num_cpu_blocks, mmap_region=None)",
+        "new_signature": "(self, kv_caches, blocks_per_chunk, num_cpu_blocks, mmap_region=None, canonical_layout=None)",
+        "baseline_signature": "(self, kv_caches, blocks_per_chunk, num_cpu_blocks)",
+        "merged_signature": "(self, kv_caches, blocks_per_chunk, num_cpu_blocks)",
+        "checks": {
+          "baseline_old_shape": {
+            "accepts": true
+          },
+          "baseline_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'canonical_layout'"
+          },
+          "merged_added_keyword": {
+            "accepts": false,
+            "error": "got an unexpected keyword argument 'canonical_layout'"
+          }
+        },
+        "local_call_line": 78,
+        "downstream_file_unchanged_in_pr": true,
+        "verdict": "true_positive_under_strict_interface_alignment",
+        "pr_adaptation": "omitted",
+        "runtime_dispatch_proven": false,
+        "scope": "Local constructor alignment, not upstream substitutability"
+      }
+    ],
+    "global_accuracy": null,
+    "note": "DFlash shares the already reported CudaGraphManager.varlen_decode root with Eagle; both dummy-run consumers share one upstream root."
+  }
+}

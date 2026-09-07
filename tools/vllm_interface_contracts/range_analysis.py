@@ -35,7 +35,7 @@ import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +46,7 @@ from .analysis_plans import (
 )
 from .cache import CacheResult, PersistentCache, build_identity, git_source_state, normalized_repo_path
 from .call_contracts import (
+    CallShape,
     DirectAttributeDependency,
     DirectAttributeDetector,
     DirectCallDependency,
@@ -56,11 +57,14 @@ from .call_contracts import (
     _parents,
     _under_attribute_fallback,
     bind_call_shape,
+    call_shape,
     infer_return_contract,
     replacement_return_compatible,
     return_contract_from_dict,
     return_use_compatible,
 )
+from .condition_contracts import conditional_state_evidence
+from .dataclass_contracts import ClassSource, dataclass_layout
 from .generator import (
     _KNOWN_TRANSPARENT_SIGNATURE_DECORATORS,
     _KNOWN_WRAPS_SIGNATURE_DECORATORS,
@@ -76,6 +80,7 @@ from .generator import (
     SignatureContract,
     _accepts_signature_contract,
     _expression_name,
+    _function_local_names,
     _function_scope_nodes,
     _import_binding_reference,
     _jsonable_signature,
@@ -90,13 +95,13 @@ from .models import (
 )
 from .module_attributes import ModuleGetattrContract, module_getattr_contract, runtime_module_body
 
-RANGE_SCHEMA_VERSION = 14
-RANGE_ANALYZER_VERSION = "2.7.0"
-SNAPSHOT_CACHE_SCHEMA_VERSION = 5
+RANGE_SCHEMA_VERSION = 15
+RANGE_ANALYZER_VERSION = "2.8.0"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 6
 RELATION_CACHE_SCHEMA_VERSION = 2
 DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
 DIRECT_CALL_CACHE_SCHEMA_VERSION = 2
-DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 4
+DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 5
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -613,6 +618,118 @@ def _optional_only_signature_additions(delta: dict[str, object] | None) -> tuple
     return tuple(str(item["name"]) for item in added)
 
 
+def _added_keyword_witness(
+    old: SignatureContract | None,
+    new: SignatureContract | None,
+    replacement: list[object] | None,
+) -> dict[str, object] | None:
+    """Prove a newly rejected call independently of whole-signature debt.
+
+    Both calls must bind to their respective upstream contracts. The old call
+    must also bind to the pinned replacement; adding only new upstream keyword
+    parameters must make that same replacement reject it. This is a strict
+    interface witness, not an assertion that every old call was compatible.
+    """
+    if old is None or new is None or old.status != "exact" or new.status != "exact":
+        return None
+    before, after = old.bound_call_signature, new.bound_call_signature
+    delta = _signature_delta(before, after)
+    if delta is None or not isinstance(delta["added"], list):
+        return None
+    added = tuple(
+        str(item["name"])
+        for item in delta["added"]
+        if isinstance(item, dict) and item["kind"] in {"keyword_only", "positional_or_keyword"}
+    )
+    parameters = _signature_parameters(before)
+    if not added or parameters is None:
+        return None
+    positional = [p for p in parameters if p["kind"] != "keyword_only"]
+    # Cover keyword-based adapters with reordered parameters as well as mixed
+    # positional calls. The bound-signature oracle rejects every invalid shape.
+    for count in range(len(positional) + 1):
+        supplied = {str(p["name"]) for p in positional[:count]}
+        keywords = tuple(str(p["name"]) for p in parameters if str(p["name"]) not in supplied)
+        old_call = CallShape(count, keywords)
+        new_call = CallShape(count, (*keywords, *added))
+        if (
+            bind_call_shape(before, old_call)[0] is True
+            and bind_call_shape(replacement, old_call)[0] is True
+            and bind_call_shape(after, new_call)[0] is True
+            and bind_call_shape(replacement, new_call)[0] is False
+        ):
+            return {
+                "kind": "exact_interface_call_pair",
+                "old_call": old_call.as_dict(),
+                "new_call": new_call.as_dict(),
+                "added_keywords": list(added),
+                "rejection": bind_call_shape(replacement, new_call)[1],
+            }
+    return None
+
+
+def _local_constructor_delta_witness(
+    relation: Relation,
+    engine: InterfaceBoundaryGenerator,
+    old: SignatureContract | None,
+    new: SignatureContract | None,
+    replacement: list[object] | None,
+) -> dict[str, object] | None:
+    """Isolate new alignment debt for adapters with extra construction context.
+
+    For example, a factory passes a downstream-only runner into an adapted
+    constructor. A concrete local call proves its baseline binding even when
+    that extra required argument prevents whole-signature substitutability.
+    This proof deliberately does not claim an upstream runtime dispatch.
+    """
+    if relation.relation != "override" or relation.downstream_name != "__init__":
+        return None
+    if old is None or new is None or old.status != "exact" or new.status != "exact":
+        return None
+    delta = _signature_delta(old.bound_call_signature, new.bound_call_signature)
+    if delta is None or not isinstance(delta["added"], list):
+        return None
+    added = tuple(
+        str(item["name"])
+        for item in delta["added"]
+        if isinstance(item, dict) and item["kind"] in {"keyword_only", "positional_or_keyword"}
+    )
+    if not added:
+        return None
+    module, _ = _file_module(relation.downstream_file)
+    expected = f"{module}.{relation.downstream_owner}"
+    for info in engine.downstream.callables.values():
+        if not isinstance(info.node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        local_names = _function_local_names(info.node)
+        for node in _function_scope_nodes(info.node):
+            if not isinstance(node, ast.Call):
+                continue
+            expression = _expression_name(node.func)
+            if expression is None or expression.split(".", 1)[0] in local_names:
+                continue
+            resolved = engine.downstream.canonical_name(engine.downstream.resolve_reference(info.module, expression))
+            if resolved != expected:
+                continue
+            before = call_shape(node)
+            if not before.exact or set(added) & set(before.keyword_names):
+                continue
+            after = replace(before, keyword_names=(*before.keyword_names, *added))
+            if bind_call_shape(replacement, before)[0] is True and bind_call_shape(replacement, after)[0] is False:
+                return {
+                    "kind": "local_constructor_interface_alignment",
+                    "file": info.file,
+                    "line": node.lineno,
+                    "scope": info.qualified_name,
+                    "old_call": before.as_dict(),
+                    "new_call": after.as_dict(),
+                    "added_keywords": list(added),
+                    "rejection": bind_call_shape(replacement, after)[1],
+                    "runtime_dispatch_proven": False,
+                }
+    return None
+
+
 def _relation_symbol_presence(endpoint: SourceEndpoint) -> bool | None:
     """Return proven symbol presence without conflating ambiguity with deletion."""
 
@@ -629,7 +746,7 @@ def _snapshot_signature_contract(
 ) -> SignatureContract | None:
     """Build the provable runtime-signature view available from one Git snapshot."""
 
-    if endpoint.symbol_kind != "callable":
+    if endpoint.symbol_kind not in {"callable", "constructor"}:
         return None
     status = endpoint.signature_status or "unknown"
     runtime_signature = endpoint.signature if status == "exact" else None
@@ -638,7 +755,9 @@ def _snapshot_signature_contract(
         _bound_signature(
             runtime_signature,
             descriptor=binding_descriptor,
-            access_kind="instance" if endpoint.owner is not None else "module",
+            access_kind="instance"
+            if endpoint.owner is not None and endpoint.symbol_kind != "constructor"
+            else "module",
         )
         if runtime_signature is not None
         else None
@@ -1154,12 +1273,15 @@ class GitSnapshot:
         if binding.status != "non_callable" or not isinstance(binding.node, (ast.Assign, ast.AnnAssign)):
             return None, binding.node
         value = binding.node.value
+        names: tuple[str, ...]
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             names = (value.value,)
         elif isinstance(value, (ast.List, ast.Set, ast.Tuple)) and all(
             isinstance(item, ast.Constant) and isinstance(item.value, str) for item in value.elts
         ):
-            names = tuple(item.value for item in value.elts if isinstance(item, ast.Constant))
+            names = tuple(
+                item.value for item in value.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)
+            )
         else:
             return None, binding.node
         return member in names, binding.node
@@ -1460,6 +1582,103 @@ class GitSnapshot:
             "unknown",
             _node_fingerprint(class_node),
         )
+
+    def registered_buffer_state(self, receiver_type: str, member: str) -> bool | None:
+        """A closed, literal torch.nn.Module registration model, without imports.
+
+        Absence is usable only after the old endpoint proves a buffer of this
+        exact name. Unknown helpers, registries, descriptors or receiver escape
+        must not turn an external nn.Module base into a blanket absence proof.
+        """
+        binding = self._resolve_qualified_node(receiver_type)
+        if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.ClassDef):
+            return None
+        node = binding.node
+        if node.decorator_list or node.keywords or len(node.bases) != 1:
+            return None
+        if self._base_reference(binding.file, node.bases[0]) not in {
+            "torch.nn.Module",
+            "torch.nn.modules.module.Module",
+        }:
+            return None
+        for name in ("__getattr__", "__getattribute__", "__setattr__", "register_buffer", "register_parameter"):
+            if _body_named_binding(node.body, name).status != "missing":
+                return None
+        initializer = _body_named_binding(node.body, "__init__")
+        if initializer.status != "exact" or not isinstance(initializer.node, ast.FunctionDef):
+            return None
+        function = initializer.node
+        if function.decorator_list or not self._calls_super_init(function):
+            return None
+        positional = [*function.args.posonlyargs, *function.args.args]
+        if not positional:
+            return None
+        receiver = positional[0].arg
+        registry_names = {"_buffers", "_parameters", "_modules", "__dict__"}
+        registrations: set[int] = set()
+        for method in node.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for candidate in _function_scope_nodes(method):
+                if (
+                    isinstance(candidate, ast.Attribute)
+                    and isinstance(candidate.value, ast.Name)
+                    and candidate.value.id == receiver
+                ):
+                    if candidate.attr in registry_names:
+                        return None
+                if not isinstance(candidate, ast.Call):
+                    continue
+                if any(
+                    isinstance(arg, ast.Name) and arg.id == receiver
+                    for arg in [*candidate.args, *(k.value for k in candidate.keywords)]
+                ):
+                    return None
+                if not (
+                    isinstance(candidate.func, ast.Attribute)
+                    and isinstance(candidate.func.value, ast.Name)
+                    and candidate.func.value.id == receiver
+                ):
+                    continue
+                if method is not function:
+                    if candidate.func.attr in {"register_buffer", "register_parameter"}:
+                        return None
+                    continue
+                if (
+                    candidate.func.attr not in {"register_buffer", "register_parameter"}
+                    or len(candidate.args) < 2
+                    or not isinstance(candidate.args[0], ast.Constant)
+                    or not isinstance(candidate.args[0].value, str)
+                ):
+                    return None
+                if candidate.args[0].value == member:
+                    registrations.add(candidate.lineno)
+        if not registrations:
+            if any(
+                self._function_may_assign_instance_member(method, receiver, member)
+                for method in node.body
+                if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ):
+                return None
+            return False
+
+        class LiteralRegistration(ast.NodeTransformer):
+            def visit_Expr(self, statement: ast.Expr) -> ast.AST:
+                if isinstance(statement.value, ast.Call) and statement.value.lineno in registrations:
+                    return ast.copy_location(
+                        ast.Assign(
+                            targets=[
+                                ast.Attribute(value=ast.Name(id=receiver, ctx=ast.Load()), attr=member, ctx=ast.Store())
+                            ],
+                            value=ast.Constant(value=None),
+                        ),
+                        statement,
+                    )
+                return statement
+
+        transformed = LiteralRegistration().visit(copy.deepcopy(function))
+        assert isinstance(transformed, ast.FunctionDef)
+        return True if self._statements_definitely_assign_instance_member(transformed.body, receiver, member) else None
 
     def attribute_endpoint(
         self,
@@ -1875,7 +2094,7 @@ class GitSnapshot:
         endpoint: SourceEndpoint,
         invocation_kind: str = "python_call",
     ) -> SignatureContract | None:
-        if endpoint.file is None or endpoint.name is None:
+        if endpoint.symbol_kind == "constructor" or endpoint.file is None or endpoint.name is None:
             return _snapshot_signature_contract(endpoint, invocation_kind)
         tree = self.tree(endpoint.file)
         node = _named_node(tree, endpoint.owner, endpoint.name) if tree is not None else None
@@ -2187,7 +2406,7 @@ def _state(
             if upstream.symbol_kind == "class"
             else CompatibilityState(True, False, "upstream base target is no longer a class")
         )
-    if upstream.symbol_kind != "callable":
+    if upstream.symbol_kind not in {"callable", "constructor"}:
         return CompatibilityState(True, False, "upstream target is no longer callable")
     if (
         upstream.owner is not None
@@ -2410,6 +2629,18 @@ def _relation_endpoints(
         relation.upstream_name,
         invocation_kind=invocation_kind,
     )
+    if relation.relation == "monkey_patch":
+        # A function can replace a class binding (including a scoped factory).
+        # Reuse the constructor resolver, which rejects custom metaclasses,
+        # decorators and __new__, instead of comparing two absent signatures.
+        endpoints = []
+        for snapshot, endpoint in ((old_snapshot, old_endpoint), (new_snapshot, new_endpoint)):
+            if endpoint.symbol_kind == "class" and endpoint.file is not None:
+                module, _ = _file_module(endpoint.file)
+                target = ".".join(part for part in (module, endpoint.owner, endpoint.name) if part)
+                endpoint = snapshot.call_endpoint(target, "constructor")
+            endpoints.append(endpoint)
+        old_endpoint, new_endpoint = endpoints
     if _relation_symbol_presence(new_endpoint) is False:
         old_tree = old_snapshot.tree(old_file)
         old_node = _named_node(old_tree, relation.upstream_owner, relation.upstream_name) if old_tree else None
@@ -2969,10 +3200,47 @@ def _relation_findings(
             )
         )
 
+        witness = (
+            _added_keyword_witness(old_signature_contract, new_signature_contract, downstream.signature)
+            if masked_preexisting_delta and strict_optional_contracts
+            else None
+        )
+        if witness is None and masked_preexisting_delta and strict_optional_contracts:
+            witness = _local_constructor_delta_witness(
+                relation,
+                engine,
+                old_signature_contract,
+                new_signature_contract,
+                downstream.signature,
+            )
+        if witness is not None:
+            findings.append(
+                replace(
+                    findings[-1],
+                    finding_id=_finding_id(findings[-1].finding_id, "independent_parameter_delta"),
+                    classification="introduced_break",
+                    action=_finding_action("introduced_break", gates),
+                    old_state=CompatibilityState(True, True, "replacement accepts the old witness call"),
+                    new_state=CompatibilityState(True, False, "replacement rejects only the added witness keywords"),
+                    suggestion="Adapt the newly rejected parameters; track whole-signature historical debt separately.",
+                    details={
+                        **findings[-1].details,
+                        "new_delta_on_preexisting_break": False,
+                        "historical_finding_id": findings[-1].finding_id,
+                        "actionability_reason": "independently_proven_new_parameter_delta",
+                        "delta_witness": witness,
+                    },
+                )
+            )
+
     return_changed = new_exists is True and (
         old_exists is not True or old_endpoint.return_contract != new_endpoint.return_contract
     )
-    if relation.relation in {"monkey_patch", "override"} and return_changed:
+    if (
+        relation.relation in {"monkey_patch", "override"}
+        and return_changed
+        and new_endpoint.symbol_kind != "constructor"
+    ):
         old_state = _replacement_return_state(old_endpoint, downstream)
         new_state = _replacement_return_state(new_endpoint, downstream)
         classification = _classify(
@@ -3249,6 +3517,7 @@ def _direct_call_findings(
     dependencies: Iterable[DirectCallDependency],
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
+    old_to_new: dict[str, str] | None = None,
 ) -> tuple[list[RangeFinding], list[DirectCallDependency]]:
     """Compare exact downstream call and return-use contracts at both SHAs."""
     findings: list[RangeFinding] = []
@@ -3269,6 +3538,21 @@ def _direct_call_findings(
             member=dependency.member,
             invocation_kind=dependency.invocation_kind,
         )
+        relocation: dict[str, Any] | None = None
+        if (
+            old_endpoint.file is not None
+            and old_endpoint.file not in new_snapshot.files
+            and new_endpoint.symbol_kind == "missing"
+        ):
+            # Longest-prefix resolution can land on a parent __init__.py when
+            # the original module disappeared. Do not present that fallback as
+            # the missing callable's actual definition or relocation destination.
+            new_endpoint = SourceEndpoint(
+                old_endpoint.file, old_endpoint.owner, old_endpoint.name, symbol_kind="missing"
+            )
+            destination = (old_to_new or {}).get(old_endpoint.file)
+            if destination is not None and old_endpoint.name is not None:
+                relocation = new_snapshot.endpoint(destination, old_endpoint.owner, old_endpoint.name).as_dict()
         callable_kinds = {"callable", "constructor"}
         exact_dependencies.append(dependency)
         downstream = SourceEndpoint(
@@ -3346,6 +3630,25 @@ def _direct_call_findings(
                         "lookup_root": dependency.lookup_root,
                         "resolution_basis": dependency.resolution_basis,
                         "call_shape": dependency.call_shape.as_dict(),
+                        "parameter_delta": _signature_delta(
+                            old_contract.bound_call_signature
+                            if (
+                                old_contract := old_snapshot.signature_contract(
+                                    old_endpoint, dependency.invocation_kind
+                                )
+                            )
+                            is not None
+                            else None,
+                            new_contract.bound_call_signature
+                            if (
+                                new_contract := new_snapshot.signature_contract(
+                                    new_endpoint, dependency.invocation_kind
+                                )
+                            )
+                            is not None
+                            else None,
+                        ),
+                        "relocation_destination": relocation,
                         "scope": dependency.scope,
                     },
                 )
@@ -3443,6 +3746,25 @@ def _direct_attribute_findings(
         exact_dependencies.append(dependency)
         old_state = _direct_attribute_state(old_endpoint)
         new_state = _direct_attribute_state(new_endpoint)
+        registered_buffer_evidence = False
+        if endpoint_receiver and dependency.member and old_state.exists is None:
+            old_buffer = old_snapshot.registered_buffer_state(endpoint_receiver, dependency.member)
+            new_buffer = new_snapshot.registered_buffer_state(endpoint_receiver, dependency.member)
+            if old_buffer is True:
+                old_state = CompatibilityState(
+                    True, True, "literal nn.Module buffer registered on every constructor path"
+                )
+                old_endpoint = replace(old_endpoint, symbol_kind="instance_field")
+                registered_buffer_evidence = True
+                if new_state.exists is None and new_buffer is not None:
+                    new_state = CompatibilityState(
+                        new_buffer,
+                        new_buffer,
+                        "literal nn.Module buffer registration present"
+                        if new_buffer
+                        else "previously registered buffer is absent from the closed new layout",
+                    )
+                    new_endpoint = replace(new_endpoint, symbol_kind="instance_field" if new_buffer else "missing")
         unresolved = old_state.exists is None or new_state.exists is None
         contract_changed = old_state.exists != new_state.exists or old_state.compatible != new_state.compatible
         if not contract_changed and not unresolved:
@@ -3507,6 +3829,7 @@ def _direct_attribute_findings(
                     "lookup_root": dependency.lookup_root,
                     "resolution_basis": dependency.resolution_basis,
                     "scope": dependency.scope,
+                    "registered_buffer_evidence": registered_buffer_evidence,
                 },
             )
         )
@@ -3929,13 +4252,48 @@ def _inherited_state_findings(
                 initialization_state, constructor = state_cache[state_key]
                 if constructor.file is None or not constructor.owner:
                     continue
+                condition_evidence: list[dict[str, object]] = []
+                if conditional_read and initialization_state.compatible is False:
+                    constructor_module, _ = _file_module(constructor.file)
+                    constructor_info = engine.downstream.find_callable(
+                        f"{constructor_module}.{constructor.owner}.__init__"
+                    )
+                    if constructor_info is not None and isinstance(
+                        constructor_info.node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ):
+                        helpers: dict[str, ast.FunctionDef] = {}
+                        for statement in constructor_info.node.body:
+                            call = statement.value if isinstance(statement, ast.Expr) else None
+                            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+                                continue
+                            helper_resolution = engine._effective_method_resolution(downstream_mro, call.func.attr)
+                            if not helper_resolution.is_total_callable or len(helper_resolution.callable_owners) != 1:
+                                continue
+                            helper_info = engine.downstream.find_callable(
+                                f"{helper_resolution.callable_owners[0]}.{call.func.attr}"
+                            )
+                            if (
+                                helper_info is not None
+                                and helper_info.file == constructor_info.file
+                                and isinstance(helper_info.node, ast.FunctionDef)
+                            ):
+                                helpers[call.func.attr] = helper_info.node
+                        condition_evidence = conditional_state_evidence(
+                            node,
+                            constructor_info.node,
+                            required_attribute,
+                            read_line,
+                            _tag_guard_names(engine.downstream.modules[constructor_info.module].tree.body),
+                            helpers,
+                        )
+                conditional_unresolved = conditional_read and not condition_evidence
                 new_state = (
                     CompatibilityState(
                         initialization_state.exists,
                         None,
                         f"{initialization_state.reason}; the inherited read is conditional",
                     )
-                    if conditional_read and initialization_state.compatible is False
+                    if conditional_unresolved and initialization_state.compatible is False
                     else initialization_state
                 )
                 old_state = (
@@ -3955,7 +4313,7 @@ def _inherited_state_findings(
                 gates = {
                     "relationship_verified": True,
                     "contract_changed": True,
-                    "runtime_reachable": not conditional_read,
+                    "runtime_reachable": not conditional_unresolved,
                     "version_lane_matches": True,
                 }
                 action = _finding_action(classification, gates)
@@ -3966,7 +4324,11 @@ def _inherited_state_findings(
                     inherited_member=qualified_member,
                     required_attribute=required_attribute,
                     read_line=read_line,
-                    read_condition="conditional" if conditional_read else "unconditional",
+                    read_condition="supported_conditional"
+                    if condition_evidence
+                    else "conditional"
+                    if conditional_read
+                    else "unconditional",
                     constructor_owner=constructor.owner,
                     constructor_file=constructor.file,
                     constructor_line=constructor.line or 0,
@@ -4017,6 +4379,7 @@ def _inherited_state_findings(
                         "required_attribute": required_attribute,
                         "read_line": read_line,
                         "read_condition": dependency.read_condition,
+                        "condition_evidence": condition_evidence,
                         "downstream_class": class_info.qualified_name,
                         "initialization_status": dependency.initialization_status,
                         "initialization_reason": dependency.initialization_reason,
@@ -4043,6 +4406,106 @@ def _inherited_state_findings(
                 retained.details["impacted_downstream_classes"] = sorted(impacted_classes)
                 findings_by_id[finding_id] = retained
     return list(findings_by_id.values()), dependencies
+
+
+def _dataclass_definition_findings(
+    engine: InterfaceBoundaryGenerator,
+    old_snapshot: GitSnapshot,
+    new_snapshot: GitSnapshot,
+) -> list[RangeFinding]:
+    """Compare class-definition legality against the pinned downstream source."""
+
+    def lookup(snapshot: GitSnapshot, reference: str) -> ClassSource | None:
+        if reference.startswith("vllm."):
+            binding = snapshot._resolve_qualified_node(reference)
+            if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.ClassDef):
+                return None
+            return ClassSource(binding.node, snapshot._return_resolver(binding.file), binding.file, reference)
+        callable_info = engine.downstream.find_callable(reference)
+        if callable_info is None or not isinstance(callable_info.node, ast.ClassDef):
+            return None
+        module = callable_info.module
+        return ClassSource(
+            callable_info.node,
+            lambda expression: engine.downstream.canonical_name(
+                engine.downstream.resolve_reference(module, expression)
+            ),
+            callable_info.file,
+            reference,
+        )
+
+    findings: list[RangeFinding] = []
+    for reference in sorted(engine.downstream.classes):
+        old_layout = dataclass_layout(reference, lambda name: lookup(old_snapshot, name))
+        new_layout = dataclass_layout(reference, lambda name: lookup(new_snapshot, name))
+        if old_layout is None or new_layout is None or old_layout.fields == new_layout.fields:
+            continue
+        old_error = old_layout.ordering_error()
+        new_error = new_layout.ordering_error()
+        if new_error is None:
+            continue
+        default, required = new_error
+        if not default.owner.startswith("vllm.") or not required.owner.startswith("vllm_ascend."):
+            continue
+        source = lookup(new_snapshot, reference)
+        if source is None:
+            continue
+        old_state = CompatibilityState(True, old_error is None, "old dataclass initializer field order")
+        new_state = CompatibilityState(
+            True, False, f"non-default argument {required.name!r} follows default argument {default.name!r}"
+        )
+        classification = _classify(old_state, new_state, True)
+        gates = {
+            "relationship_verified": True,
+            "contract_changed": True,
+            "runtime_reachable": True,
+            "version_lane_matches": True,
+        }
+        action = _finding_action(classification, gates)
+        old_base = old_snapshot._resolve_qualified_node(default.owner)
+        new_base = new_snapshot._resolve_qualified_node(default.owner)
+        if old_base is None or new_base is None:
+            continue
+        findings.append(
+            RangeFinding(
+                finding_id=_finding_id(
+                    "dataclass_definition", reference, required.name, old_snapshot.revision, new_snapshot.revision
+                ),
+                classification=classification,
+                relation="inheritance",
+                priority="P1" if action == "modify" else "P2",
+                action=action,
+                confidence="high",
+                upstream_old=old_snapshot.endpoint(old_base.file, old_base.owner, old_base.name),
+                upstream_new=new_snapshot.endpoint(new_base.file, new_base.owner, new_base.name),
+                downstream=SourceEndpoint(source.file, None, source.node.name, required.line, symbol_kind="class"),
+                old_state=old_state,
+                new_state=new_state,
+                change="upstream dataclass defaults invalidate the downstream generated initializer",
+                evidence=[
+                    {
+                        "upstream_default": default.name,
+                        "upstream_line": default.line,
+                        "downstream_required": required.name,
+                        "downstream_line": required.line,
+                    }
+                ],
+                gates=gates,
+                suggestion=(
+                    "Align the downstream dataclass field defaults or keyword-only contract and test class creation."
+                ),
+                source="dataclass_definition_detector",
+                contract_kind="dataclass_field_order",
+                direction="upstream_dataclass_layout_to_downstream_definition",
+                details={
+                    "upstream_default": default.name,
+                    "downstream_required": required.name,
+                    "old_fields": [field.__dict__ for field in old_layout.fields],
+                    "new_fields": [field.__dict__ for field in new_layout.fields],
+                },
+            )
+        )
+    return findings
 
 
 def _verified_historical_direct_calls(
@@ -4518,6 +4981,7 @@ def analyze_range(
         persistent_cache.events.append(relation_cache_result)
     if isinstance(relation_payload, dict):
         relations = relation_payload["relations"]
+        generator.relations = relations
         generator_findings = relation_payload["findings"]
         generator.historical_override_candidates = relation_payload["historical_override_candidates"]
         cached_phase_timings = relation_payload.get("phase_timings")
@@ -4619,6 +5083,8 @@ def analyze_range(
                 strict_optional_contracts=plan.scenario == MAIN2MAIN_SCENARIO,
             )
         ]
+        if plan.analyze_inheritance:
+            branch_findings.extend(_dataclass_definition_findings(generator, old_snapshot, new_snapshot))
         return branch_findings, time.perf_counter() - started
 
     def analyze_imports() -> tuple[list[RangeFinding], float]:
@@ -4719,6 +5185,7 @@ def analyze_range(
             discovered_direct_calls,
             old_snapshot,
             new_snapshot,
+            old_to_new,
         )
         return (
             branch_findings,
@@ -5475,6 +5942,11 @@ def _root_cause_key(item: dict[str, Any]) -> tuple[object, ...]:
 
     old_present = present(old)
     new_present = present(new)
+    if item.get("contract_kind") == "symbol_presence":
+        # A relocation destination is diagnostic evidence, not proof that the
+        # old import path still exists. Use the import resolver's presence fact.
+        old_present = item.get("compatibility", {}).get("old", {}).get("exists") is True
+        new_present = item.get("compatibility", {}).get("new", {}).get("exists") is True
     if old_present and not new_present:
         return ("upstream_presence_removed", *identity(root))
     if not old_present and new_present:
@@ -5483,9 +5955,16 @@ def _root_cause_key(item: dict[str, Any]) -> tuple[object, ...]:
     endpoint = new if new.get("file") is not None else root
     parameter_delta = details.get("parameter_delta")
     if _signature_delta_changed(parameter_delta):
+        parameter_identity = identity(endpoint)
+        if endpoint.get("symbol_kind") == "constructor":
+            parameter_identity = (
+                endpoint.get("file"),
+                ".".join(part for part in (endpoint.get("owner"), endpoint.get("name")) if part),
+                "__init__",
+            )
         return (
             "upstream_parameter_delta",
-            *identity(endpoint),
+            *parameter_identity,
             json.dumps(parameter_delta, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
         )
     if item.get("contract_kind") == "required_instance_attribute":
