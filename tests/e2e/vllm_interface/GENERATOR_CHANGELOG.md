@@ -4,6 +4,23 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v2.9.0 - dataclass calls and executable import reads
+
+- Range snapshots derive generated dataclass argument protocols from source
+  fields, including inherited fields, defaults, keyword-only arguments, InitVar
+  and ClassVar exclusions. Custom allocation, unknown decorators and unsupported
+  layouts remain unresolved; repository classes are never executed.
+- Ordinary patch assignments no longer produce executable-import read findings
+  for their write targets. Receiver/RHS and augmented-assignment reads remain
+  visible, and unaliased submodule imports establish the root binding.
+- Snapshot cache schema 7 and direct-import cache schema 2 invalidate the
+  affected persisted results. Range output schema advances to 16. Full
+  main2main, monkey-patch, validation and report entry points are retained.
+- Regression fixtures compare generated protocols with Python's standard-library
+  dataclasses and verify that real patch-target removal findings remain present.
+  These fixes do not claim to complete container field tracing, polymorphic
+  receiver resolution or patch-consumer effectivity analysis.
+
 ## range analyzer v2.7.0 - reviewed benchmarks and inherited field lookup
 
 - Proven self/super attribute dependencies now retain an upstream lookup root

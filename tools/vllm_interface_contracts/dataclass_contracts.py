@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Source-only dataclass constructor-order contracts.
+"""Source-only dataclass field ordering and generated argument protocols.
 
 No repository classes or decorators are executed. Unknown decorators, dynamic
 field options, conditional declarations and multiple inheritance stay unknown.
@@ -36,6 +36,27 @@ class DataclassField:
 class DataclassLayout:
     fields: tuple[DataclassField, ...]
     generates_initializer: bool
+
+    def initializer(self) -> ast.FunctionDef | None:
+        """Represent only the generated argument protocol, without executing code."""
+        if not self.generates_initializer or self.ordering_error() is not None:
+            return None
+        fields = [field for field in self.fields if field.included]
+        positional = [field for field in fields if not field.keyword_only]
+        keywords = [field for field in fields if field.keyword_only]
+        node = ast.parse("def __init__(self): pass").body[0]
+        assert isinstance(node, ast.FunctionDef)
+        receiver = "__dataclass_self__" if any(field.name == "self" for field in fields) else "self"
+        node.args = ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg=receiver), *(ast.arg(arg=field.name) for field in positional)],
+            vararg=None,
+            kwonlyargs=[ast.arg(arg=field.name) for field in keywords],
+            kw_defaults=[None if field.required else ast.Constant(None) for field in keywords],
+            kwarg=None,
+            defaults=[ast.Constant(None) for field in positional if not field.required],
+        )
+        return ast.fix_missing_locations(node)
 
     def ordering_error(self) -> tuple[DataclassField, DataclassField] | None:
         if not self.generates_initializer:
@@ -74,6 +95,19 @@ def dataclass_layout(
             if call.args:
                 return None
             for keyword in call.keywords:
+                if keyword.arg not in {
+                    "init",
+                    "repr",
+                    "eq",
+                    "order",
+                    "unsafe_hash",
+                    "frozen",
+                    "match_args",
+                    "kw_only",
+                    "slots",
+                    "weakref_slot",
+                }:
+                    return None
                 if keyword.arg is None or not isinstance(keyword.value, ast.Constant):
                     return None
                 if not isinstance(keyword.value.value, bool):
@@ -109,7 +143,10 @@ def dataclass_layout(
                 return None
             continue
         if isinstance(statement, ast.Assign):
-            if any(isinstance(target, ast.Name) and target.id in fields for target in statement.targets):
+            if any(
+                isinstance(target, ast.Name) and (target.id in fields or target.id == "__init__")
+                for target in statement.targets
+            ):
                 return None
             continue
         if not isinstance(statement, ast.AnnAssign) or not isinstance(statement.target, ast.Name):
@@ -128,26 +165,36 @@ def dataclass_layout(
             continue
         included = annotation_ref != "typing.ClassVar"
         field_kw_only = keyword_only
-        required = statement.value is None
         value = statement.value
+        required = value is None or source.resolve(ast.unparse(value)) == "dataclasses.MISSING"
         if isinstance(value, ast.Call) and source.resolve(ast.unparse(value.func)) == "dataclasses.field":
             if value.args:
                 return None
             required = True
+            defaults = 0
             for keyword in value.keywords:
                 if keyword.arg in {"default", "default_factory"}:
                     if source.resolve(ast.unparse(keyword.value)) != "dataclasses.MISSING":
                         required = False
+                        defaults += 1
+                        if keyword.arg == "default" and isinstance(keyword.value, (ast.List, ast.Dict, ast.Set)):
+                            return None
                 elif keyword.arg in {"init", "kw_only"}:
                     if not isinstance(keyword.value, ast.Constant) or not isinstance(keyword.value.value, bool):
                         return None
                     if keyword.arg == "init":
-                        included = keyword.value.value
+                        included = included and keyword.value.value
                     else:
                         field_kw_only = keyword.value.value
-                elif keyword.arg is None:
+                elif keyword.arg not in {"repr", "hash", "compare", "metadata"}:
                     return None
-        elif required and name in fields:
+            if defaults > 1:
+                return None
+        elif isinstance(value, (ast.Call, ast.List, ast.Dict, ast.Set)):
+            # A descriptor factory can change requiredness through __get__;
+            # mutable defaults can prevent the dataclass from being defined.
+            return None
+        elif value is None and name in fields:
             # An annotation without a value does not erase an inherited default.
             required = fields[name].required
         fields[name] = DataclassField(

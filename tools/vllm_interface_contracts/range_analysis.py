@@ -95,11 +95,11 @@ from .models import (
 )
 from .module_attributes import ModuleGetattrContract, module_getattr_contract, runtime_module_body
 
-RANGE_SCHEMA_VERSION = 15
-RANGE_ANALYZER_VERSION = "2.8.0"
-SNAPSHOT_CACHE_SCHEMA_VERSION = 6
+RANGE_SCHEMA_VERSION = 16
+RANGE_ANALYZER_VERSION = "2.9.0"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 7
 RELATION_CACHE_SCHEMA_VERSION = 2
-DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 1
+DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 2
 DIRECT_CALL_CACHE_SCHEMA_VERSION = 2
 DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 5
 CLASSIFICATIONS = (
@@ -1823,6 +1823,23 @@ class GitSnapshot:
             return False
         return self._constructor_class_safe(base, frozenset((*seen, class_reference)))
 
+    def _dataclass_constructor(self, reference: str) -> ast.FunctionDef | None:
+        def lookup(name: str) -> ClassSource | None:
+            binding = self._resolve_qualified_node(name)
+            if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.ClassDef):
+                return None
+            # A generated __init__ does not define the whole class-call protocol
+            # when allocation or subclass creation is customized in the MRO.
+            if any(
+                _body_named_binding(binding.node.body, member).status != "missing"
+                for member in ("__new__", "__init_subclass__")
+            ):
+                return None
+            return ClassSource(binding.node, self._return_resolver(binding.file), binding.file, name)
+
+        layout = dataclass_layout(reference, lookup)
+        return layout.initializer() if layout is not None else None
+
     def _return_resolver(self, file_name: str) -> Any:
         module, _ = _file_module(file_name)
         bindings = self._module_bindings(file_name)
@@ -2179,12 +2196,15 @@ class GitSnapshot:
         if isinstance(node, ast.ClassDef):
             initializer_binding = self._effective_member(expression, "__init__")
             new_binding = self._effective_member(expression, "__new__")
+            generated_initializer = self._dataclass_constructor(expression)
+            generated_protocol = generated_initializer is not None
             constructor_fingerprint = hashlib.sha256(
                 json.dumps(
                     [
                         resolved.fingerprint,
                         initializer_binding.fingerprint if initializer_binding is not None else None,
                         new_binding.fingerprint if new_binding is not None else None,
+                        ast.dump(generated_initializer) if generated_initializer is not None else None,
                     ],
                     separators=(",", ":"),
                 ).encode()
@@ -2203,6 +2223,9 @@ class GitSnapshot:
                 if initializer_binding is not None and initializer_binding.status == "exact"
                 else None
             )
+            if generated_protocol:
+                initializer = generated_initializer
+                constructor_unknown = False
             if (
                 initializer is None
                 and initializer_binding is not None
@@ -3350,14 +3373,19 @@ class _ImportVisitor(ast.NodeVisitor):
             if not alias.name.startswith("vllm"):
                 continue
             self.references.append(ImportReference(alias.name, None, self.file_name, node.lineno))
-            if alias.name == "vllm":
+            if alias.name == "vllm" or (alias.name.startswith("vllm.") and alias.asname is None):
                 self._vllm_roots.add(alias.asname or "vllm")
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if self._version_guard_depth:
             return
+        if not _attribute_is_read(node, self._parents):
+            # Stores install patches or mutate state; they do not read the old
+            # attribute. Still visit receivers and values through normal AST flow.
+            self.generic_visit(node)
+            return
         parent = self._parents.get(id(node))
-        if isinstance(parent, ast.Attribute) and parent.value is node:
+        if isinstance(parent, ast.Attribute) and parent.value is node and _attribute_is_read(parent, self._parents):
             return
         parts: list[str] = []
         current: ast.AST = node
