@@ -28,6 +28,8 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .annotation_names import AnnotationNamespace
+from .dataclass_contracts import ClassSource
 from .generator import (
     _TRITON_JIT_DECORATOR,
     _TRITON_KERNEL_PROTOCOL,
@@ -42,6 +44,7 @@ from .generator import (
     _statements_must_terminate,
     _tag_guard_names,
 )
+from .type_flow import TYPE_BUILTINS, ContainerFlow, FlowValue
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,7 @@ class DirectCallDependency:
     invocation_kind: str = "python_call"
     lookup_root: str | None = None
     resolution_basis: str = "new_exact"
+    receiver_path: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -156,6 +160,7 @@ class DirectAttributeDependency:
     member: str | None = None
     lookup_root: str | None = None
     resolution_basis: str = "new_exact"
+    receiver_path: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -963,6 +968,61 @@ class _DirectDependencyResolver:
         self._function_locals: dict[int, frozenset[str]] = {}
         self._scope_tag_guards: dict[int, set[str]] = {}
         self._instance_member_types: dict[tuple[str, str], frozenset[str] | None] = {}
+        self._container_flows: dict[int, ContainerFlow] = {}
+        self._annotation_namespaces: dict[tuple[int, str], AnnotationNamespace] = {}
+
+    def _annotation_namespace(self, index: RepositoryIndex, module: ModuleInfo) -> AnnotationNamespace:
+        key = (id(index), module.name)
+        if key not in self._annotation_namespaces:
+            self._annotation_namespaces[key] = AnnotationNamespace(module.tree, module.name, module.is_package)
+        return self._annotation_namespaces[key]
+
+    def _type_source(self, reference: str) -> ClassSource | None:
+        index = self.engine.upstream if reference.startswith("vllm.") else self.engine.downstream
+        info = index.find_callable(reference)
+        if info is None or not isinstance(info.node, ast.ClassDef):
+            return None
+        namespace = self._annotation_namespace(index, index.modules[info.module])
+
+        def resolve(expression: str) -> str | None:
+            if expression in TYPE_BUILTINS and not index.find_final_bindings(f"{info.module}.{expression}"):
+                return expression
+            target = namespace.resolve(expression)
+            return index.canonical_name(target) if target is not None else None
+
+        return ClassSource(info.node, resolve, info.file, reference)
+
+    def _container_receiver(
+        self,
+        member: ast.Attribute,
+        function: ast.FunctionDef | ast.AsyncFunctionDef | None,
+        module: ModuleInfo,
+    ) -> FlowValue | None:
+        if function is None:
+            return None
+        key = id(function)
+        if key not in self._container_flows:
+            namespace = self._annotation_namespace(self.engine.downstream, module)
+
+            def resolve(expression: str) -> str | None:
+                if expression in TYPE_BUILTINS and not self.engine.downstream.find_final_bindings(
+                    f"{module.name}.{expression}"
+                ):
+                    return expression
+                return namespace.resolve(expression, function.lineno)
+
+            def runtime(expression: str) -> str | None:
+                if expression in TYPE_BUILTINS and not self.engine.downstream.find_final_bindings(
+                    f"{module.name}.{expression}"
+                ):
+                    return expression
+                return namespace.runtime(expression, function.lineno)
+
+            self._container_flows[key] = ContainerFlow(function, resolve, self._type_source, runtime_resolve=runtime)
+        value = self._container_flows[key].receivers.get(id(member))
+        if value is None or len(value.path) < 2 or not value.shape.reference.startswith("vllm."):
+            return None
+        return value
 
     def _local_names(
         self,
@@ -1691,6 +1751,19 @@ class DirectCallDetector(_DirectDependencyResolver):
                 )
                 if special is None and may_be_constructed:
                     special = self._constructed_instance_target(node, function, module_info)
+                flow = None
+                if invocation_kind == "python_call" and isinstance(callable_node, ast.Attribute):
+                    flow = self._container_receiver(callable_node, function, module_info)
+                    if flow is not None:
+                        receiver = flow.shape.reference
+                        special = (
+                            f"{receiver}.{callable_node.attr}",
+                            "instance",
+                            receiver,
+                            callable_node.attr,
+                            None,
+                            "typed_container_flow",
+                        )
                 receiver_type: str | None
                 member: str | None
                 lookup_root: str | None
@@ -1750,6 +1823,7 @@ class DirectCallDetector(_DirectDependencyResolver):
                     invocation_kind=invocation_kind,
                     lookup_root=lookup_root,
                     resolution_basis=resolution_basis,
+                    receiver_path=flow.path if flow is not None else (),
                 )
                 if lookup_root is not None:
                     self.historical_candidates.append(dependency)
@@ -2049,6 +2123,10 @@ class DirectAttributeDetector(_DirectDependencyResolver):
                 if special is None and may_be_constructed:
                     special = self._constructed_instance_target(node, function, module_info)
 
+                flow = self._container_receiver(node, function, module_info)
+                if flow is not None:
+                    receiver = flow.shape.reference
+                    special = (f"{receiver}.{node.attr}", "instance", receiver, node.attr, None, "typed_container_flow")
                 receiver_type: str | None
                 member: str | None
                 lookup_root: str | None
@@ -2095,6 +2173,7 @@ class DirectAttributeDetector(_DirectDependencyResolver):
                     owner=owner.rsplit(".", 1)[-1] if owner else None,
                     scope=function.name if function is not None else None,
                     expression=ast.unparse(node),
+                    receiver_path=flow.path if flow is not None else (),
                     receiver_type=receiver_type,
                     member=member,
                     lookup_root=lookup_root,

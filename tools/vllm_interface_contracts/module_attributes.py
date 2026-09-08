@@ -24,6 +24,15 @@ def runtime_module_body(tree: ast.Module) -> list[ast.stmt]:
     Nested function/class bodies retain their own annotation semantics.
     """
 
+    return _typing_module_body(tree, annotation_mode=False)
+
+
+def annotation_module_body(tree: ast.Module) -> list[ast.stmt]:
+    """Select proven TYPE_CHECKING branches for annotation lookup only."""
+    return _typing_module_body(tree, annotation_mode=True)
+
+
+def _typing_module_body(tree: ast.Module, *, annotation_mode: bool) -> list[ast.stmt]:
     candidates: dict[str, str] = {}
     counts: dict[str, int] = {}
     for statement in tree.body:
@@ -36,7 +45,23 @@ def runtime_module_body(tree: ast.Module) -> list[ast.stmt]:
             for alias in statement.names:
                 if alias.name == "typing":
                     candidates[alias.asname or alias.name] = "module"
+    # Function/class-local names cannot rebind a module typing alias. A nested
+    # global declaration can, so retain a conservative barrier for that case.
     for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            for name in node.names:
+                candidates.pop(name, None)
+    pending: list[ast.AST] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            pending.extend(node.decorator_list)
+            pending.extend(node.args.defaults)
+            pending.extend(default for default in node.args.kw_defaults if default is not None)
+        elif isinstance(node, ast.ClassDef):
+            pending.extend([*node.decorator_list, *node.bases, *(keyword.value for keyword in node.keywords)])
+        elif not isinstance(node, ast.Lambda):
+            pending.extend(ast.iter_child_nodes(node))
         names: list[str] = []
         if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
             candidates.clear()
@@ -78,7 +103,7 @@ def runtime_module_body(tree: ast.Module) -> list[ast.stmt]:
             if isinstance(test, ast.Attribute) and isinstance(test.value, ast.Name):
                 is_typing = test.attr == "TYPE_CHECKING" and aliases.get(test.value.id) == "module"
             if is_typing:
-                replacement = ast.Module(body=node.orelse, type_ignores=[])
+                replacement = ast.Module(body=node.body if annotation_mode else node.orelse, type_ignores=[])
                 self.generic_visit(replacement)
                 return replacement.body
             return self.generic_visit(node)

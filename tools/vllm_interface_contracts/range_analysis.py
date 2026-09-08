@@ -44,6 +44,7 @@ from .analysis_plans import (
     AnalysisPlan,
     resolve_analysis_plan,
 )
+from .annotation_names import AnnotationNamespace
 from .cache import CacheResult, PersistentCache, build_identity, git_source_state, normalized_repo_path
 from .call_contracts import (
     CallShape,
@@ -94,14 +95,15 @@ from .models import (
     SourceEndpoint,
 )
 from .module_attributes import ModuleGetattrContract, module_getattr_contract, runtime_module_body
+from .type_flow import TYPE_BUILTINS, resolve_type_path
 
-RANGE_SCHEMA_VERSION = 16
-RANGE_ANALYZER_VERSION = "2.9.0"
-SNAPSHOT_CACHE_SCHEMA_VERSION = 7
+RANGE_SCHEMA_VERSION = 18
+RANGE_ANALYZER_VERSION = "2.11.0"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 9
 RELATION_CACHE_SCHEMA_VERSION = 2
-DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 2
-DIRECT_CALL_CACHE_SCHEMA_VERSION = 2
-DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 5
+DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 3
+DIRECT_CALL_CACHE_SCHEMA_VERSION = 4
+DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 7
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -826,6 +828,7 @@ class GitSnapshot:
         self._source: dict[str, str | None] = {}
         self._trees: dict[str, ast.Module | None] = {}
         self._bindings: dict[str, dict[str, str]] = {}
+        self._annotation_namespaces: dict[str, AnnotationNamespace] = {}
         self._attribute_endpoints: dict[tuple[str, str, str | None, str | None], SourceEndpoint] = {}
         self._module_attributes: dict[str, tuple[list[ast.stmt], ModuleGetattrContract | None]] = {}
         self._keyword_call_candidates: dict[
@@ -1822,6 +1825,49 @@ class GitSnapshot:
         if base is None or not base.startswith("vllm."):
             return False
         return self._constructor_class_safe(base, frozenset((*seen, class_reference)))
+
+    def _type_source(self, reference: str) -> ClassSource | None:
+        binding = self._resolve_qualified_node(reference)
+        if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.ClassDef):
+            return None
+        tree = self.tree(binding.file)
+        if tree is None:
+            return None
+        if binding.file not in self._annotation_namespaces:
+            module, is_package = _file_module(binding.file)
+            self._annotation_namespaces[binding.file] = AnnotationNamespace(tree, module, is_package)
+        namespace = self._annotation_namespaces[binding.file]
+
+        def resolve(expression: str) -> str | None:
+            if expression in TYPE_BUILTINS:
+                tree = self.tree(binding.file)
+                if tree is not None and _body_named_binding(tree.body, expression).status == "missing":
+                    return expression
+            return namespace.resolve(expression)
+
+        return ClassSource(binding.node, resolve, binding.file, reference)
+
+    def dependency_endpoint(
+        self,
+        dependency: DirectCallDependency | DirectAttributeDependency,
+    ) -> SourceEndpoint:
+        receiver = dependency.lookup_root or dependency.receiver_type
+        if dependency.receiver_path:
+            resolved = resolve_type_path(dependency.receiver_path, self._type_source)
+            if resolved is None or not resolved.reference.startswith("vllm."):
+                return SourceEndpoint(None, None, dependency.member, symbol_kind="unknown")
+            receiver = resolved.reference
+        if isinstance(dependency, DirectAttributeDependency):
+            return self.attribute_endpoint(
+                dependency.target, dependency.access_kind, receiver_type=receiver, member=dependency.member
+            )
+        return self.call_endpoint(
+            dependency.target,
+            dependency.access_kind,
+            receiver_type=receiver,
+            member=dependency.member,
+            invocation_kind=dependency.invocation_kind,
+        )
 
     def _dataclass_constructor(self, reference: str) -> ast.FunctionDef | None:
         def lookup(name: str) -> ClassSource | None:
@@ -3407,7 +3453,7 @@ def discover_imports(ascend_root: Path) -> list[ImportReference]:
         except (OSError, SyntaxError, UnicodeError):
             continue
         visitor = _ImportVisitor(relative)
-        visitor.visit(tree)
+        visitor.visit(ast.Module(body=runtime_module_body(tree), type_ignores=[]))
         references.extend(visitor.references)
     unique = {(item.module, item.symbol, item.file, item.line): item for item in references}
     ordered = sorted(
@@ -3551,21 +3597,8 @@ def _direct_call_findings(
     findings: list[RangeFinding] = []
     exact_dependencies: list[DirectCallDependency] = []
     for dependency in dependencies:
-        endpoint_receiver = dependency.lookup_root or dependency.receiver_type
-        old_endpoint = old_snapshot.call_endpoint(
-            dependency.target,
-            dependency.access_kind,
-            receiver_type=endpoint_receiver,
-            member=dependency.member,
-            invocation_kind=dependency.invocation_kind,
-        )
-        new_endpoint = new_snapshot.call_endpoint(
-            dependency.target,
-            dependency.access_kind,
-            receiver_type=endpoint_receiver,
-            member=dependency.member,
-            invocation_kind=dependency.invocation_kind,
-        )
+        old_endpoint = old_snapshot.dependency_endpoint(dependency)
+        new_endpoint = new_snapshot.dependency_endpoint(dependency)
         relocation: dict[str, Any] | None = None
         if (
             old_endpoint.file is not None
@@ -3759,23 +3792,13 @@ def _direct_attribute_findings(
     exact_dependencies: list[DirectAttributeDependency] = []
     for dependency in dependencies:
         endpoint_receiver = dependency.lookup_root or dependency.receiver_type
-        old_endpoint = old_snapshot.attribute_endpoint(
-            dependency.target,
-            dependency.access_kind,
-            receiver_type=endpoint_receiver,
-            member=dependency.member,
-        )
-        new_endpoint = new_snapshot.attribute_endpoint(
-            dependency.target,
-            dependency.access_kind,
-            receiver_type=endpoint_receiver,
-            member=dependency.member,
-        )
+        old_endpoint = old_snapshot.dependency_endpoint(dependency)
+        new_endpoint = new_snapshot.dependency_endpoint(dependency)
         exact_dependencies.append(dependency)
         old_state = _direct_attribute_state(old_endpoint)
         new_state = _direct_attribute_state(new_endpoint)
         registered_buffer_evidence = False
-        if endpoint_receiver and dependency.member and old_state.exists is None:
+        if endpoint_receiver and dependency.member and old_state.exists is None and not dependency.receiver_path:
             old_buffer = old_snapshot.registered_buffer_state(endpoint_receiver, dependency.member)
             new_buffer = new_snapshot.registered_buffer_state(endpoint_receiver, dependency.member)
             if old_buffer is True:
@@ -3858,6 +3881,7 @@ def _direct_attribute_findings(
                     "resolution_basis": dependency.resolution_basis,
                     "scope": dependency.scope,
                     "registered_buffer_evidence": registered_buffer_evidence,
+                    "receiver_path": list(dependency.receiver_path),
                 },
             )
         )
@@ -4710,13 +4734,7 @@ def validate_current_contracts(
     attribute_dependencies: list[DirectAttributeDependency] = []
     findings: list[dict[str, Any]] = []
     for dependency in discovered_dependencies:
-        upstream = snapshot.call_endpoint(
-            dependency.target,
-            dependency.access_kind,
-            receiver_type=dependency.receiver_type,
-            member=dependency.member,
-            invocation_kind=dependency.invocation_kind,
-        )
+        upstream = snapshot.dependency_endpoint(dependency)
         dependencies.append(dependency)
         argument_state = _direct_call_state(upstream, dependency)
         if argument_state.compatible is not True:
@@ -4757,12 +4775,7 @@ def validate_current_contracts(
                 )
 
     for attribute_dependency in discovered_attributes:
-        upstream = snapshot.attribute_endpoint(
-            attribute_dependency.target,
-            attribute_dependency.access_kind,
-            receiver_type=attribute_dependency.lookup_root or attribute_dependency.receiver_type,
-            member=attribute_dependency.member,
-        )
+        upstream = snapshot.dependency_endpoint(attribute_dependency)
         attribute_dependencies.append(attribute_dependency)
         state = _direct_attribute_state(upstream)
         if state.compatible is True:

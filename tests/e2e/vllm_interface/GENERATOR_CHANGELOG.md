@@ -4,6 +4,38 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v2.11.0 - annotation namespaces and scalar arguments
+
+- Type evidence can follow proven TYPE_CHECKING imports without installing
+  runtime bindings. Annotation and runtime names reuse the scope interpreter;
+  conflicting/rebound names remain unknown. Snapshot field annotations use
+  their own revision's namespace, not the checked-out new revision's imports.
+- Runtime-import discovery excludes proven module-level typing-only branches.
+  Local function names no longer invalidate unrelated module typing aliases;
+  genuine rebindings and nested global declarations retain conservative guards.
+- Passing a source-proven immutable scalar field to a helper does not erase
+  its parent container's type path. Mutable and unknown arguments still do.
+- Range schema 18, snapshot schema 9 and import/call/attribute cache schemas
+  3/4/7 invalidate the affected persisted data. This does not complete self-held
+  config, mutable read-only helper, downstream-constructor or patch-consumer
+  tracing; a new full historical replay is still required after engine freeze.
+
+## range analyzer v2.10.0 - container element type paths
+
+- Direct field reads and method calls can follow typed container fields through
+  aliases, loops, indices, enumeration, mapping views and comprehensions.
+- Evidence retains the annotation root and traversal path. Snapshots resolve
+  that path independently so a changed element owner is not borrowed from new
+  for the old endpoint. Unresolved paths remain review items.
+- Branch joins, unknown mutations, zero-iteration loops and comprehension-local
+  variables do not manufacture an exact receiver. Literal-false filters are
+  excluded and element bindings take precedence over same-named parameters.
+- Range schema 17, snapshot schema 8, direct-call cache schema 3 and
+  direct-attribute cache schema 6 invalidate the affected persisted data.
+- This is a foundation, not complete field coverage: a named PR 14872 probe
+  resolves three of 37 shared_by read sites. Self-held configuration types and
+  interprocedural read-only/effect analysis still require follow-up work.
+
 ## range analyzer v2.9.0 - dataclass calls and executable import reads
 
 - Range snapshots derive generated dataclass argument protocols from source
