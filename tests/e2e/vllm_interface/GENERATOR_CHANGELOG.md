@@ -4,6 +4,22 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v2.13.0 - stored configuration parameter paths
+
+- Constructor parameter stores can seed self-held configuration paths, with
+  explicit non-null narrowing for nullable annotations. Both exact field reads
+  and calls on container elements use the shared path resolver.
+- Upstream-owned fields retain their declaring owner and are replayed at both
+  endpoints. Downstream-local annotations remain pinned to the review baseline.
+- Competing writes, early initializer returns, unknown allocators, descriptors
+  and dynamic attribute protocols block evidence. A property setter is not
+  treated like an unrelated plain field store.
+- Fields stored from the same constructor parameter retain a common alias
+  origin; mutations through either member invalidate both source paths.
+- Range schema 20 and call/attribute cache schemas 8/11 invalidate affected
+  discoveries, including intermediate development schemas. Full main2main and
+  monkey-patch scope are unchanged; this is not full historical replay evidence.
+
 ## range analyzer v2.12.0 - source-derived helper parameter effects
 
 - Uniquely bound, ordinary downstream helpers can preserve container type paths

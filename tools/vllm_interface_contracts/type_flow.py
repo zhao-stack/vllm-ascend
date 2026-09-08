@@ -78,6 +78,13 @@ def annotation_type(node: ast.AST | None, resolve: Resolve) -> TypeShape | None:
             node = ast.parse(node.value, mode="eval").body
         except SyntaxError:
             return None
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        if isinstance(node.right, ast.Constant) and node.right.value is None:
+            inner = annotation_type(node.left, resolve)
+            return TypeShape("optional", (inner,)) if inner is not None else None
+        if isinstance(node.left, ast.Constant) and node.left.value is None:
+            inner = annotation_type(node.right, resolve)
+            return TypeShape("optional", (inner,)) if inner is not None else None
     if isinstance(node, (ast.Name, ast.Attribute)):
         reference = resolve(ast.unparse(node))
         return TypeShape(reference) if reference is not None else None
@@ -87,6 +94,9 @@ def annotation_type(node: ast.AST | None, resolve: Resolve) -> TypeShape | None:
     if base is None:
         return None
     items = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+    if base.reference == "typing.Optional" and len(items) == 1:
+        inner = annotation_type(items[0], resolve)
+        return TypeShape("optional", (inner,)) if inner is not None else None
     arguments = []
     for item in items:
         argument = (
@@ -98,6 +108,137 @@ def annotation_type(node: ast.AST | None, resolve: Resolve) -> TypeShape | None:
             return None
         arguments.append(argument)
     return TypeShape(base.reference, tuple(arguments))
+
+
+def _plain_instance_storage(
+    reference: str, member: str, lookup: Lookup, seen: frozenset[str] = frozenset(), *, reject_other_writes: bool = True
+) -> bool:
+    if reference in {"object", "builtins.object"}:
+        return True
+    if reference in seen or (source := lookup(reference)) is None:
+        return False
+    node = source.node
+    if node.keywords or node.decorator_list or len(node.bases) > 1:
+        return False
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if item.name in {member, "__getattribute__", "__getattr__", "__setattr__", "__delattr__", "__new__"}:
+                return False
+            if (
+                reject_other_writes
+                and item.name != "__init__"
+                and any(
+                    isinstance(child, ast.Attribute)
+                    and child.attr == member
+                    and isinstance(child.ctx, (ast.Store, ast.Del))
+                    for child in ast.walk(item)
+                )
+            ):
+                return False
+        elif any(
+            isinstance(child, ast.Name) and child.id == member and isinstance(child.ctx, (ast.Store, ast.Del))
+            for child in ast.walk(item)
+        ):
+            return False
+    return all(
+        (base_reference := source.resolve(ast.unparse(base))) is not None
+        and _plain_instance_storage(
+            base_reference, member, lookup, seen | {reference}, reject_other_writes=reject_other_writes
+        )
+        for base in node.bases
+    )
+
+
+def instance_field_origin(
+    reference: str, member: str, lookup: Lookup, seen: frozenset[str] = frozenset()
+) -> tuple[str, TypeShape, str] | None:
+    """Prove one unconditional constructor store of an annotated parameter.
+
+    This is a stored-field contract, not arbitrary constructor execution. Other
+    writes, descriptors, parameter rebinding and an overriding initializer
+    block inherited evidence. Return the declaring owner for endpoint replay.
+    """
+    if reference in seen or (source := lookup(reference)) is None:
+        return None
+    if not _plain_instance_storage(reference, member, lookup):
+        return None
+    node = source.node
+    if node.keywords or node.decorator_list or len(node.bases) > 1:
+        return None
+    initializers = [item for item in node.body if isinstance(item, ast.FunctionDef) and item.name == "__init__"]
+    writes: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.AST]] = []
+    for item in node.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name in {
+            "__getattribute__",
+            "__getattr__",
+            "__setattr__",
+            "__delattr__",
+        }:
+            return None
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and item.name == member:
+            return None
+        if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if any(
+                isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)) and n.id == member
+                for n in ast.walk(item)
+            ):
+                return None
+            continue
+        args = [*item.args.posonlyargs, *item.args.args]
+        if not args:
+            continue
+        receiver = args[0].arg
+        aliases = {receiver}
+        for assignment in ast.walk(item):
+            if isinstance(assignment, ast.Assign) and isinstance(assignment.value, ast.Name):
+                if assignment.value.id in aliases:
+                    aliases.update(t.id for t in assignment.targets if isinstance(t, ast.Name))
+        for child in ast.walk(item):
+            if (
+                isinstance(child, ast.Attribute)
+                and child.attr == member
+                and isinstance(child.ctx, (ast.Store, ast.Del))
+                and isinstance(child.value, ast.Name)
+                and child.value.id in aliases
+            ):
+                writes.append((item, child))
+    if writes:
+        if len(writes) != 1 or len(initializers) != 1 or writes[0][0] is not initializers[0]:
+            return None
+        init = initializers[0]
+        if init.decorator_list:
+            return None
+        assignments = [
+            s
+            for s in init.body
+            if isinstance(s, (ast.Assign, ast.AnnAssign))
+            and any(t is writes[0][1] for t in (s.targets if isinstance(s, ast.Assign) else [s.target]))
+        ]
+        if len(assignments) != 1 or not isinstance(assignments[0].value, ast.Name):
+            return None
+        if any(
+            isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom))
+            for statement in init.body[: init.body.index(assignments[0])]
+            for child in ast.walk(statement)
+        ):
+            return None
+        name = assignments[0].value.id
+        parameters = [*init.args.posonlyargs, *init.args.args, *init.args.kwonlyargs]
+        argument = next((arg for arg in parameters if arg.arg == name), None)
+        if argument is None or any(
+            isinstance(n, ast.Name) and n.id in {name, parameters[0].arg} and isinstance(n.ctx, (ast.Store, ast.Del))
+            for n in ast.walk(init)
+        ):
+            return None
+        shape = annotation_type(argument.annotation, source.resolve)
+        return (reference, shape, name) if shape is not None else None
+    if initializers:
+        return None
+    for base in node.bases:
+        base_reference = source.resolve(ast.unparse(base))
+        if base_reference is not None:
+            return instance_field_origin(base_reference, member, lookup, seen | {reference})
+    return None
 
 
 def field_type(reference: str, member: str, lookup: Lookup, seen: frozenset[str] = frozenset()) -> TypeShape | None:
@@ -133,6 +274,11 @@ def field_type(reference: str, member: str, lookup: Lookup, seen: frozenset[str]
 
 
 def type_step(value: TypeShape, step: str, lookup: Lookup) -> TypeShape | None:
+    if step == "nonnull":
+        return value.arguments[0] if value.reference == "optional" and len(value.arguments) == 1 else value
+    if step.startswith("instance_field:"):
+        origin = instance_field_origin(value.reference, step.removeprefix("instance_field:"), lookup)
+        return origin[1] if origin is not None else None
     if step.startswith("field:"):
         return field_type(value.reference, step.removeprefix("field:"), lookup)
     name = value.reference
@@ -235,11 +381,15 @@ class ContainerFlow:
         *,
         runtime_resolve: Resolve | None = None,
         helper_resolve: HelperResolver | None = None,
+        instance_fields: dict[str, FlowValue] | None = None,
+        instance_owner: str | None = None,
     ):
         self.lookup = lookup
         self.resolve = resolve
         self.runtime_resolve = runtime_resolve or resolve
         self.helper_resolve = helper_resolve
+        self.instance_fields = instance_fields or {}
+        self.instance_owner = instance_owner
         self.receivers: dict[int, FlowValue] = {}
         self.blocked_builtins = {
             n.id for n in ast.walk(function) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
@@ -250,7 +400,19 @@ class ContainerFlow:
         for argument in arguments:
             shape = annotation_type(argument.annotation, resolve)
             env[argument.arg] = FlowValue(shape, (shape.render(),)) if shape else None
-        if any(value is not None and "vllm." in value.shape.render() for value in env.values()):
+        env.update(self.instance_fields)
+        for receiver in {name.split(".")[0] for name in self.instance_fields}:
+            env[receiver] = FlowValue(
+                TypeShape("unknown"),
+                ("unknown",),
+                frozenset(
+                    root
+                    for name, value in self.instance_fields.items()
+                    if name.startswith(receiver + ".")
+                    for root in value.roots
+                ),
+            )
+        if self.instance_fields or any(value is not None and "vllm." in value.shape.render() for value in env.values()):
             self.statements(function.body, env)
 
     @staticmethod
@@ -266,14 +428,40 @@ class ContainerFlow:
 
     def bind(self, target: ast.AST, value: FlowValue | None, env: dict[str, FlowValue | None]) -> None:
         if isinstance(target, ast.Name):
+            for field in self.instance_fields:
+                if field.startswith(target.id + "."):
+                    self.invalidate(ast.parse(field, mode="eval").body, env)
             env[target.id] = value
         elif isinstance(target, (ast.Tuple, ast.List)):
             for index, item in enumerate(target.elts):
                 self.bind(item, value.step(f"index:{index}", self.lookup) if value else None, env)
         else:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and ast.unparse(target) not in self.instance_fields
+                and any(name.startswith(target.value.id + ".") for name in self.instance_fields)
+                and self.instance_owner is not None
+                and _plain_instance_storage(self.instance_owner, target.attr, self.lookup, reject_other_writes=False)
+            ):
+                return  # A distinct plain stored field does not rebind the configuration.
             self.invalidate(target, env)
 
     def invalidate(self, node: ast.AST, env: dict[str, FlowValue | None]) -> None:
+        root = node
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            if ast.unparse(root) in self.instance_fields:
+                value = env.get(ast.unparse(root))
+                if value is not None:
+                    for name, candidate in list(env.items()):
+                        if candidate is not None and candidate.roots & value.roots:
+                            env[name] = None
+                return
+            root = root.value
+        if isinstance(root, ast.Name):
+            for field in self.instance_fields:
+                if field.startswith(root.id + ".") and isinstance(node, ast.Name):
+                    self.invalidate(ast.parse(field, mode="eval").body, env)
         root = node
         while isinstance(root, (ast.Attribute, ast.Subscript)):
             root = root.value
@@ -288,6 +476,8 @@ class ContainerFlow:
         if isinstance(node, ast.Name):
             return env.get(node.id)
         if isinstance(node, ast.Attribute):
+            if ast.unparse(node) in self.instance_fields:
+                return env.get(ast.unparse(node))
             value = self.expression(node.value, env)
             if value is not None:
                 self.receivers[id(node)] = value
@@ -453,6 +643,7 @@ class ContainerFlow:
                         return True
                     continue
                 left, right = dict(env), dict(env)
+                self.narrow_nonnull(statement.test, left, right)
                 left_exits = self.statements(statement.body, left)
                 right_exits = self.statements(statement.orelse, right)
                 if left_exits and right_exits:
@@ -474,6 +665,11 @@ class ContainerFlow:
                     return True
             elif isinstance(statement, (ast.Break, ast.Continue)):
                 return True
+            elif isinstance(statement, ast.Assert):
+                self.expression(statement.test, env)
+                self.narrow_nonnull(statement.test, env, dict(env))
+                # A message may execute when the assertion fails; that path
+                # does not continue to a following field read.
             else:
                 # Unsupported control flow must not manufacture evidence from
                 # mutually exclusive paths or leak writes into a later read.
@@ -490,3 +686,21 @@ class ContainerFlow:
                         for argument in [*child.args, *(kw.value for kw in child.keywords)]:
                             self.invalidate(argument, env)
         return False
+
+    def narrow_nonnull(
+        self, test: ast.AST, positive: dict[str, FlowValue | None], negative: dict[str, FlowValue | None]
+    ) -> None:
+        if not (
+            isinstance(test, ast.Compare)
+            and len(test.ops) == 1
+            and len(test.comparators) == 1
+            and isinstance(test.comparators[0], ast.Constant)
+            and test.comparators[0].value is None
+        ):
+            return
+        env = positive if isinstance(test.ops[0], ast.IsNot) else negative if isinstance(test.ops[0], ast.Is) else None
+        name = ast.unparse(test.left)
+        if env is not None and name in env and env[name] is not None:
+            value = env[name]
+            if value is not None:
+                env[name] = value.step("nonnull", self.lookup)

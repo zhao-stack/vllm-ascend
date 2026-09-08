@@ -45,7 +45,7 @@ from .generator import (
     _tag_guard_names,
 )
 from .helper_effects import HelperEffects, HelperSummary
-from .type_flow import TYPE_BUILTINS, ContainerFlow, FlowValue, HelperCallEffects, TypeShape
+from .type_flow import TYPE_BUILTINS, ContainerFlow, FlowValue, HelperCallEffects, TypeShape, instance_field_origin
 
 
 @dataclass(frozen=True)
@@ -972,12 +972,17 @@ class _DirectDependencyResolver:
         self._container_flows: dict[int, ContainerFlow] = {}
         self._annotation_namespaces: dict[tuple[int, str], AnnotationNamespace] = {}
         self._helper_summaries: dict[tuple[str, tuple[tuple[str, TypeShape | None], ...]], HelperSummary] = {}
+        self._parent_maps: dict[str, dict[int, ast.AST]] = {}
+        self._stored_field_origins: dict[tuple[str, str], tuple[str, TypeShape, str] | None] = {}
 
     def _helper_call_effects(
         self, call: ast.Call, values: tuple[FlowValue | None, ...], function: ast.AST, module: ModuleInfo
     ) -> HelperCallEffects | None:
         expression = _expression_name(call.func)
-        if not any(value is not None and any("vllm." in root for root in value.roots) for value in values):
+        if not any(
+            value is not None and ("vllm." in value.shape.render() or any("vllm." in root for root in value.roots))
+            for value in values
+        ):
             return None
         if expression is None or not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return None
@@ -1090,12 +1095,51 @@ class _DirectDependencyResolver:
                     return expression
                 return namespace.runtime(expression, function.lineno)
 
+            instance_fields = {}
+            if module.name not in self._parent_maps:
+                self._parent_maps[module.name] = _parents(module.tree)
+            parents = self._parent_maps[module.name]
+            owner = self._class_name(function, parents, module.name)
+            args = [*function.args.posonlyargs, *function.args.args]
+            if (
+                owner is not None
+                and args
+                and not function.decorator_list
+                and isinstance(parents.get(id(function)), ast.ClassDef)
+            ):
+                receiver = args[0].arg
+                for child in ast.walk(function):
+                    if (
+                        isinstance(child, ast.Attribute)
+                        and isinstance(child.value, ast.Name)
+                        and child.value.id == receiver
+                    ):
+                        origin_key = (owner, child.attr)
+                        if origin_key not in self._stored_field_origins:
+                            self._stored_field_origins[origin_key] = instance_field_origin(
+                                owner, child.attr, self._type_source
+                            )
+                        origin = self._stored_field_origins[origin_key]
+                        if origin is None:
+                            continue
+                        declaring_owner, shape, parameter = origin
+                        path = (
+                            (declaring_owner, f"instance_field:{child.attr}")
+                            if declaring_owner.startswith("vllm.")
+                            else (shape.render(),)
+                        )
+                        name = f"{receiver}.{child.attr}"
+                        instance_fields[name] = FlowValue(
+                            shape, path, frozenset({f"{receiver}:{declaring_owner}.{parameter}"})
+                        )
             self._container_flows[key] = ContainerFlow(
                 function,
                 resolve,
                 self._type_source,
                 runtime_resolve=runtime,
                 helper_resolve=lambda call, values: self._helper_call_effects(call, values, function, module),
+                instance_fields=instance_fields,
+                instance_owner=owner,
             )
         value = self._container_flows[key].receivers.get(id(member))
         if value is None or len(value.path) < 2 or not value.shape.reference.startswith("vllm."):
