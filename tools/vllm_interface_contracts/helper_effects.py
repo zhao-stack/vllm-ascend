@@ -12,7 +12,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, replace
 
-from .type_flow import Lookup, Resolve, TypeShape, field_type, ordinary_instance_target, type_step
+from .type_flow import Lookup, Resolve, TypeShape, dictionary_get_safe, field_type, ordinary_instance_target, type_step
 
 
 @dataclass(frozen=True)
@@ -186,6 +186,25 @@ class HelperEffects:
                 return EffectValue(shape=TypeShape("bool"))
         if isinstance(node.func, ast.Attribute):
             receiver = self.expression(node.func.value, env)
+            query_shape = (
+                TypeShape("empty_dict")
+                if receiver.owned is not None and receiver.shape == TypeShape("dict")
+                else receiver.shape
+            )
+            if (
+                query_shape is not None
+                and node.func.attr == "get"
+                and not node.keywords
+                and len(node.args) in {1, 2}
+                and not any(isinstance(arg, ast.Starred) for arg in node.args)
+                and dictionary_get_safe(query_shape, values[0].shape)
+            ):
+                default = values[1] if len(values) == 2 else _EMPTY
+                return (
+                    default
+                    if query_shape.reference == "empty_dict"
+                    else EffectValue(receiver.origins | default.origins)
+                )
             shape = type_step(receiver.shape, node.func.attr, self.lookup) if receiver.shape else None
             if node.func.attr in {"items", "values", "keys"} and shape is not None and not values:
                 return self.derived(receiver, shape, node.func.attr)

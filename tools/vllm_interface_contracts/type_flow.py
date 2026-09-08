@@ -72,6 +72,22 @@ class TypeShape:
         return self.reference + suffix
 
 
+def dictionary_get_safe(receiver: TypeShape, key: TypeShape | None) -> bool:
+    """Only builtin dictionaries with non-overloaded key protocols are queries."""
+    scalar_keys = _IMMUTABLE_SCALARS | {"NoneType"}
+    if key is None or key.reference.removeprefix("builtins.") not in scalar_keys:
+        return False
+    if receiver.reference == "dict_choice":
+        return bool(receiver.arguments) and all(dictionary_get_safe(value, key) for value in receiver.arguments)
+    if receiver.reference == "empty_dict":
+        return True
+    return (
+        receiver.reference in {"dict", "builtins.dict", "typing.Dict"}
+        and len(receiver.arguments) == 2
+        and receiver.arguments[0].reference.removeprefix("builtins.") in scalar_keys
+    )
+
+
 def annotation_type(node: ast.AST | None, resolve: Resolve) -> TypeShape | None:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         try:
@@ -473,8 +489,29 @@ class ContainerFlow:
                     env[name] = None
 
     def expression(self, node: ast.AST | None, env: dict[str, FlowValue | None]) -> FlowValue | None:
+        if isinstance(node, ast.Constant) and type(node.value).__name__ in _IMMUTABLE_SCALARS | {"NoneType"}:
+            shape = TypeShape(type(node.value).__name__)
+            return FlowValue(shape, (shape.render(),))
         if isinstance(node, ast.Name):
             return env.get(node.id)
+        if isinstance(node, ast.Dict):
+            keys, values = [], []
+            for key_node, value_node in zip(node.keys, node.values):
+                keys.append(self.expression(key_node, env))
+                values.append(self.expression(value_node, env))
+            if not node.keys:
+                return FlowValue(TypeShape("empty_dict"), ("unknown",))
+            key_shapes = {key.shape for key in keys if key is not None}
+            value_shapes = {value.shape for value in values if value is not None}
+            key_shape = next(iter(key_shapes)) if len(key_shapes) == 1 and all(keys) else TypeShape("unknown")
+            value_shape = next(iter(value_shapes)) if len(value_shapes) == 1 and all(values) else TypeShape("unknown")
+            for expression, value in zip(node.keys, keys):
+                if expression is not None and (
+                    value is None or value.shape.reference not in _IMMUTABLE_SCALARS | {"NoneType"}
+                ):
+                    self.invalidate(expression, env)
+            origins = frozenset(root for value in (*keys, *values) if value is not None for root in value.roots)
+            return FlowValue(TypeShape("dict", (key_shape, value_shape)), ("unknown",), origins)
         if isinstance(node, ast.Attribute):
             if ast.unparse(node) in self.instance_fields:
                 return env.get(ast.unparse(node))
@@ -503,9 +540,22 @@ class ContainerFlow:
             if isinstance(node.test, ast.Constant) and isinstance(node.test.value, bool):
                 return self.expression(node.body if node.test.value else node.orelse, env)
             left_env, right_env = dict(env), dict(env)
+            self.narrow_condition(node.test, left_env, right_env)
             left = self.expression(node.body, left_env)
             right = self.expression(node.orelse, right_env)
             env.update(self.join(left_env, right_env))
+            if (
+                left is not None
+                and right is not None
+                and all(
+                    value.shape.reference in {"dict", "builtins.dict", "typing.Dict", "empty_dict", "dict_choice"}
+                    for value in (left, right)
+                )
+                and left != right
+            ):
+                return FlowValue(
+                    TypeShape("dict_choice", (left.shape, right.shape)), ("unknown",), left.roots | right.roots
+                )
             return left if left == right else None
         if isinstance(node, ast.BoolOp):
             for operand in node.values:
@@ -550,6 +600,21 @@ class ContainerFlow:
                 return None
         if isinstance(node.func, ast.Attribute):
             receiver = self.receivers.get(id(node.func))
+            if (
+                receiver is not None
+                and node.func.attr == "get"
+                and not node.keywords
+                and len(node.args) in {1, 2}
+                and not any(isinstance(arg, ast.Starred) for arg in node.args)
+                and dictionary_get_safe(receiver.shape, arguments[0].shape if arguments[0] else None)
+            ):
+                default = arguments[1] if len(arguments) == 2 else None
+                if receiver.shape.reference == "empty_dict":
+                    return default
+                origins = receiver.roots | (default.roots if default is not None else frozenset())
+                # The result may be the mapping element or the supplied default.
+                # Retain both alias origins without inventing one historical path.
+                return FlowValue(TypeShape("unknown"), ("unknown",), origins)
             if (
                 receiver is not None
                 and node.func.attr in {"values", "keys", "items"}
@@ -643,7 +708,7 @@ class ContainerFlow:
                         return True
                     continue
                 left, right = dict(env), dict(env)
-                self.narrow_nonnull(statement.test, left, right)
+                self.narrow_condition(statement.test, left, right)
                 left_exits = self.statements(statement.body, left)
                 right_exits = self.statements(statement.orelse, right)
                 if left_exits and right_exits:
@@ -667,7 +732,7 @@ class ContainerFlow:
                 return True
             elif isinstance(statement, ast.Assert):
                 self.expression(statement.test, env)
-                self.narrow_nonnull(statement.test, env, dict(env))
+                self.narrow_condition(statement.test, env, dict(env))
                 # A message may execute when the assertion fails; that path
                 # does not continue to a following field read.
             else:
@@ -687,9 +752,23 @@ class ContainerFlow:
                             self.invalidate(argument, env)
         return False
 
-    def narrow_nonnull(
+    def narrow_condition(
         self, test: ast.AST, positive: dict[str, FlowValue | None], negative: dict[str, FlowValue | None]
     ) -> None:
+        if (
+            isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Name)
+            and self.class_reference(test.func.id) in {"isinstance", "builtins.isinstance"}
+            and len(test.args) == 2
+            and not test.keywords
+            and isinstance(test.args[0], ast.Name)
+            and ordinary_instance_target(test.args[1], self.class_reference, self.lookup)
+        ):
+            reference = self.class_reference(ast.unparse(test.args[1]))
+            value = positive.get(test.args[0].id)
+            if reference is not None and value is not None:
+                positive[test.args[0].id] = FlowValue(TypeShape(reference), (reference,), value.roots)
+            return
         if not (
             isinstance(test, ast.Compare)
             and len(test.ops) == 1

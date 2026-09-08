@@ -4,6 +4,21 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v2.14.0 - source-proven dictionary queries
+
+- Ordinary isinstance branches can narrow a receiver before a conditional
+  dictionary selection. Dictionary alternatives retain their alias origins.
+- Builtin dict get is read-only only with scalar query and stored key types.
+  Abstract mappings, custom dictionary subclasses, unknown key protocols and
+  unsupported argument binding remain barriers; a method name is not proof.
+- Query results retain both element and default origins. A non-unique return
+  path is opaque rather than borrowing a new-only result owner for old.
+- Dictionary literals retain borrowed values and source evaluation order.
+  Helper effects use the same key-protocol rule; mutating a query result still
+  invalidates the originating configuration.
+- Range schema 21 and call/attribute cache schemas 9/12 invalidate affected
+  discoveries. Full main2main, monkey-patch and local cache capabilities remain.
+
 ## range analyzer v2.13.0 - stored configuration parameter paths
 
 - Constructor parameter stores can seed self-held configuration paths, with
