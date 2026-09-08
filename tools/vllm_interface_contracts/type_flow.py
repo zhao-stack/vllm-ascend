@@ -33,9 +33,33 @@ TYPE_BUILTINS = frozenset(
         "len",
         "print",
         "range",
+        "isinstance",
     }
 )
 _IMMUTABLE_SCALARS = frozenset({"int", "str", "bool", "float", "bytes"})
+
+
+def ordinary_instance_target(
+    node: ast.AST, resolve: Resolve, lookup: Lookup, seen: frozenset[str] = frozenset()
+) -> bool:
+    """A custom metaclass may mutate an object during isinstance()."""
+    if isinstance(node, ast.Tuple):
+        return all(ordinary_instance_target(item, resolve, lookup, seen) for item in node.elts)
+    if not isinstance(node, (ast.Name, ast.Attribute)):
+        return False
+    reference = resolve(ast.unparse(node))
+    if reference is None or reference in seen:
+        return False
+    if reference.removeprefix("builtins.") in _IMMUTABLE_SCALARS | {"object", "list", "tuple", "dict", "set"}:
+        return True
+    source = lookup(reference)
+    if source is None or source.node.keywords:
+        return False
+    for decorator in source.node.decorator_list:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if source.resolve(ast.unparse(target)) != "dataclasses.dataclass":
+            return False
+    return all(ordinary_instance_target(base, source.resolve, lookup, seen | {reference}) for base in source.node.bases)
 
 
 @dataclass(frozen=True)
@@ -171,10 +195,28 @@ def resolve_type_path(path: tuple[str, ...], lookup: Lookup) -> TypeShape | None
 class FlowValue:
     shape: TypeShape
     path: tuple[str, ...]
+    origins: frozenset[str] = frozenset()
+
+    @property
+    def roots(self) -> frozenset[str]:
+        return self.origins or frozenset(self.path[:1])
 
     def step(self, step: str, lookup: Lookup) -> FlowValue | None:
         shape = type_step(self.shape, step, lookup)
-        return FlowValue(shape, (*self.path, step)) if shape is not None else None
+        if shape is not None:
+            return FlowValue(shape, (*self.path, step), self.origins)
+        return FlowValue(TypeShape("unknown"), ("unknown",), self.origins) if self.origins else None
+
+
+@dataclass(frozen=True)
+class HelperCallEffects:
+    safe_arguments: frozenset[int]
+    borrowed_arguments: frozenset[int]
+    return_shape: TypeShape | None
+    return_path: tuple[str, ...] | None
+
+
+HelperResolver = Callable[[ast.Call, tuple[FlowValue | None, ...]], HelperCallEffects | None]
 
 
 class ContainerFlow:
@@ -192,10 +234,12 @@ class ContainerFlow:
         lookup: Lookup,
         *,
         runtime_resolve: Resolve | None = None,
+        helper_resolve: HelperResolver | None = None,
     ):
         self.lookup = lookup
         self.resolve = resolve
         self.runtime_resolve = runtime_resolve or resolve
+        self.helper_resolve = helper_resolve
         self.receivers: dict[int, FlowValue] = {}
         self.blocked_builtins = {
             n.id for n in ast.walk(function) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
@@ -215,6 +259,11 @@ class ContainerFlow:
             name: left.get(name) if left.get(name) == right.get(name) else None for name in left.keys() | right.keys()
         }
 
+    def class_reference(self, expression: str) -> str | None:
+        if expression.split(".", 1)[0] in self.blocked_builtins:
+            return None
+        return self.runtime_resolve(expression)
+
     def bind(self, target: ast.AST, value: FlowValue | None, env: dict[str, FlowValue | None]) -> None:
         if isinstance(target, ast.Name):
             env[target.id] = value
@@ -232,7 +281,7 @@ class ContainerFlow:
         if value is not None:
             # Aliases and derived element bindings share the same origin.
             for name, candidate in list(env.items()):
-                if candidate is not None and candidate.path[0] == value.path[0]:
+                if candidate is not None and candidate.roots & value.roots:
                     env[name] = None
 
     def expression(self, node: ast.AST | None, env: dict[str, FlowValue | None]) -> FlowValue | None:
@@ -293,7 +342,21 @@ class ContainerFlow:
             resolved = self.runtime_resolve(node.func.id)
             if resolved in {"enumerate", "builtins.enumerate"} and len(arguments) == 1 and not node.keywords:
                 return arguments[0].step("enumerate", self.lookup) if arguments[0] else None
-            if resolved in {"len", "builtins.len", "print", "builtins.print", "range", "builtins.range"}:
+            if resolved in {
+                "len",
+                "builtins.len",
+                "print",
+                "builtins.print",
+                "range",
+                "builtins.range",
+            }:
+                return None
+            if (
+                resolved in {"isinstance", "builtins.isinstance"}
+                and len(node.args) == 2
+                and not node.keywords
+                and ordinary_instance_target(node.args[1], self.class_reference, self.lookup)
+            ):
                 return None
         if isinstance(node.func, ast.Attribute):
             receiver = self.receivers.get(id(node.func))
@@ -301,15 +364,33 @@ class ContainerFlow:
                 receiver is not None
                 and node.func.attr in {"values", "keys", "items"}
                 and not (node.args or node.keywords)
+                and type_step(receiver.shape, node.func.attr, self.lookup) is not None
             ):
                 return receiver.step(node.func.attr, self.lookup)
             self.invalidate(node.func.value, env)
-        for argument, value in zip([*node.args, *(kw.value for kw in node.keywords)], [*arguments, *keyword_arguments]):
+        values = (*arguments, *keyword_arguments)
+        effects = self.helper_resolve(node, values) if self.helper_resolve is not None else None
+        for index, (argument, value) in enumerate(zip([*node.args, *(kw.value for kw in node.keywords)], values)):
             # Passing an immutable field value does not expose its owning
             # object/container for mutation. Unknown and mutable values still
             # invalidate aliases; do not infer read-only effects from a name.
+            if effects is not None and index in effects.safe_arguments:
+                continue
             if value is None or value.shape.reference.removeprefix("builtins.") not in _IMMUTABLE_SCALARS:
                 self.invalidate(argument, env)
+        if effects is not None:
+            origins = frozenset(
+                root
+                for index in effects.borrowed_arguments
+                for value in (values[index],)
+                if value is not None
+                for root in value.roots
+            )
+            shape = effects.return_shape or TypeShape("unknown")
+            # Borrowed results need a source path that both snapshots can
+            # replay. A new-only inferred owner is not an old endpoint proof.
+            path = effects.return_path or (("unknown",) if origins else (shape.render(),))
+            return FlowValue(shape, path, origins)
         return None
 
     def comprehension(

@@ -44,7 +44,8 @@ from .generator import (
     _statements_must_terminate,
     _tag_guard_names,
 )
-from .type_flow import TYPE_BUILTINS, ContainerFlow, FlowValue
+from .helper_effects import HelperEffects, HelperSummary
+from .type_flow import TYPE_BUILTINS, ContainerFlow, FlowValue, HelperCallEffects, TypeShape
 
 
 @dataclass(frozen=True)
@@ -970,6 +971,77 @@ class _DirectDependencyResolver:
         self._instance_member_types: dict[tuple[str, str], frozenset[str] | None] = {}
         self._container_flows: dict[int, ContainerFlow] = {}
         self._annotation_namespaces: dict[tuple[int, str], AnnotationNamespace] = {}
+        self._helper_summaries: dict[tuple[str, tuple[tuple[str, TypeShape | None], ...]], HelperSummary] = {}
+
+    def _helper_call_effects(
+        self, call: ast.Call, values: tuple[FlowValue | None, ...], function: ast.AST, module: ModuleInfo
+    ) -> HelperCallEffects | None:
+        expression = _expression_name(call.func)
+        if not any(value is not None and any("vllm." in root for root in value.roots) for value in values):
+            return None
+        if expression is None or not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        if expression.split(".", 1)[0] in self._local_names(function):
+            return None
+        if any(isinstance(arg, ast.Starred) for arg in call.args) or any(kw.arg is None for kw in call.keywords):
+            return None
+        index = self.engine.downstream
+        reference = self._annotation_namespace(index, module).runtime(expression)
+        if reference is None or not reference.startswith("vllm_ascend."):
+            return None
+        info = index.find_callable(reference)
+        bindings = index.find_final_bindings(reference)
+        if (
+            info is None
+            or info.owner is not None
+            or not isinstance(info.node, ast.FunctionDef)
+            or info.node.decorator_list
+            or info.node.args.vararg
+            or info.node.args.kwarg
+            or len(bindings) != 1
+            or bindings[0].node is not info.node
+        ):
+            return None
+        signature = _inspect_signature(info.signature) if info.signature is not None else None
+        if signature is None:
+            return None
+        try:
+            bound = signature.bind(
+                *range(len(call.args)),
+                **{kw.arg: len(call.args) + offset for offset, kw in enumerate(call.keywords) if kw.arg is not None},
+            )
+        except TypeError:
+            return None
+        positions = {name: position for name, position in bound.arguments.items() if isinstance(position, int)}
+        shapes = {
+            name: value.shape if value is not None else None
+            for name, position in positions.items()
+            for value in (values[position],)
+        }
+        key = (reference, tuple(sorted(shapes.items())))
+        if key not in self._helper_summaries:
+            helper_module = index.modules[info.module]
+            namespace = self._annotation_namespace(index, helper_module)
+
+            def resolve(name: str) -> str | None:
+                if name in TYPE_BUILTINS and not index.find_final_bindings(f"{info.module}.{name}"):
+                    return name
+                return namespace.runtime(name)
+
+            self._helper_summaries[key] = HelperEffects(info.node, shapes, resolve, self._type_source).summary
+        summary = self._helper_summaries[key]
+        mutated_return = bool(summary.returned & summary.unsafe)
+        return_path = None
+        if not mutated_return and summary.return_path is not None and summary.return_path[0] in positions:
+            value = values[positions[summary.return_path[0]]]
+            if value is not None:
+                return_path = (*value.path, *summary.return_path[1:])
+        return HelperCallEffects(
+            frozenset(position for name, position in positions.items() if name not in summary.unsafe),
+            frozenset(position for name, position in positions.items() if name in summary.returned),
+            None if mutated_return else summary.return_shape,
+            return_path,
+        )
 
     def _annotation_namespace(self, index: RepositoryIndex, module: ModuleInfo) -> AnnotationNamespace:
         key = (id(index), module.name)
@@ -1018,7 +1090,13 @@ class _DirectDependencyResolver:
                     return expression
                 return namespace.runtime(expression, function.lineno)
 
-            self._container_flows[key] = ContainerFlow(function, resolve, self._type_source, runtime_resolve=runtime)
+            self._container_flows[key] = ContainerFlow(
+                function,
+                resolve,
+                self._type_source,
+                runtime_resolve=runtime,
+                helper_resolve=lambda call, values: self._helper_call_effects(call, values, function, module),
+            )
         value = self._container_flows[key].receivers.get(id(member))
         if value is None or len(value.path) < 2 or not value.shape.reference.startswith("vllm."):
             return None

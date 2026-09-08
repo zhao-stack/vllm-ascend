@@ -4,6 +4,23 @@ This log records why each generator iteration changed, the boundary case it
 handles, and the evidence used to decide whether a result is a source risk or a
 generator problem.
 
+## range analyzer v2.12.0 - source-derived helper parameter effects
+
+- Uniquely bound, ordinary downstream helpers can preserve container type paths
+  for parameters proven read-only by source. Exact positional/keyword binding
+  keeps effects of separate parameters distinct; names are not a whitelist.
+- Effects follow aliases, loop joins, stored annotated fields, narrowed
+  isinstance branches and fresh containers. Unknown calls, descriptors,
+  mutations, external stores and unsupported control flow remain barriers.
+- Returned aliases retain their source origins, including references embedded
+  in a fresh dictionary/list. Mutating a borrowed result invalidates the source
+  type path rather than silently reusing stale parameter evidence.
+- Only proven container views are treated as read-only. Unknown return objects
+  cannot acquire dictionary semantics from a method name alone.
+- Range schema 19 and call/attribute cache schemas 6/9 invalidate the affected
+  discoveries. Self-held config and append-built container provenance still
+  need follow-up; this change is not a claim of complete PR field coverage.
+
 ## range analyzer v2.11.0 - annotation namespaces and scalar arguments
 
 - Type evidence can follow proven TYPE_CHECKING imports without installing
