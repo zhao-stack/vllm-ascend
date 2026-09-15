@@ -16,6 +16,8 @@ import sys
 import time
 from pathlib import Path
 
+from qa_markdown import render_qa
+
 REPORT_FILES = (
     "main2main-range-report.json",
     "main2main-range-report.md",
@@ -73,6 +75,18 @@ def prepare(args: argparse.Namespace) -> None:
     engine_tree = git(roots["engine_root"], "rev-parse", "HEAD:tools/vllm_interface_contracts")
     marker = roots["ascend_root"] / ".github/vllm-main-verified.commit"
     marker_value = marker.read_text(encoding="utf-8").strip() if marker.exists() else None
+    if marker_value != args.old:
+        raise ValueError("Resolved old SHA does not match the selected Ascend marker")
+    resolution = {}
+    if args.resolved_range:
+        resolution = json.loads(args.resolved_range.read_text(encoding="utf-8"))
+        for key, expected in (
+            ("vllm_old_sha", args.old),
+            ("vllm_new_sha", args.new),
+            ("vllm_ascend_sha", args.ascend_sha),
+        ):
+            if resolution.get(key) != expected:
+                raise ValueError(f"Resolved workflow range mismatch: {key}")
     identity = {
         "schema_version": 1,
         "engine_sha": args.engine_sha,
@@ -93,7 +107,8 @@ def prepare(args: argparse.Namespace) -> None:
         "cache_key": cache_key(identity),
         "roots": {name: str(root) for name, root in roots.items()},
         "baseline_marker": marker_value,
-        "range_mode": "marker" if marker_value == args.old else "explicit_historical_replay",
+        "range_mode": "marker",
+        "resolution": resolution,
         "qa": {"status": "disabled", "model_calls": 0},
     }
     json_write(output / "run-metadata.json", metadata)
@@ -114,7 +129,15 @@ def verify_report(directory: Path, inputs: dict) -> dict:
         if metadata.get(key) != inputs[key]:
             raise ValueError(f"Report input mismatch: {key}")
     capabilities = metadata["analysis_plan"]["capabilities"]
-    for capability in ("monkey_patch", "override", "direct_import", "direct_call", "inheritance_mro"):
+    for capability in (
+        "monkey_patch",
+        "override",
+        "direct_import",
+        "direct_call",
+        "inheritance_mro",
+        "direct_attribute",
+        "inherited_state",
+    ):
         if capabilities[capability]["state"] != "analyzed":
             raise ValueError(f"Required main2main capability not analyzed: {capability}")
     if not isinstance(report.get("findings"), list) or not isinstance(report.get("summary"), dict):
@@ -139,6 +162,26 @@ def scan(args: argparse.Namespace) -> None:
     roots = {name: Path(value) for name, value in metadata["roots"].items()}
     for name, key in (("engine_root", "engine_sha"), ("vllm_root", "vllm_new_sha"), ("ascend_root", "vllm_ascend_sha")):
         clean_head(roots[name], inputs[key])
+    if inputs["vllm_old_sha"] == inputs["vllm_new_sha"]:
+        message = (
+            "# Main2Main QA 审阅材料\n\n无需升级：选定 Ascend marker 与 vLLM 目标一致。\n\n"
+            f"vLLM：`{inputs['vllm_new_sha']}`\n\n"
+            f"Ascend：`{inputs['vllm_ascend_sha']}`\n\n"
+            "扫描未启动；QA 未调用，模型调用为 0。\n"
+        )
+        (output / "qa-review.md").write_text(message, encoding="utf-8")
+        (output / "summary.md").write_text(message, encoding="utf-8")
+        json_write(
+            output / "run-status.json",
+            {
+                "scan": "skipped_no_changes",
+                "qa": "disabled",
+                "model_calls": 0,
+                "source_unchanged": True,
+                "qa_input": "qa-review.md",
+            },
+        )
+        return
     cache = args.cache_dir.resolve()
     if cache == output or cache in output.parents or output in cache.parents:
         raise ValueError("Cache and output must be separate directories")
@@ -227,7 +270,7 @@ def scan(args: argparse.Namespace) -> None:
         cache_status=cache_status,
         elapsed_seconds=round(time.monotonic() - start, 3),
         capabilities=report["metadata"]["analysis_plan"]["capabilities"],
-        phase_timings=report["metadata"].get("timings_seconds", {}),
+        phase_timings=report["metadata"].get("stage_timings_seconds", report["metadata"].get("timings_seconds", {})),
     )
     json_write(output / "run-metadata.json", metadata)
     json_write(
@@ -239,22 +282,11 @@ def scan(args: argparse.Namespace) -> None:
             "cache_status": cache_status,
             "summary": report["summary"],
             "source_unchanged": True,
+            "qa_input": "qa-review.md",
         },
     )
-    findings = report["findings"]
-    json_write(
-        output / "qa-input.json",
-        {
-            "schema_version": 1,
-            "status": "prepared_not_executed",
-            "inputs": inputs,
-            "report_path": "report/" + REPORT_FILES[0],
-            "findings": findings,
-            "review_instruction": (
-                "Read-only review: confirm, reject, or mark insufficient evidence "
-                "using pinned source. Do not adapt code."
-            ),
-        },
+    (output / "qa-review.md").write_text(
+        render_qa(report, inputs, roots, metadata.get("resolution", {})), encoding="utf-8"
     )
     summary = (
         "# Main2Main interface gray scan\n\n"
@@ -265,7 +297,8 @@ def scan(args: argparse.Namespace) -> None:
         f"- Ascend baseline: `{inputs['vllm_ascend_sha']}`\n"
         f"- Engine: `{inputs['engine_sha']}`\n"
         f"- Summary: `{json.dumps(report['summary'], ensure_ascii=False)}`\n\n"
-        "QA input is prepared, but no QA verdict has been produced. Download the artifact for complete evidence.\n"
+        "QA input: qa-review.md (single Markdown). No QA verdict has been produced. "
+        "Internal diagnostics are uploaded separately.\n"
     )
     (output / "summary.md").write_text(summary, encoding="utf-8")
     if args.github_output:
@@ -282,6 +315,7 @@ def main() -> int:
         setup.add_argument("--" + name, type=Path, required=True)
     for name in ("engine-sha", "old", "new", "ascend-sha"):
         setup.add_argument("--" + name, required=True)
+    setup.add_argument("--resolved-range", type=Path)
     execute = subparsers.add_parser("scan")
     execute.add_argument("--cache-dir", type=Path, required=True)
     execute.add_argument("--force-rescan", action="store_true")

@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from resolve import resolve_range
 from run import cache_key, git
 
 
@@ -113,7 +114,13 @@ class GrayTests(unittest.TestCase):
         self.invoke("scan", "--cache-dir", self.cache, "--force-rescan")
         self.assertEqual(self.status()["cache_status"], "bypassed")
         self.assertEqual(self.status()["model_calls"], 0)
-        self.assertEqual(json.loads((self.output / "qa-input.json").read_text())["status"], "prepared_not_executed")
+        qa = (self.output / "qa-review.md").read_text(encoding="utf-8")
+        self.assertIn("prepared_not_executed", qa)
+        self.assertIn("required", qa)
+        self.assertIn(f"/blob/{self.old}/vllm/api.py", qa)
+        self.assertIn(f"/blob/{self.new}/vllm/api.py", qa)
+        self.assertIn("QA 结论", qa)
+        self.assertFalse((self.output / "qa-input.json").exists())
 
     def test_fixed_snapshot_invalidates_cache(self):
         self.prepare()
@@ -136,6 +143,69 @@ class GrayTests(unittest.TestCase):
         (self.down / "vllm_ascend/untracked.py").unlink()
         self.old = "not-a-sha"
         self.prepare(success=False)
+
+    def test_resolve_marker_target_and_empty_range(self):
+        resolved = resolve_range(self.up, self.down)
+        self.assertEqual(resolved["vllm_old_sha"], self.old)
+        self.assertEqual(resolved["vllm_new_sha"], self.new)
+        with self.assertRaises(ValueError):
+            resolve_range(self.up, self.down, self.old)
+        self.write(self.down, ".github/vllm-main-verified.commit", self.new + "\n")
+        self.ascend = self.commit(self.down)
+        self.assertFalse(resolve_range(self.up, self.down)["has_changes"])
+        self.prepare(success=False)  # caller cannot override the selected marker
+        self.old = self.new
+        self.prepare()
+        self.invoke("scan", "--cache-dir", self.cache)
+        self.assertEqual(self.status()["scan"], "skipped_no_changes")
+        self.assertFalse((self.output / "scan.log").exists())
+        self.assertFalse(self.cache.exists())
+
+    def test_missing_marker_and_nonancestor_fail(self):
+        (self.down / ".github/vllm-main-verified.commit").unlink()
+        self.commit(self.down)
+        with self.assertRaises(subprocess.CalledProcessError):
+            resolve_range(self.up, self.down)
+        self.write(self.down, ".github/vllm-main-verified.commit", self.new + "\n")
+        self.commit(self.down)
+        git(self.up, "checkout", "--detach", self.old)
+        with self.assertRaises(subprocess.CalledProcessError):
+            resolve_range(self.up, self.down)
+
+    def test_fork_baseline_and_rebase(self):
+        fork = self.root / "fork"
+        subprocess.run(["git", "clone", str(self.down), str(fork)], check=True, capture_output=True)
+        git(fork, "config", "user.name", "Gray Test")
+        git(fork, "config", "user.email", "gray@example.invalid")
+        self.assertEqual(resolve_range(self.up, self.down, baseline_url=str(fork))["source_mode"], "fresh")
+        git(fork, "checkout", "-b", "main2main_baseline")
+        self.write(fork, "adapted.txt", "prior adaptation\n")
+        self.commit(fork)
+        self.write(self.down, "main.txt", "upstream update\n")
+        source = self.commit(self.down)
+        first = resolve_range(self.up, self.down, baseline_url=str(fork))
+        self.assertEqual(first["source_mode"], "incremental_rebased")
+        self.assertTrue((self.down / "adapted.txt").exists())
+        self.assertTrue((self.down / "main.txt").exists())
+        git(self.down, "checkout", "--detach", source)
+        second = resolve_range(self.up, self.down, baseline_url=str(fork))
+        self.assertEqual(first["vllm_ascend_sha"], second["vllm_ascend_sha"])
+
+        # An explicitly requested target already covered by the baseline uses main.
+        self.write(fork, ".github/vllm-main-verified.commit", self.new + "\n")
+        self.commit(fork)
+        git(self.down, "checkout", "--detach", source)
+        result = resolve_range(self.up, self.down, self.new, str(fork))
+        self.assertEqual(result["fallback_reason"], "explicit_target_at_or_before_baseline")
+        self.assertEqual(result["vllm_ascend_sha"], source)
+
+        # Conflicting prior adaptation must be aborted before selecting fresh main.
+        self.write(fork, "main.txt", "conflicting prior adaptation\n")
+        self.commit(fork)
+        result = resolve_range(self.up, self.down, baseline_url=str(fork))
+        self.assertEqual(result["fallback_reason"], "baseline_rebase_conflict")
+        self.assertEqual(result["vllm_ascend_sha"], source)
+        self.assertFalse(git(self.down, "status", "--porcelain"))
 
     def test_fingerprint_changes(self):
         self.prepare()

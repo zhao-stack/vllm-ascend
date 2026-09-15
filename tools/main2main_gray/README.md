@@ -1,59 +1,78 @@
 # Main2Main interface gray test
 
-This is the first, **QA-disabled** stage of the fork-only experiment. It runs the
-complete source analyzer and prepares a QA handoff file, but makes zero model calls.
-It does not run kickoff, adapt code, update markers, execute NPU tests, create PRs,
-or write the adaptation baseline. The production workflows are unchanged.
+The fork-only manual workflow resolves an upgrade range, runs the pinned complete
+source analyzer and publishes one `qa-review.md` for read-only QA. QA is disabled:
+there are no model calls, adaptation, NPU jobs, marker updates or upstream PRs.
 
-## Run manually
+## Inputs and version ownership
 
-In `zhao-stack/vllm-ascend`, open **Actions → Main2Main Interface Gray (CPU, QA off)**
-and choose branch `codex/main2main-interface-gray`. The default branch only contains
-a launcher notice so GitHub exposes the dispatch button.
+Run `Main2Main Interface Gray (CPU, QA off)` on branch
+`codex/main2main-interface-gray` in `zhao-stack/vllm-ascend`.
 
-The defaults replay the PR13477 historical range against its pre-adaptation Ascend
-baseline. Explicit old/new values are historical replay inputs, not a request to
-advance the verified marker. All commit inputs must be full lowercase SHAs.
+- `target_commit`: optional full vLLM SHA. Empty checks out main once and freezes HEAD.
+- `ascend_source_sha`: optional historical Ascend SHA. Empty starts from upstream
+  main and checks this personal fork's `main2main_baseline` ref.
+- `engine_sha`: exact full-engine snapshot commit, currently v2.34.0.
+- `force_rescan`: bypass verified report reuse.
+- `cache_generation`: increment to replace an immutable bad cache.
 
-The complete engine is pinned in the separate `codex/main2main-gray-engine` branch.
-That branch snapshots the existing clean local engine for reproducible testing;
-it is **not** the final upstream shared-engine integration. QA wiring and the
-reconciliation with the current upstream engine remain later implementation steps.
+There is no independently supplied old SHA. `resolve.py` reads old from the selected
+Ascend snapshot's `.github/vllm-main-verified.commit`; new is the frozen vLLM HEAD.
+The resolved SHAs are workflow outputs and are cross-checked by `run.py prepare`.
+Missing markers, inconsistent inputs and non-ancestor ranges fail. Equal endpoints
+produce a no-upgrade Markdown without invoking the analyzer or caching a report.
 
-The runner is GitHub-hosted `ubuntu-24.04`. No upstream/self-hosted runner or model
-secret is used. Fork-only commits include `[skip ci]` to avoid triggering inherited
-push CI; this does not suppress the explicit manual dispatch.
+With no historical Ascend override, the resolver follows the production source
+selection pattern: try the personal fork's accumulated baseline, rebase it onto
+frozen upstream main, and use fresh main if the baseline is missing, an explicit
+target is at/before the baseline, or the rebase conflicts. Rebase is confined to
+the disposable runner checkout. Its committer dates are deterministic for reuse.
+Network/history errors fail rather than silently discarding adaptation state.
+The production flow also supports legacy conf.py markers; this gray wrapper
+requires the current marker file. It does not invoke or modify production kickoff.
 
-## Cache and outputs
+For the existing PR13477 replay, specify only:
 
-Report reuse requires exact old/new, Ascend baseline, engine commit/tree, wrapper
-content, Python minor version, scenario/profile and worker configuration. Each
-cached file has a checksum and report metadata is checked again before reuse.
-External roots are not supported by this first runner; their explicit empty set is
-recorded. Dependencies requiring unavailable external source retain the engine's
-unresolved semantics.
+- `target_commit=beca88e59ea75a7aa1af72a5ae50188fa91d4e3d`
+- `ascend_source_sha=61cfd1fc6a79ae139a3c5bdb8051ba7edb9c022e`
 
-Only JSON, Markdown and CSV reports are cached. The engine runs with `--no-cache`,
-so no persistent pickle/index data is restored. A successful second identical run
-must report `cache_status=hit` and must not create a new `scan.log`.
+The workflow derives old `0351e9aa1fdf1a51329d1906881528dfe61fc88e` from that marker.
 
-`force_rescan` bypasses reuse. GitHub caches are immutable: increment
-`cache_generation` to replace a bad or intentionally refreshed entry. A corrupt
-cache is rejected and scanned again; it never yields a successful cache hit.
-Concurrent dispatches on the same branch are serialized by Actions; queued runs
-follow GitHub's normal concurrency behavior, not an exactly-once guarantee.
+## QA and internal outputs
 
-Artifacts include run metadata/status, four engine reports, scan logs when the
-engine ran, and `qa-input.json` with `status=prepared_not_executed`. A successful scan
-can contain introduced breaks; these are findings, not execution failures. Invalid
-inputs, dirty sources, incomplete output or analyzer failures fail the job.
+The `main2main-qa-review-<run>-<attempt>` artifact contains exactly `qa-review.md`.
+It groups introduced breaks by root cause, includes pinned source locations and
+short source excerpts, and separately includes unresolved findings whose
+`contract_changed` gate is true. Other unresolved findings, warnings and preexisting
+issues are explicitly counted but not expanded. This is a focused upgrade review,
+not a claim that all unresolved findings have been cleared. QA should return
+confirm/reject/insufficient-evidence per root without adapting code.
 
-## Local integration checks
+For rebased local Ascend commits, the Markdown includes source excerpts and commit
+identities instead of inaccessible GitHub links. Original reports and run metadata
+remain in the separate internal diagnostic artifact for auditing and cache checks.
+No `qa-input.json` is produced. QA has not actually run.
+
+## Scan and cache
+
+The engine runs full main2main / exact-contracts, workers 1/1, with `--no-cache`.
+Only four JSON/Markdown/CSV report files are cached. Reuse requires identical
+source SHAs, engine commit/tree, wrapper hash, Python minor version and settings;
+file checksums and capability coverage are verified before reuse. `qa-review.md`
+is regenerated from the verified report and pinned source on every run.
+
+The GitHub-hosted Ubuntu CPU job uploads artifacts after execution. Incompatible
+findings are report content, not workflow failure; execution and validation
+failures fail the job. This temporary engine snapshot is not the final upstream
+shared-engine integration. Commits use `[skip ci]` and only this workflow is
+manually dispatched in the fork.
+
+## Local verification
 
 ```bash
-python -B tools/main2main_gray/test_run.py --engine-root /path/to/pinned-engine -v
+python -B tools/main2main_gray/test_run.py --engine-root /path/to/pinned-engine
 ```
 
-These use tiny real Git repositories and the real analyzer to check an introduced
-call break, a fixed downstream snapshot, verified report reuse, corrupt cache
-recovery, force rescan, input invalidation and invalid/dirty checkout failures.
+Tests cover actual contract changes, cache reuse/corruption/force, changed Ascend
+snapshots, dirty/invalid sources, marker-derived ranges, frozen target validation,
+empty/non-ancestor ranges, accumulated baseline selection and deterministic rebase.

@@ -1,21 +1,17 @@
 name: Main2Main Interface Gray (CPU, QA off)
-run-name: Interface gray ${{ inputs.vllm_new_sha }} / cache ${{ inputs.cache_generation }}
+run-name: Interface gray ${{ inputs.target_commit }} / cache ${{ inputs.cache_generation }}
 
 on:
   workflow_dispatch:
     inputs:
-      vllm_old_sha:
-        description: Exact old vLLM SHA (historical replay)
-        required: true
-        default: '0351e9aa1fdf1a51329d1906881528dfe61fc88e'
-      vllm_new_sha:
-        description: Exact new vLLM SHA
-        required: true
-        default: 'beca88e59ea75a7aa1af72a5ae50188fa91d4e3d'
-      ascend_baseline_sha:
-        description: Exact pre-adaptation Ascend SHA
-        required: true
-        default: '61cfd1fc6a79ae139a3c5bdb8051ba7edb9c022e'
+      target_commit:
+        description: Target vLLM full SHA; empty selects main once
+        required: false
+        default: ''
+      ascend_source_sha:
+        description: Optional historical Ascend SHA; empty resolves main and fork baseline
+        required: false
+        default: ''
       engine_sha:
         description: Exact complete-engine commit in this fork
         required: true
@@ -47,15 +43,15 @@ jobs:
     steps:
       - name: Validate dispatch inputs
         env:
-          OLD_SHA: ${{ inputs.vllm_old_sha }}
-          NEW_SHA: ${{ inputs.vllm_new_sha }}
-          ASCEND_SHA: ${{ inputs.ascend_baseline_sha }}
+          TARGET_SHA: ${{ inputs.target_commit }}
+          ASCEND_SHA: ${{ inputs.ascend_source_sha }}
           ENGINE_SHA: ${{ inputs.engine_sha }}
           CACHE_GENERATION: ${{ inputs.cache_generation }}
         run: |
           set -euo pipefail
-          for value in "$OLD_SHA" "$NEW_SHA" "$ASCEND_SHA" "$ENGINE_SHA"; do
-            [[ "$value" =~ ^[0-9a-f]{40}$ ]] || { echo 'Expected full commit SHA'; exit 1; }
+          [[ "$ENGINE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          for value in "$TARGET_SHA" "$ASCEND_SHA"; do
+            [[ -z "$value" || "$value" =~ ^[0-9a-f]{40}$ ]] || exit 1
           done
           [[ "$CACHE_GENERATION" =~ ^[0-9]+$ ]] || exit 1
 
@@ -78,7 +74,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: vllm-project/vllm
-          ref: ${{ inputs.vllm_new_sha }}
+          ref: ${{ inputs.target_commit || 'main' }}
           path: vllm-source
           fetch-depth: 0
           filter: blob:none
@@ -88,8 +84,9 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: vllm-project/vllm-ascend
-          ref: ${{ inputs.ascend_baseline_sha }}
+          ref: ${{ inputs.ascend_source_sha || 'main' }}
           path: ascend-source
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python (no runtime packages)
@@ -97,23 +94,40 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Verify sources and compute report fingerprint
+      - name: Resolve source and freeze upgrade range
+        id: range
+        env:
+          TARGET_SHA: ${{ inputs.target_commit }}
+          ASCEND_SHA: ${{ inputs.ascend_source_sha }}
+          GRAY_REPOSITORY: ${{ github.repository }}
+        run: |
+          args=()
+          if [[ -z "$ASCEND_SHA" ]]; then
+            args+=(--baseline-url "https://github.com/${GRAY_REPOSITORY}.git")
+          fi
+          python -B gray-code/tools/main2main_gray/resolve.py \
+            --vllm-root vllm-source --ascend-root ascend-source \
+            --target "$TARGET_SHA" --output output/resolved-range.json \
+            --github-output "$GITHUB_OUTPUT" "${args[@]}"
+
+      - name: Verify frozen sources and compute report fingerprint
         id: inputs
         env:
-          OLD_SHA: ${{ inputs.vllm_old_sha }}
-          NEW_SHA: ${{ inputs.vllm_new_sha }}
-          ASCEND_SHA: ${{ inputs.ascend_baseline_sha }}
+          OLD_SHA: ${{ steps.range.outputs.vllm_old_sha }}
+          NEW_SHA: ${{ steps.range.outputs.vllm_new_sha }}
+          ASCEND_SHA: ${{ steps.range.outputs.vllm_ascend_sha }}
           ENGINE_SHA: ${{ inputs.engine_sha }}
         run: |
           python -B gray-code/tools/main2main_gray/run.py prepare \
             --engine-root engine --engine-sha "$ENGINE_SHA" \
             --vllm-root vllm-source --old "$OLD_SHA" --new "$NEW_SHA" \
             --ascend-root ascend-source --ascend-sha "$ASCEND_SHA" \
+            --resolved-range output/resolved-range.json \
             --output output --github-output "$GITHUB_OUTPUT"
 
       - name: Restore exact report cache
         id: cache
-        if: ${{ !inputs.force_rescan }}
+        if: ${{ steps.range.outputs.has_changes == 'true' && !inputs.force_rescan }}
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: report-cache
@@ -131,7 +145,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT" "${args[@]}"
 
       - name: Save successful report cache
-        if: ${{ success() && steps.cache.outputs.cache-hit != 'true' }}
+        if: ${{ success() && steps.range.outputs.has_changes == 'true' && steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: report-cache
@@ -147,11 +161,22 @@ jobs:
             if [[ -f output/run-status.json ]]; then cat output/run-status.json; fi
           fi
 
-      - name: Upload scan and QA handoff evidence
+      - name: Upload single Markdown for QA
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: main2main-qa-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/qa-review.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload internal scan diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: main2main-interface-gray-${{ github.run_id }}-${{ github.run_attempt }}
-          path: output/
+          path: |
+            output/
+            !output/qa-review.md
           if-no-files-found: warn
           retention-days: 14
