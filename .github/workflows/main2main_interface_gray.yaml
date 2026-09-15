@@ -1,0 +1,49 @@
+name: Main2Main Interface Gray (CPU, QA off)
+run-name: Interface gray ${{ inputs.vllm_new_sha }} / cache ${{ inputs.cache_generation }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_old_sha:
+        description: Exact old vLLM SHA (historical replay)
+        required: true
+        default: '0351e9aa1fdf1a51329d1906881528dfe61fc88e'
+      vllm_new_sha:
+        description: Exact new vLLM SHA
+        required: true
+        default: 'beca88e59ea75a7aa1af72a5ae50188fa91d4e3d'
+      ascend_baseline_sha:
+        description: Exact pre-adaptation Ascend SHA
+        required: true
+        default: '61cfd1fc6a79ae139a3c5bdb8051ba7edb9c022e'
+      engine_sha:
+        description: Exact complete-engine commit in this fork
+        required: true
+        default: '349ebcae3df8125d512e4393926b82cd66c543f4'
+      force_rescan:
+        description: Bypass report reuse for this run
+        type: boolean
+        default: false
+      cache_generation:
+        description: Increment to replace an immutable bad cache
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main2main-interface-gray-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  choose-test-branch:
+    if: github.repository == 'zhao-stack/vllm-ascend'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Select the gray implementation branch
+        run: |
+          echo 'Run this workflow on branch codex/main2main-interface-gray.'
+          echo 'The default branch contains only this manual launcher.'
+          exit 1
