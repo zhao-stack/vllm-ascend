@@ -19,7 +19,7 @@ on:
       engine_sha:
         description: Exact complete-engine commit in this fork
         required: true
-        default: '349ebcae3df8125d512e4393926b82cd66c543f4'
+        default: '0b2d7f1adb822977ac8e8466e3a101e928bd86ba'
       force_rescan:
         description: Bypass report reuse for this run
         type: boolean
