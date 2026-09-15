@@ -28,6 +28,7 @@ import os
 import pickle
 import platform
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -40,6 +41,25 @@ CACHE_SCHEMA_VERSION = 4
 _CACHE_MAGIC = "vllm-interface-contracts-private-pickle"
 _LOCK_WAIT_SECONDS = 30.0
 _STALE_LOCK_SECONDS = 600.0
+
+
+def require_private_cache_path(path: Path) -> None:
+    """Reject observed links/reparse points before accessing trusted cache data.
+
+    This is a path-boundary check, not a sandbox against concurrent malicious
+    directory replacement. Cache parents must remain private to the user.
+    A pickle envelope is not authentication; never import untrusted caches.
+    """
+    absolute = Path(os.path.abspath(path))
+    for candidate in (*reversed(absolute.parents), absolute):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError(f"unsafe cache path: linked or reparse-point entry {candidate}")
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            raise OSError(f"unsafe cache path: hard-linked file {candidate}")
 
 
 def default_cache_dir() -> Path:
@@ -184,6 +204,14 @@ class PersistentCache:
         key, path = self._entry_path(component, identity)
         result = CacheResult(component, True, "miss", commit_sha=commit, key=key, path=str(path))
         started = time.perf_counter()
+        try:
+            require_private_cache_path(path)
+        except OSError as error:
+            result.status = "bypassed"
+            result.reason = str(error)
+            result.load_seconds = time.perf_counter() - started
+            self.events.append(result)
+            return None, result
         if path.is_file():
             try:
                 with path.open("rb") as stream:
@@ -207,6 +235,7 @@ class PersistentCache:
                 result.status = "corrupt"
                 result.reason = f"{type(error).__name__}: {error}"
                 with contextlib.suppress(OSError):
+                    require_private_cache_path(path)
                     path.unlink()
         result.load_seconds = time.perf_counter() - started
         self.events.append(result)
@@ -218,6 +247,7 @@ class PersistentCache:
         deadline = time.monotonic() + _LOCK_WAIT_SECONDS
         acquired = False
         while time.monotonic() < deadline:
+            require_private_cache_path(lock)
             try:
                 descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 os.close(descriptor)
@@ -234,6 +264,7 @@ class PersistentCache:
         finally:
             if acquired:
                 with contextlib.suppress(OSError):
+                    require_private_cache_path(lock)
                     lock.unlink()
 
     def store(
@@ -253,7 +284,9 @@ class PersistentCache:
         started = time.perf_counter()
         temporary_path: Path | None = None
         try:
+            require_private_cache_path(path)
             path.parent.mkdir(parents=True, exist_ok=True)
+            require_private_cache_path(path)
             with self._write_lock(path) as acquired:
                 if not acquired:
                     current.status = "write_skipped"
@@ -279,6 +312,7 @@ class PersistentCache:
                     )
                     stream.flush()
                     os.fsync(stream.fileno())
+                require_private_cache_path(path)
                 os.replace(temporary_path, path)
                 temporary_path = None
                 if current.status == "corrupt":
@@ -289,6 +323,7 @@ class PersistentCache:
         finally:
             if temporary_path is not None:
                 with contextlib.suppress(OSError):
+                    require_private_cache_path(temporary_path)
                     temporary_path.unlink()
             current.write_seconds = time.perf_counter() - started
         return current
@@ -296,10 +331,16 @@ class PersistentCache:
     def clear(self) -> bool:
         """Remove only the configured analyzer-owned cache directory."""
 
-        if self.root is None or not self.root.exists():
+        if not self.enabled or self.root is None:
+            return False
+        require_private_cache_path(self.root)
+        if not self.root.exists():
             return False
         marker_parts = {CACHE_NAMESPACE, f"schema-{CACHE_SCHEMA_VERSION}"}
         if not marker_parts.intersection(self.root.parts):
             raise ValueError("refusing to clear a cache directory outside the analyzer namespace")
+        for directory, folders, files in os.walk(self.root, followlinks=False):
+            for name in (*folders, *files):
+                require_private_cache_path(Path(directory) / name)
         shutil.rmtree(self.root)
         return True

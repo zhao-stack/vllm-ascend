@@ -30,14 +30,17 @@ import os
 import posixpath
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from contextlib import ExitStack, suppress
+from dataclasses import asdict, dataclass, replace
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 from .analysis_plans import (
     MAIN2MAIN_SCENARIO,
@@ -47,6 +50,7 @@ from .analysis_plans import (
 from .annotation_names import AnnotationNamespace
 from .cache import CacheResult, PersistentCache, build_identity, git_source_state, normalized_repo_path
 from .call_contracts import (
+    MAX_FACTORY_RETURN_DEPTH,
     CallShape,
     DirectAttributeDependency,
     DirectAttributeDetector,
@@ -55,6 +59,7 @@ from .call_contracts import (
     ReturnContract,
     ReturnShape,
     _attribute_is_read,
+    _DirectDependencyResolver,
     _parents,
     _under_attribute_fallback,
     bind_call_shape,
@@ -65,7 +70,9 @@ from .call_contracts import (
     return_use_compatible,
 )
 from .condition_contracts import conditional_state_evidence
-from .dataclass_contracts import ClassSource, dataclass_layout
+from .construction_effects import construction_effects, has_construction_effect, has_storage_effect
+from .dataclass_contracts import ClassSource, dataclass_layout, dataclass_replacement, dataclass_storage
+from .factory_returns import factory_body_supported, proven_factory_return
 from .generator import (
     _KNOWN_TRANSPARENT_SIGNATURE_DECORATORS,
     _KNOWN_WRAPS_SIGNATURE_DECORATORS,
@@ -78,32 +85,48 @@ from .generator import (
     InterfaceBoundaryGenerator,
     Relation,
     RelationEvidence,
+    RepositoryIndex,
     SignatureContract,
     _accepts_signature_contract,
     _expression_name,
     _function_local_names,
     _function_scope_nodes,
     _import_binding_reference,
+    _inspect_signature,
     _jsonable_signature,
     _scope_final_bindings,
+    _ScopeBinding,
     _statements_must_terminate,
     _tag_guard_names,
 )
+from .method_context import FactoryCallProof, MethodContextLookup, MethodProof, method_body_hash
 from .models import (
     CompatibilityState,
     RangeFinding,
     SourceEndpoint,
 )
 from .module_attributes import ModuleGetattrContract, module_getattr_contract, runtime_module_body
-from .type_flow import TYPE_BUILTINS, resolve_type_path
+from .patch_consumers import patch_consumer_findings
+from .source_facts import SourceFacts
+from .type_flow import (
+    TYPE_BUILTINS,
+    ContainerFlow,
+    FlowValue,
+    HelperCallEffects,
+    Lookup,
+    TypeShape,
+    method_path_proofs,
+    resolve_flow_path,
+)
 
-RANGE_SCHEMA_VERSION = 24
-RANGE_ANALYZER_VERSION = "2.17.0"
-SNAPSHOT_CACHE_SCHEMA_VERSION = 9
+RANGE_SCHEMA_VERSION = 48
+RANGE_ANALYZER_VERSION = "2.34.0"
+SNAPSHOT_CACHE_SCHEMA_VERSION = 16
+_GIT_BATCH_CLOSE_TIMEOUT_SECONDS = 5
 RELATION_CACHE_SCHEMA_VERSION = 2
 DIRECT_IMPORT_CACHE_SCHEMA_VERSION = 3
-DIRECT_CALL_CACHE_SCHEMA_VERSION = 14
-DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 17
+DIRECT_CALL_CACHE_SCHEMA_VERSION = 38
+DIRECT_ATTRIBUTE_CACHE_SCHEMA_VERSION = 37
 CLASSIFICATIONS = (
     "introduced_break",
     "compatibility_warning",
@@ -189,7 +212,13 @@ def resolve_commit(repo: Path, revision: str) -> str:
     try:
         return _git(repo, "rev-parse", f"{revision}^{{commit}}")
     except subprocess.CalledProcessError as error:
-        raise ValueError(f"Git commit does not exist: {revision}") from error
+        detail = error.stderr or b""
+        if isinstance(detail, bytes):
+            detail = detail.decode("utf-8", errors="replace")
+        raise ValueError(
+            f"Cannot resolve Git commit {revision} in {repo}: "
+            f"git exited with status {error.returncode}. {detail.strip()}"
+        ) from error
 
 
 def verify_range(vllm_root: Path, old: str, new: str) -> tuple[str, str]:
@@ -409,7 +438,7 @@ class _ResolvedCallBinding:
     receiver_class: str | None = None
 
 
-def _body_named_binding(body: list[ast.stmt], name: str) -> _NamedBinding:
+def _binding_from_alternatives(alternatives: tuple[_ScopeBinding, ...]) -> _NamedBinding:
     """Return one final runtime namespace binding, or fail closed.
 
     The shared scope-flow interpreter handles overload stubs followed by a
@@ -417,7 +446,6 @@ def _body_named_binding(body: list[ast.stmt], name: str) -> _NamedBinding:
     A path-dependent final binding is ``unknown`` rather than ``missing``.
     """
 
-    alternatives = _scope_final_bindings(body, _tag_guard_names(body)).get(name, ())
     if not alternatives:
         return _NamedBinding(None, "missing")
     fingerprint = hashlib.sha256(
@@ -443,6 +471,10 @@ def _body_named_binding(body: list[ast.stmt], name: str) -> _NamedBinding:
     if binding.kind in {"alias", "value"}:
         return _NamedBinding(binding.node, "non_callable", fingerprint)
     return _NamedBinding(None, "unknown", fingerprint)
+
+
+def _body_named_binding(body: list[ast.stmt], name: str) -> _NamedBinding:
+    return _binding_from_alternatives(_scope_final_bindings(body, _tag_guard_names(body)).get(name, ()))
 
 
 def _named_binding(tree: ast.Module, owner: str | None, name: str) -> _NamedBinding:
@@ -818,17 +850,29 @@ def _ambiguous_binding_changed(old: SourceEndpoint, new: SourceEndpoint) -> bool
 
 
 class GitSnapshot:
+    _reference_prefixes: tuple[str, ...] = ("vllm.",)
+
     def __init__(self, root: Path, revision: str):
         self.root = root.resolve()
         self.revision = revision
         self.cache_work_seconds = 0.0
         self._lock = threading.RLock()
+        self._batch_lock = threading.RLock()
+        self._memo = SourceFacts()
+        self._batch_process: subprocess.Popen[bytes] | None = None
+        self._batch_stderr: BinaryIO | None = None
+        self._batch_resources = ExitStack()
+        self._closed = False
         self._files: set[str] | None = None
         self._tree_entries: dict[str, tuple[str, str]] | None = None
         self._source: dict[str, str | None] = {}
         self._trees: dict[str, ast.Module | None] = {}
         self._bindings: dict[str, dict[str, str]] = {}
         self._annotation_namespaces: dict[str, AnnotationNamespace] = {}
+        self._construction_effects: dict[str, frozenset[str]] = {}
+        self._replacement_protocols: dict[
+            tuple[str, tuple[str, ...]], tuple[SourceEndpoint, dict[str, Any] | None]
+        ] = {}
         self._attribute_endpoints: dict[tuple[str, str, str | None, str | None], SourceEndpoint] = {}
         self._module_attributes: dict[str, tuple[list[ast.stmt], ModuleGetattrContract | None]] = {}
         self._keyword_call_candidates: dict[
@@ -842,7 +886,16 @@ class GitSnapshot:
 
     def __getstate__(self) -> dict[str, object]:
         state = dict(self.__dict__)
-        state.pop("_lock", None)
+        for key in (
+            "_lock",
+            "_batch_lock",
+            "_memo",
+            "_batch_process",
+            "_batch_stderr",
+            "_batch_resources",
+            "_closed",
+        ):
+            state.pop(key, None)
         return state
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -853,76 +906,241 @@ class GitSnapshot:
         if not hasattr(self, "_module_attributes"):
             self._module_attributes = {}
         self._lock = threading.RLock()
+        self._batch_lock = threading.RLock()
+        self._memo = SourceFacts()
+        self._batch_process = None
+        self._batch_stderr = None
+        self._batch_resources = ExitStack()
+        self._closed = False
 
     @property
     def files(self) -> set[str]:
         with self._lock:
-            if self._files is None:
-                started = time.perf_counter()
-                output = _git(self.root, "ls-tree", "-r", self.revision)
-                entries: dict[str, tuple[str, str]] = {}
-                for line in output.splitlines():
-                    metadata, separator, file_name = line.partition("\t")
-                    parts = metadata.split()
-                    if separator and len(parts) == 3:
-                        entries[file_name] = (parts[0], parts[2])
-                self._tree_entries = entries
-                self._files = set(entries)
+            if self._files is not None:
+                return self._files
+
+        def build() -> tuple[dict[str, tuple[str, str]], set[str]]:
+            started = time.perf_counter()
+            output = _git(self.root, "ls-tree", "-r", self.revision)
+            entries: dict[str, tuple[str, str]] = {}
+            for line in output.splitlines():
+                metadata, separator, file_name = line.partition("\t")
+                parts = metadata.split()
+                if separator and len(parts) == 3:
+                    entries[file_name] = (parts[0], parts[2])
+            with self._lock:
                 self.cache_work_seconds += time.perf_counter() - started
+            return entries, set(entries)
+
+        entries, files = self._memo.get("snapshot_files", self.revision, build)
+        with self._lock:
+            if self._files is None:
+                self._tree_entries = entries
+                self._files = files
             return self._files
 
     def _source_at(self, normalized: str, seen: frozenset[str]) -> str | None:
-        if normalized in self._source:
-            return self._source[normalized]
         if normalized in seen or len(seen) >= 16 or normalized not in self.files:
-            self._source[normalized] = None
             return None
         assert self._tree_entries is not None
         mode, _blob_sha = self._tree_entries[normalized]
-        raw = subprocess.run(
-            ["git", "-C", str(self.root), "show", f"{self.revision}:{normalized}"],
-            check=True,
-            capture_output=True,
-        ).stdout
+        raw = self._read_blob(normalized)
         decoded = raw.decode("utf-8", errors="replace")
         if mode != "120000":
-            self._source[normalized] = decoded
             return decoded
         target = posixpath.normpath(posixpath.join(posixpath.dirname(normalized), decoded.strip()))
         if posixpath.isabs(target) or target == ".." or target.startswith("../"):
-            self._source[normalized] = None
             return None
-        resolved = self._source_at(target, seen | {normalized})
-        self._source[normalized] = resolved
-        return resolved
+        return self._source_at(target, seen | {normalized})
 
     def source(self, file_name: str) -> str | None:
         normalized = file_name.replace("\\", "/")
         with self._lock:
-            if normalized not in self._source:
-                started = time.perf_counter()
-                self._source_at(normalized, frozenset())
+            if normalized in self._source:
+                return self._source[normalized]
+
+        def build() -> str | None:
+            started = time.perf_counter()
+            value = self._source_at(normalized, frozenset())
+            with self._lock:
                 self.cache_work_seconds += time.perf_counter() - started
+            return value
+
+        value = self._memo.get("snapshot_source", normalized, build)
+        with self._lock:
+            self._source.setdefault(normalized, value)
             return self._source[normalized]
+
+    def __enter__(self) -> GitSnapshot:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        # Explicit close/ExitStack is the primary owner; retain compatibility
+        # with short-lived snapshot clients that predate the lazy Git reader.
+        if getattr(self, "_batch_process", None) is not None:
+            with suppress(OSError, ValueError):
+                self.close()
+
+    def _read_blob(self, file_name: str) -> bytes:
+        """Read on demand through one binary Git pipe per analysis snapshot."""
+        with self._batch_lock:
+            if self._closed:
+                raise ValueError("cannot read from a closed Git snapshot")
+            # The batch protocol is line-delimited. Keep the original Git path
+            # handling for unusual names rather than splitting a request in two.
+            if "\n" in file_name or "\r" in file_name:
+                return subprocess.run(
+                    ["git", "-C", str(self.root), "show", f"{self.revision}:{file_name}"],
+                    check=True,
+                    capture_output=True,
+                ).stdout
+            try:
+                if self._batch_process is None:
+                    # A file avoids a full stderr pipe blocking Git while Python
+                    # reads stdout, including partial-clone lazy-fetch diagnostics.
+                    self._batch_stderr = cast(
+                        BinaryIO,
+                        self._batch_resources.enter_context(
+                            tempfile.TemporaryFile(mode="w+b")  # noqa: SIM115 - owned by the snapshot's ExitStack
+                        ),
+                    )
+                    self._batch_process = subprocess.Popen(
+                        ["git", "-C", str(self.root), "cat-file", "--batch"],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=self._batch_stderr,
+                    )
+                process = self._batch_process
+                assert process.stdin is not None and process.stdout is not None
+                if process.poll() is not None:
+                    raise ValueError(f"Git batch process exited with code {process.returncode}")
+                process.stdin.write(f"{self.revision}:{file_name}\n".encode())
+                process.stdin.flush()
+                header = process.stdout.readline().split()
+                if len(header) != 3 or header[1] != b"blob":
+                    raise ValueError(f"unexpected Git batch header: {header!r}")
+                size = int(header[2])
+                if size < 0:
+                    raise ValueError(f"invalid Git blob size: {size}")
+                content = process.stdout.read(size)
+                if len(content) != size or process.stdout.read(1) != b"\n":
+                    raise ValueError("incomplete Git batch blob response")
+                return content
+            except (OSError, ValueError) as error:
+                diagnostic = ""
+                if self._batch_stderr is not None:
+                    self._batch_stderr.seek(0)
+                    diagnostic = self._batch_stderr.read().decode("utf-8", errors="replace").strip()
+                self.close()
+                raise ValueError(
+                    f"Git batch read failed for {self.revision}:{file_name}: {error}"
+                    + (f"\n{diagnostic}" if diagnostic else "")
+                ) from error
+
+    def close(self) -> None:
+        """Release the lazy Git process on both successful and failed runs."""
+        with self._batch_lock:
+            self._closed = True
+            process = self._batch_process
+            try:
+                if process is not None:
+                    if process.stdin is not None:
+                        with suppress(BrokenPipeError):
+                            process.stdin.close()
+                    try:
+                        process.wait(timeout=_GIT_BATCH_CLOSE_TIMEOUT_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    if process.stdout is not None:
+                        process.stdout.close()
+            finally:
+                self._batch_resources.close()
+                self._batch_stderr = None
+                self._batch_process = None
 
     def tree(self, file_name: str) -> ast.Module | None:
         normalized = file_name.replace("\\", "/")
         with self._lock:
-            if normalized not in self._trees:
-                started = time.perf_counter()
-                source = self.source(normalized)
-                if source is None:
-                    self._trees[normalized] = None
-                else:
-                    try:
-                        self._trees[normalized] = ast.parse(source, filename=normalized)
-                    except SyntaxError:
-                        self._trees[normalized] = None
+            if normalized in self._trees:
+                return self._trees[normalized]
+
+        def build() -> ast.Module | None:
+            started = time.perf_counter()
+            source = self.source(normalized)
+            if source is None:
+                tree = None
+            else:
+                try:
+                    tree = ast.parse(source, filename=normalized)
+                except SyntaxError:
+                    tree = None
+            with self._lock:
                 self.cache_work_seconds += time.perf_counter() - started
+            return tree
+
+        tree = self._memo.get("snapshot_tree", normalized, build)
+        with self._lock:
+            self._trees.setdefault(normalized, tree)
             return self._trees[normalized]
 
     def resolve_module(self, module: str) -> str | None:
         return next((candidate for candidate in _module_file(module) if candidate in self.files), None)
+
+    def _scope_bindings(self, scope: ast.Module | ast.ClassDef) -> dict[str, tuple[_ScopeBinding, ...]]:
+        return self._body_bindings(scope.body)
+
+    def _body_bindings(self, body: list[ast.stmt]) -> dict[str, tuple[_ScopeBinding, ...]]:
+        return self._memo.get(
+            "scope_bindings", tuple(body), lambda: _scope_final_bindings(body, _tag_guard_names(body))
+        )
+
+    def _body_named_binding(self, body: list[ast.stmt], name: str) -> _NamedBinding:
+        return self._memo.get(
+            "named_binding",
+            (tuple(body), name),
+            lambda: _binding_from_alternatives(self._body_bindings(body).get(name, ())),
+        )
+
+    def named_binding(self, tree: ast.Module, owner: str | None, name: str) -> _NamedBinding:
+        if owner is None:
+            return self._body_named_binding(tree.body, name)
+        node = self._memo.get("owner", (tree, owner), lambda: _owner_node(tree, owner))
+        return self._body_named_binding(node.body, name) if node is not None else _NamedBinding(None, "missing")
+
+    def _import_body(self, tree: ast.Module) -> list[ast.stmt]:
+        return self._memo.get("runtime_module_body", tree, lambda: runtime_module_body(tree))
+
+    def has_import_symbol(self, file_name: str, name: str) -> bool | None:
+        def build() -> bool | None:
+            tree = self.tree(file_name)
+            if tree is None:
+                return False if file_name not in self.files else None
+            body = self._import_body(tree)
+            final = self._body_bindings(body)
+            kinds = {binding.kind for binding in final.get(name, ())}
+            if kinds and kinds <= {"function", "class", "value", "alias"}:
+                return True
+            if not kinds or kinds == {"unbound"}:
+                dynamic = self._memo.get(
+                    "dynamic_exports",
+                    tree,
+                    lambda: (
+                        any(binding.kind != "unbound" for binding in final.get("__getattr__", ()))
+                        or any(
+                            isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names)
+                            for statement in body
+                            for node in ast.walk(statement)
+                        )
+                    ),
+                )
+                return None if dynamic else False
+            return None
+
+        return self._memo.get("import_presence", (file_name, name), build)
 
     def _module_bindings(self, file_name: str) -> dict[str, str]:
         normalized = file_name.replace("\\", "/")
@@ -933,7 +1151,7 @@ class GitSnapshot:
         bindings: dict[str, str] = {}
         pending: dict[str, str] = {}
         if tree is not None:
-            final = _scope_final_bindings(tree.body, _tag_guard_names(tree.body))
+            final = self._scope_bindings(tree)
             for name, alternatives in final.items():
                 if len(alternatives) != 1:
                     continue
@@ -973,7 +1191,7 @@ class GitSnapshot:
                     elif reference.startswith("vllm."):
                         bindings[name] = reference
                         changed = True
-                    elif _body_named_binding(tree.body, root).status == "exact":
+                    elif self._body_named_binding(tree.body, root).status == "exact":
                         bindings[name] = f"{module}.{reference}"
                         changed = True
         self._bindings[normalized] = bindings
@@ -998,14 +1216,14 @@ class GitSnapshot:
             bindings = self._module_bindings(file_name)
             if suffix[0] in bindings:
                 target = ".".join([bindings[suffix[0]], *suffix[1:]])
-                if not target.startswith("vllm."):
+                if not target.startswith(self._reference_prefixes):
                     target = f"{module}.{target}"
                 return self._resolve_qualified_node(target, frozenset((*seen, expression)))
             owner = ".".join(suffix[:-1]) or None
             tree = self.tree(file_name)
             if tree is None:
                 return _QualifiedBinding(file_name, owner, suffix[-1], None, "unknown")
-            binding = _named_binding(tree, owner, suffix[-1])
+            binding = self.named_binding(tree, owner, suffix[-1])
             return _QualifiedBinding(
                 file_name,
                 owner,
@@ -1030,6 +1248,23 @@ class GitSnapshot:
         receiver_type: str,
         member: str,
         seen: frozenset[str] = frozenset(),
+        *,
+        generated_storage: bool = False,
+    ) -> _QualifiedBinding | None:
+        key = (receiver_type, member, seen, generated_storage)
+        return self._memo.get(
+            "effective_member",
+            key,
+            lambda: self._build_effective_member(receiver_type, member, seen, generated_storage=generated_storage),
+        )
+
+    def _build_effective_member(
+        self,
+        receiver_type: str,
+        member: str,
+        seen: frozenset[str] = frozenset(),
+        *,
+        generated_storage: bool = False,
     ) -> _QualifiedBinding | None:
         """Resolve a member through a provable single-inheritance chain.
 
@@ -1063,7 +1298,9 @@ class GitSnapshot:
             )
         class_node = resolved.node
         actual_owner = ".".join(item for item in (resolved.owner, class_node.name) if item)
-        if class_node.decorator_list:
+        if class_node.decorator_list and not (
+            generated_storage and dataclass_storage(receiver_type, self._type_source) is not None
+        ):
             return _QualifiedBinding(
                 resolved.file,
                 actual_owner,
@@ -1072,7 +1309,7 @@ class GitSnapshot:
                 "unknown",
                 _node_fingerprint(class_node),
             )
-        direct = _body_named_binding(class_node.body, member)
+        direct = self._body_named_binding(class_node.body, member)
         if direct.status != "missing":
             return _QualifiedBinding(
                 resolved.file,
@@ -1102,7 +1339,7 @@ class GitSnapshot:
             # snapshot lookup so an otherwise complete vLLM chain does not
             # become unknown merely because it terminates at ``abc.ABC``.
             return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
-        if base is None or not base.startswith("vllm."):
+        if base is None or not base.startswith(self._reference_prefixes):
             return _QualifiedBinding(
                 resolved.file,
                 actual_owner,
@@ -1111,7 +1348,12 @@ class GitSnapshot:
                 "unknown",
                 _node_fingerprint(class_node),
             )
-        return self._effective_member(base, member, frozenset((*seen, receiver_type)))
+        return self._effective_member(
+            base,
+            member,
+            frozenset((*seen, receiver_type)),
+            generated_storage=generated_storage,
+        )
 
     @staticmethod
     def _instance_assignment(
@@ -1268,9 +1510,8 @@ class GitSnapshot:
     def _calls_super_init(cls, function: ast.AsyncFunctionDef | ast.FunctionDef) -> bool:
         return cls._statements_definitely_call_super_init(function.body)
 
-    @staticmethod
-    def _slot_binding(class_node: ast.ClassDef, member: str) -> tuple[bool | None, ast.AST | None]:
-        binding = _body_named_binding(class_node.body, "__slots__")
+    def _slot_binding(self, class_node: ast.ClassDef, member: str) -> tuple[bool | None, ast.AST | None]:
+        binding = self._body_named_binding(class_node.body, "__slots__")
         if binding.status == "missing":
             return False, None
         if binding.status != "non_callable" or not isinstance(binding.node, (ast.Assign, ast.AnnAssign)):
@@ -1371,7 +1612,7 @@ class GitSnapshot:
                     _node_fingerprint(class_node),
                 )
 
-        direct = _body_named_binding(class_node.body, member)
+        direct = self._body_named_binding(class_node.body, member)
         if direct.status == "unknown":
             return _QualifiedBinding(
                 resolved.file,
@@ -1415,7 +1656,7 @@ class GitSnapshot:
             )
 
         for dynamic_name in ("__getattr__", "__getattribute__"):
-            if _body_named_binding(class_node.body, dynamic_name).status != "missing":
+            if self._body_named_binding(class_node.body, dynamic_name).status != "missing":
                 return _QualifiedBinding(
                     resolved.file,
                     actual_owner,
@@ -1425,7 +1666,7 @@ class GitSnapshot:
                     _node_fingerprint(class_node),
                 )
 
-        initializer = _body_named_binding(class_node.body, "__init__")
+        initializer = self._body_named_binding(class_node.body, "__init__")
         recurse_to_base = initializer.status == "missing"
         if initializer.status == "unknown" or initializer.status == "non_callable":
             return _QualifiedBinding(
@@ -1524,7 +1765,7 @@ class GitSnapshot:
             base = self._base_reference(resolved.file, class_node.bases[0])
             if base == "builtins.object" or base in STDLIB_STRUCTURAL_BASES:
                 return _QualifiedBinding(resolved.file, actual_owner, member, None, "missing")
-            if base is None or not base.startswith("vllm."):
+            if base is None or not base.startswith(self._reference_prefixes):
                 return _QualifiedBinding(
                     resolved.file,
                     actual_owner,
@@ -1544,7 +1785,7 @@ class GitSnapshot:
             base = self._base_reference(resolved.file, base_node)
             if base == "builtins.object" or base in STDLIB_STRUCTURAL_BASES:
                 continue
-            if base is None or not base.startswith("vllm."):
+            if base is None or not base.startswith(self._reference_prefixes):
                 return _QualifiedBinding(
                     resolved.file,
                     actual_owner,
@@ -1605,9 +1846,9 @@ class GitSnapshot:
         }:
             return None
         for name in ("__getattr__", "__getattribute__", "__setattr__", "register_buffer", "register_parameter"):
-            if _body_named_binding(node.body, name).status != "missing":
+            if self._body_named_binding(node.body, name).status != "missing":
                 return None
-        initializer = _body_named_binding(node.body, "__init__")
+        initializer = self._body_named_binding(node.body, "__init__")
         if initializer.status != "exact" or not isinstance(initializer.node, ast.FunctionDef):
             return None
         function = initializer.node
@@ -1765,18 +2006,21 @@ class GitSnapshot:
         tree = self.tree(file_name)
         if tree is None:
             return SourceEndpoint(file_name, None, name, symbol_kind="unknown")
-        with self._lock:
-            if file_name not in self._module_attributes:
-                body = runtime_module_body(tree)
-                getter = _body_named_binding(body, "__getattr__")
-                contract = None
-                if getter.status != "missing":
-                    contract = module_getattr_contract(body, getter.node)
-                    if _body_named_binding(body, "AttributeError").status != "missing":
-                        contract = ModuleGetattrContract(None)
-                self._module_attributes[file_name] = body, contract
-            body, contract = self._module_attributes[file_name]
-        binding = _body_named_binding(body, name)
+
+        def build() -> tuple[list[ast.stmt], ModuleGetattrContract | None]:
+            body = self._import_body(tree)
+            getter = self._body_named_binding(body, "__getattr__")
+            contract = None
+            if getter.status != "missing":
+                contract = module_getattr_contract(body, getter.node)
+                if self._body_named_binding(body, "AttributeError").status != "missing":
+                    contract = ModuleGetattrContract(None)
+            return body, contract
+
+        # Never acquire the memo lock while holding the snapshot lock: memo
+        # builders can resolve files/trees and acquire the snapshot lock.
+        body, contract = self._memo.get("module_attributes", file_name, build)
+        binding = self._body_named_binding(body, name)
         descriptor = "module_attribute"
         status, node = binding.status, binding.node
         fingerprint = binding.fingerprint
@@ -1822,7 +2066,7 @@ class GitSnapshot:
         base = self._base_reference(resolved.file, node.bases[0])
         if base == "builtins.object":
             return True
-        if base is None or not base.startswith("vllm."):
+        if base is None or not base.startswith(self._reference_prefixes):
             return False
         return self._constructor_class_safe(base, frozenset((*seen, class_reference)))
 
@@ -1835,28 +2079,206 @@ class GitSnapshot:
             return None
         if binding.file not in self._annotation_namespaces:
             module, is_package = _file_module(binding.file)
-            self._annotation_namespaces[binding.file] = AnnotationNamespace(tree, module, is_package)
+            self._annotation_namespaces[binding.file] = AnnotationNamespace(
+                tree, module, is_package, source_facts=self._memo
+            )
         namespace = self._annotation_namespaces[binding.file]
 
         def resolve(expression: str) -> str | None:
             if expression in TYPE_BUILTINS:
                 tree = self.tree(binding.file)
-                if tree is not None and _body_named_binding(tree.body, expression).status == "missing":
+                if tree is not None and self._body_named_binding(tree.body, expression).status == "missing":
                     return expression
             return namespace.resolve(expression)
 
-        return ClassSource(binding.node, resolve, binding.file, reference)
+        module, is_package = _file_module(binding.file)
+        if binding.file not in self._construction_effects:
+            self._construction_effects[binding.file] = construction_effects(tree, module, is_package)
+        effects = self._construction_effects[binding.file]
+        return ClassSource(
+            binding.node,
+            resolve,
+            binding.file,
+            reference,
+            has_storage_effect(reference, effects) or has_storage_effect(f"{module}.{binding.node.name}", effects),
+        )
+
+    def _flow_lookup(self) -> Lookup:
+        return self._type_source
+
+    def _factory_method_has_effect(self, reference: str, file: str) -> bool:
+        effects = self._construction_effects.get(file, frozenset())
+        return has_construction_effect(reference, effects) or any(
+            effect.startswith(reference + ".") for effect in effects
+        )
+
+    def factory_method_result(
+        self,
+        receiver: str,
+        member: str,
+        arguments: tuple[FlowValue | None, ...] = (),
+        *,
+        positional: int = 0,
+        keywords: tuple[str, ...] = (),
+        _start: str | None = None,
+        _seen: frozenset[tuple[str, str, str]] = frozenset(),
+    ) -> FlowValue | None:
+        """Prove one endpoint's bounded class/static factory body, not Self.
+
+        This internal evaluator uses only this snapshot's names, method owner
+        and AST. A separate invocation recipe is required before discovery may
+        publish its result for replay at another endpoint.
+        """
+        start = _start or receiver
+        key = (receiver, start, member)
+        if key in _seen or len(_seen) >= MAX_FACTORY_RETURN_DEPTH or not 0 <= positional <= len(arguments):
+            return None
+        if positional + len(keywords) != len(arguments) or len(set(keywords)) != len(keywords):
+            return None
+        source = self._type_source(receiver)
+        if source is None or source.storage_effects:
+            return None
+        if dataclass_storage(receiver, self._type_source) is None and not self._constructor_class_safe(receiver):
+            return None
+        hook = self._effective_member(receiver, "__init_subclass__", generated_storage=True)
+        if hook is None or hook.status != "missing":
+            return None
+        binding = self._effective_member(start, member, generated_storage=True)
+        if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.FunctionDef):
+            return None
+        function = binding.node
+        namespace = self._return_resolver(binding.file)
+        descriptor = _descriptor(function, namespace)
+        if (
+            descriptor not in {"classmethod", "staticmethod"}
+            or len(function.decorator_list) != 1
+            or not isinstance(function.decorator_list[0], (ast.Name, ast.Attribute))
+        ):
+            return None
+        if not factory_body_supported(function) or function.args.vararg or function.args.kwarg:
+            return None
+        signature_data = _jsonable_signature(function)
+        signature = _inspect_signature(signature_data) if signature_data is not None else None
+        if signature is None:
+            return None
+        class_value = FlowValue(TypeShape("class", (TypeShape(receiver),)), (receiver,))
+        try:
+            bound = signature.bind(
+                *((class_value,) if descriptor == "classmethod" else ()),
+                *arguments[:positional],
+                **dict(zip(keywords, arguments[positional:])),
+            )
+        except TypeError:
+            return None
+        if any(value is None for value in bound.arguments.values()):
+            return None
+        module, _ = _file_module(binding.file)
+        owner = ".".join(part for part in (module, binding.owner) if part)
+        owner_source = self._type_source(owner)
+        if (
+            owner_source is None
+            or owner_source.storage_effects
+            or self._factory_method_has_effect(f"{owner}.{member}", binding.file)
+        ):
+            return None
+        local_names = _function_local_names(function)
+        tree = self.tree(binding.file)
+        if tree is None:
+            return None
+
+        def resolve(expression: str) -> str | None:
+            if expression == "super" and self._body_named_binding(tree.body, "super").status == "missing":
+                return "builtins.super"
+            return owner_source.resolve(expression)
+
+        def constructor(call: ast.Call) -> str | None:
+            expression = _expression_name(call.func)
+            if expression is None or expression.split(".")[0] in local_names:
+                return None
+            target = resolve(expression)
+            return target if target is not None and self._type_source(target) is not None else None
+
+        proxy = None
+        if descriptor == "classmethod" and len(owner_source.node.bases) == 1:
+            base = self._base_reference(binding.file, owner_source.node.bases[0])
+            if base is not None and base.startswith(self._reference_prefixes):
+                proxy = FlowValue(TypeShape("super", (TypeShape(receiver), TypeShape(base))), ("unknown",))
+
+        def method_bind(call: ast.Call, value: FlowValue | None):
+            if not isinstance(call.func, ast.Attribute):
+                return None
+            target, lookup_start = None, None
+            if value is not None and value.shape.reference == "super" and len(value.shape.arguments) == 2:
+                target, lookup_start = (item.reference for item in value.shape.arguments)
+            elif value is not None and value.shape.reference == "class" and len(value.shape.arguments) == 1:
+                target = value.shape.arguments[0].reference
+            elif value is None:
+                expression = _expression_name(call.func.value)
+                if expression is not None and expression.split(".")[0] not in local_names:
+                    target = resolve(expression)
+            if target is None:
+                return None
+            bound_target = target
+            method_name = call.func.attr
+
+            def invoke(node: ast.Call, values: tuple[FlowValue | None, ...]) -> HelperCallEffects | None:
+                if any(isinstance(arg, ast.Starred) for arg in node.args) or any(
+                    kw.arg is None for kw in node.keywords
+                ):
+                    return None
+                result = self.factory_method_result(
+                    bound_target,
+                    method_name,
+                    values,
+                    positional=len(node.args),
+                    keywords=tuple(kw.arg for kw in node.keywords if kw.arg is not None),
+                    _start=lookup_start,
+                    _seen=_seen | {key},
+                )
+                if result is None:
+                    return None
+                return HelperCallEffects(
+                    frozenset(range(len(values))),
+                    frozenset(),
+                    None,
+                    None,
+                    result if result.owned is None else None,
+                    result if result.owned is not None else None,
+                )
+
+            return invoke
+
+        flow = ContainerFlow(
+            function,
+            resolve,
+            self._type_source,
+            runtime_resolve=resolve,
+            constructor_resolve=constructor,
+            method_bind=method_bind,
+            capture_returns=True,
+            parameters=dict(bound.arguments),
+            super_value=proxy,
+            super_receiver=next(iter(bound.arguments.items()), None) if descriptor == "classmethod" else None,
+        )
+        return proven_factory_return(flow, dict(bound.arguments))
 
     def dependency_endpoint(
         self,
         dependency: DirectCallDependency | DirectAttributeDependency,
     ) -> SourceEndpoint:
+        if isinstance(dependency, DirectCallDependency) and dependency.resolution_basis == "dataclass_replace":
+            return self._dataclass_replace_endpoint(dependency)
         receiver = dependency.lookup_root or dependency.receiver_type
         if dependency.receiver_path:
-            resolved = resolve_type_path(dependency.receiver_path, self._type_source)
-            if resolved is None or not resolved.reference.startswith("vllm."):
+            resolved = resolve_flow_path(dependency.receiver_path, self._flow_lookup())
+            if (
+                resolved is None
+                or not resolved.shape.reference.startswith(self._reference_prefixes)
+                or dependency.resolution_basis == "constructed_storage"
+                and not resolved.constructed
+            ):
                 return SourceEndpoint(None, None, dependency.member, symbol_kind="unknown")
-            receiver = resolved.reference
+            receiver = resolved.shape.reference
         if isinstance(dependency, DirectAttributeDependency):
             return self.attribute_endpoint(
                 dependency.target, dependency.access_kind, receiver_type=receiver, member=dependency.member
@@ -1867,24 +2289,125 @@ class GitSnapshot:
             receiver_type=receiver,
             member=dependency.member,
             invocation_kind=dependency.invocation_kind,
+            constructed_storage=dependency.resolution_basis == "constructed_storage",
         )
 
-    def _dataclass_constructor(self, reference: str) -> ast.FunctionDef | None:
-        def lookup(name: str) -> ClassSource | None:
-            binding = self._resolve_qualified_node(name)
-            if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.ClassDef):
-                return None
-            # A generated __init__ does not define the whole class-call protocol
-            # when allocation or subclass creation is customized in the MRO.
-            if any(
-                _body_named_binding(binding.node.body, member).status != "missing"
-                for member in ("__new__", "__init_subclass__")
-            ):
-                return None
-            return ClassSource(binding.node, self._return_resolver(binding.file), binding.file, name)
+    def _dataclass_replace_endpoint(self, dependency: DirectCallDependency) -> SourceEndpoint:
+        return self._dataclass_replace_protocol(dependency)[0]
 
-        layout = dataclass_layout(reference, lookup)
-        return layout.initializer() if layout is not None else None
+    def _dataclass_replace_protocol(
+        self, dependency: DirectCallDependency
+    ) -> tuple[SourceEndpoint, dict[str, Any] | None]:
+        key = (dependency.target, dependency.receiver_path)
+        if key not in self._replacement_protocols:
+            self._replacement_protocols[key] = self._build_dataclass_replace_protocol(dependency)
+        return self._replacement_protocols[key]
+
+    def _build_dataclass_replace_protocol(
+        self, dependency: DirectCallDependency
+    ) -> tuple[SourceEndpoint, dict[str, Any] | None]:
+        value = resolve_flow_path(dependency.receiver_path, self._flow_lookup())
+        unknown = SourceEndpoint(None, None, dependency.target, symbol_kind="unknown")
+        if value is None or not value.constructed or value.shape.reference != dependency.target:
+            return unknown, None
+        source = self._type_source(dependency.target)
+        replacement = dataclass_replacement(dependency.target, self._type_source)
+        if source is None or replacement is None:
+            return unknown, None
+        layout, storage = replacement.layout, replacement.storage
+        # replace copies each ordinary init field from the existing instance.
+        # InitVars are not stored: a required InitVar must still be supplied.
+        # init=False and ClassVar entries cannot become constructor keywords.
+        fields = [field for field in layout.fields if field.included]
+        node = ast.parse("def replacement(): pass").body[0]
+        assert isinstance(node, ast.FunctionDef)
+        node.args.kwonlyargs = [ast.arg(arg=field.name) for field in fields]
+        node.args.kw_defaults = [
+            None if field.name in replacement.required_keywords else ast.Constant(None) for field in fields
+        ]
+        endpoint = SourceEndpoint(
+            source.file,
+            None,
+            dependency.target.rsplit(".", 1)[-1],
+            line=source.node.lineno,
+            signature=_jsonable_signature(node),
+            symbol_kind="constructor",
+            signature_status="exact",
+            analysis_fingerprint=_node_fingerprint(source.node),
+        )
+        protocol = {
+            "fields": [asdict(field) for field in layout.fields],
+            "copied_fields": list(replacement.copied_fields),
+            "excluded_fields": list(replacement.excluded_fields),
+            "required_keywords": list(replacement.required_keywords),
+            "stored_parameters": sorted(storage.stored_parameters),
+            "initializer_owner": storage.initializer_owner,
+            "initializer_signature": _bound_signature(
+                _jsonable_signature(storage.layout.initializer()),
+                descriptor="ordinary",
+                access_kind="constructor",
+            ),
+        }
+        return endpoint, protocol
+
+    def call_state(self, dependency: DirectCallDependency, endpoint: SourceEndpoint) -> CompatibilityState:
+        if dependency.resolution_basis != "dataclass_replace":
+            return _direct_call_state(endpoint, dependency)
+        _, protocol = self._dataclass_replace_protocol(dependency)
+        if protocol is None:
+            return _direct_call_state(endpoint, dependency)
+        if not dependency.call_shape.exact:
+            return CompatibilityState(True, None, "replacement keyword expansion is not statically exact")
+        supplied = set(dependency.call_shape.keyword_names)
+        if len(supplied) != len(dependency.call_shape.keyword_names):
+            return CompatibilityState(True, False, "replacement call supplies a keyword more than once")
+        forbidden = sorted(supplied.intersection(protocol["excluded_fields"]))
+        if forbidden:
+            return CompatibilityState(
+                True, False, "replacement explicitly sets init=False fields: " + ", ".join(forbidden)
+            )
+        copied = set(protocol["copied_fields"])
+        # The child's dataclass metadata, not the parent's initializer layout,
+        # supplies implicit keywords. Bind the synthesized call separately.
+        shape = CallShape(0, tuple(sorted(supplied | copied)))
+        compatible, reason = bind_call_shape(protocol["initializer_signature"], shape)
+        if compatible is not True:
+            return CompatibilityState(True, compatible, "replacement synthesized constructor: " + reason)
+        missing = sorted(set(protocol["required_keywords"]) - supplied)
+        if missing:
+            return CompatibilityState(
+                True, False, "replacement requires unstored initialization fields: " + ", ".join(missing)
+            )
+        return CompatibilityState(True, True, "replacement copies stored fields and binds the generated constructor")
+
+    def _constructor_class_source(self, name: str) -> ClassSource | None:
+        binding = self._resolve_qualified_node(name)
+        if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.ClassDef):
+            return None
+        # Allocation and subclass hooks can change the generated call protocol.
+        if any(
+            self._body_named_binding(binding.node.body, member).status != "missing"
+            for member in ("__new__", "__init_subclass__")
+        ):
+            return None
+        return ClassSource(binding.node, self._return_resolver(binding.file), binding.file, name)
+
+    def _dataclass_constructor(self, reference: str, seen: frozenset[str] = frozenset()) -> ast.FunctionDef | None:
+        if reference in seen:
+            return None
+        layout = dataclass_layout(reference, self._constructor_class_source)
+        if layout is None:
+            return None
+        initializer = layout.initializer()
+        if initializer is not None or layout.generates_initializer:
+            return initializer
+        source = self._constructor_class_source(reference)
+        if source is None or len(source.node.bases) != 1:
+            return None
+        if self._body_named_binding(source.node.body, "__init__").status != "missing":
+            return None
+        base = self._base_reference(source.file, source.node.bases[0])
+        return self._dataclass_constructor(base, seen | {reference}) if base is not None else None
 
     def _return_resolver(self, file_name: str) -> Any:
         module, _ = _file_module(file_name)
@@ -1894,12 +2417,12 @@ class GitSnapshot:
             root, separator, remainder = expression.partition(".")
             if root in bindings:
                 return f"{bindings[root]}.{remainder}" if separator else bindings[root]
-            if expression.startswith("vllm."):
+            if expression.startswith(self._reference_prefixes):
                 return expression
             if (
                 expression in {"classmethod", "property", "staticmethod"}
                 and (tree := self.tree(file_name)) is not None
-                and _body_named_binding(tree.body, expression).status == "missing"
+                and self._body_named_binding(tree.body, expression).status == "missing"
             ):
                 return f"builtins.{expression}"
             return f"{module}.{expression}"
@@ -2105,8 +2628,22 @@ class GitSnapshot:
         *,
         invocation_kind: str = "python_call",
     ) -> SourceEndpoint:
+        return self._memo.get(
+            "endpoint",
+            (file_name, owner, name, invocation_kind),
+            lambda: self._build_endpoint(file_name, owner, name, invocation_kind=invocation_kind),
+        )
+
+    def _build_endpoint(
+        self,
+        file_name: str,
+        owner: str | None,
+        name: str,
+        *,
+        invocation_kind: str = "python_call",
+    ) -> SourceEndpoint:
         tree = self.tree(file_name)
-        binding = _named_binding(tree, owner, name) if tree is not None else _NamedBinding(None, "unknown")
+        binding = self.named_binding(tree, owner, name) if tree is not None else _NamedBinding(None, "unknown")
         node = binding.node if binding.status == "exact" else None
         resolver = self._return_resolver(file_name)
         descriptor = _descriptor(node, resolver) if node is not None else None
@@ -2159,8 +2696,16 @@ class GitSnapshot:
     ) -> SignatureContract | None:
         if endpoint.symbol_kind == "constructor" or endpoint.file is None or endpoint.name is None:
             return _snapshot_signature_contract(endpoint, invocation_kind)
+        key = (endpoint.file, endpoint.owner, endpoint.name, endpoint.descriptor, invocation_kind)
+        return self._memo.get(
+            "signature_contract", key, lambda: self._build_signature_contract(endpoint, invocation_kind)
+        )
+
+    def _build_signature_contract(self, endpoint: SourceEndpoint, invocation_kind: str) -> SignatureContract | None:
+        assert endpoint.file is not None and endpoint.name is not None
         tree = self.tree(endpoint.file)
-        node = _named_node(tree, endpoint.owner, endpoint.name) if tree is not None else None
+        binding = self.named_binding(tree, endpoint.owner, endpoint.name) if tree is not None else None
+        node = binding.node if binding is not None and binding.status == "exact" else None
         if node is None:
             return _snapshot_signature_contract(endpoint, invocation_kind)
         return _snapshot_node_signature_contract(
@@ -2179,12 +2724,37 @@ class GitSnapshot:
         receiver_type: str | None = None,
         member: str | None = None,
         invocation_kind: str = "python_call",
+        constructed_storage: bool = False,
+    ) -> SourceEndpoint:
+        key = (expression, access_kind, receiver_type, member, invocation_kind, constructed_storage)
+        return self._memo.get(
+            "call_endpoint",
+            key,
+            lambda: self._build_call_endpoint(
+                expression,
+                access_kind,
+                receiver_type=receiver_type,
+                member=member,
+                invocation_kind=invocation_kind,
+                constructed_storage=constructed_storage,
+            ),
+        )
+
+    def _build_call_endpoint(
+        self,
+        expression: str,
+        access_kind: str,
+        *,
+        receiver_type: str | None = None,
+        member: str | None = None,
+        invocation_kind: str = "python_call",
+        constructed_storage: bool = False,
     ) -> SourceEndpoint:
         effective_access_kind = access_kind
         resolved: _QualifiedBinding | None = None
         if access_kind == "instance" and receiver_type is not None and member is not None:
-            if receiver_type.startswith("vllm."):
-                resolved = self._effective_member(receiver_type, member)
+            if receiver_type.startswith(self._reference_prefixes):
+                resolved = self._effective_member(receiver_type, member, generated_storage=constructed_storage)
             else:
                 # ``self``/``super`` receiver classes live downstream and are
                 # not present in this upstream snapshot.  The detector's
@@ -3084,7 +3654,7 @@ def _relation_findings(
     evidence = [item.as_dict() for item in relation.evidence] or [
         {"file": relation.evidence_file, "line": relation.evidence_line}
     ]
-    findings: list[RangeFinding] = []
+    findings = patch_consumer_findings(relation, engine, old_snapshot, new_snapshot)
     if contract_changed:
         contract_kind = "base_presence" if relation.relation == "inheritance" else "call_arguments"
         old_state = _state(
@@ -3444,14 +4014,16 @@ class _ImportVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def discover_imports(ascend_root: Path) -> list[ImportReference]:
+def discover_imports(ascend_root: Path, *, trees: dict[str, ast.Module] | None = None) -> list[ImportReference]:
     references: list[ImportReference] = []
     for path in sorted((ascend_root / "vllm_ascend").rglob("*.py")):
         relative = path.relative_to(ascend_root).as_posix()
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
-        except (OSError, SyntaxError, UnicodeError):
-            continue
+        tree = trees.get(relative) if trees is not None else None
+        if tree is None:
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
+            except (OSError, SyntaxError, UnicodeError):
+                continue
         visitor = _ImportVisitor(relative)
         visitor.visit(ast.Module(body=runtime_module_body(tree), type_ignores=[]))
         references.extend(visitor.references)
@@ -3464,21 +4036,15 @@ def discover_imports(ascend_root: Path) -> list[ImportReference]:
 
 
 def _top_level_symbol(snapshot: GitSnapshot, file_name: str, name: str) -> SourceEndpoint:
+    if snapshot.has_import_symbol(file_name, name) is not True:
+        return SourceEndpoint(file=None, owner=None, name=name)
     endpoint = snapshot.endpoint(file_name, None, name)
     if endpoint.line is not None:
         return endpoint
     tree = snapshot.tree(file_name)
-    if tree is not None:
-        for node in tree.body:
-            names: list[str] = []
-            if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                names = [item.id for target in targets for item in ast.walk(target) if isinstance(item, ast.Name)]
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [alias.asname or alias.name.rsplit(".", 1)[-1] for alias in node.names]
-            if name in names:
-                return SourceEndpoint(file=file_name, owner=None, name=name, line=node.lineno)
-    return SourceEndpoint(file=None, owner=None, name=name)
+    assert tree is not None
+    bindings = snapshot._body_bindings(snapshot._import_body(tree))[name]
+    return SourceEndpoint(file=file_name, owner=None, name=name, line=min(binding.line for binding in bindings))
 
 
 def _import_findings(
@@ -3515,6 +4081,13 @@ def _import_findings(
             old_endpoint = SourceEndpoint(file=old_file, owner=None, name=None)
             new_endpoint = SourceEndpoint(file=new_file, owner=None, name=None)
         elif symbol and "." not in symbol:
+            if old_snapshot.has_import_symbol(old_file, symbol) is not True:
+                continue
+            if new_file is not None:
+                if new_file.endswith("/__init__.py") and new_snapshot.resolve_module(f"{reference.module}.{symbol}"):
+                    continue
+                if new_snapshot.has_import_symbol(new_file, symbol) is not False:
+                    continue
             old_endpoint = _top_level_symbol(old_snapshot, old_file, symbol)
             new_endpoint = (
                 _top_level_symbol(new_snapshot, new_file, symbol)
@@ -3590,6 +4163,12 @@ def _import_findings(
 def _dispatch_state(state: CompatibilityState, binding: dict[str, Any] | None) -> CompatibilityState:
     if binding is None:
         return state
+    if binding.get("kind") == "invalidated_parameter_receiver":
+        return CompatibilityState(
+            state.exists,
+            None,
+            "preceding effects invalidated receiver provenance; the parameter annotation is not an exact binding",
+        )
     return CompatibilityState(
         state.exists,
         None,
@@ -3597,18 +4176,401 @@ def _dispatch_state(state: CompatibilityState, binding: dict[str, Any] | None) -
     )
 
 
+class _ConstructorSnapshot(GitSnapshot):
+    """Ephemeral composite view: fixed downstream ASTs and one upstream SHA.
+
+    Constructor and concrete receiver comparisons use this view. It is never stored as an
+    upstream snapshot or substituted into the running relation generator.
+    """
+
+    _reference_prefixes = ("vllm.", "vllm_ascend.")
+
+    def __init__(
+        self,
+        upstream: GitSnapshot,
+        downstream: RepositoryIndex,
+        *,
+        proofs: frozenset[MethodProof] = frozenset(),
+        baseline_effects: dict[str, frozenset[str]] | None = None,
+        flow_engine: InterfaceBoundaryGenerator | None = None,
+    ):
+        super().__init__(upstream.root, upstream.revision)
+        self._upstream = upstream
+        self._downstream = downstream
+        self._flow_engine = flow_engine
+        self._downstream_trees = downstream.source_facts.get(
+            "downstream_trees", downstream, lambda: {module.file: module.tree for module in downstream.modules.values()}
+        )
+        self._combined_files = downstream.source_facts.get(
+            "combined_files", upstream, lambda: upstream.files | self._downstream_trees.keys()
+        )
+        self._method_proofs = proofs
+        self._baseline_effects = baseline_effects if baseline_effects is not None else {}
+        self._proof_views: dict[frozenset[MethodProof], _ConstructorSnapshot] = {}
+        self._proofs_valid = True
+        self._context_effects: frozenset[str] = frozenset()
+        if proofs:
+            effects: set[str] = set()
+            for module in downstream.modules.values():
+                calls = [proof.call_in(module.tree) for proof in proofs if proof.file == module.file]
+                if any(call is None for call in calls):
+                    self._proofs_valid = False
+                if calls:
+                    module_effects = construction_effects(
+                        module.tree,
+                        module.name,
+                        module.is_package,
+                        bound_receiver_calls=frozenset(id(call) for call in calls if call is not None),
+                    )
+                else:
+                    if module.file not in self._baseline_effects:
+                        self._baseline_effects[module.file] = downstream.source_facts.get(
+                            "construction_effects",
+                            (module.tree, module.name, module.is_package),
+                            partial(construction_effects, module.tree, module.name, module.is_package),
+                        )
+                    module_effects = self._baseline_effects[module.file]
+                self._construction_effects[module.file] = module_effects
+                effects.update(module_effects)
+            self._context_effects = frozenset(effects)
+            self._proofs_valid = self._proofs_valid and all(self._valid_method_proof(proof) for proof in proofs)
+
+    def _valid_method_proof(self, proof: MethodProof) -> bool:
+        tree = self._downstream_trees.get(proof.file)
+        call = proof.call_in(tree) if tree is not None else None
+        if (
+            call is None
+            or not isinstance(call.func, ast.Attribute)
+            or call.func.attr != proof.method.rsplit(".", 1)[-1]
+        ):
+            return False
+        creation_hook = self._effective_member(proof.receiver, "__init_subclass__", generated_storage=True)
+        if creation_hook is None or creation_hook.status != "missing":
+            return False
+        binding = self._effective_member(proof.receiver, call.func.attr, generated_storage=True)
+        if binding is None or binding.status != "exact" or not isinstance(binding.node, ast.FunctionDef):
+            return False
+        module, _ = _file_module(binding.file)
+        reference = ".".join(part for part in (module, binding.owner, binding.name) if part)
+        if isinstance(proof, FactoryCallProof):
+            expression = _expression_name(call.func.value)
+            # This entry point currently binds source-visible class references,
+            # not annotated instances or local aliases with unproved values.
+            return (
+                expression is not None
+                and self._return_resolver(proof.file)(expression) == proof.receiver
+                and not has_construction_effect(proof.receiver, self._context_effects)
+                and not has_construction_effect(reference, self._context_effects)
+                and not any(effect.startswith(reference + ".") for effect in self._context_effects)
+            )
+        return (
+            binding.file in self._downstream_trees
+            and reference == proof.method
+            and method_body_hash(binding.node) == proof.body_sha256
+            and not has_construction_effect(proof.receiver, self._context_effects)
+            and not has_construction_effect(proof.method, self._context_effects)
+            and not any(effect.startswith(proof.method + ".") for effect in self._context_effects)
+        )
+
+    def _type_source(self, reference: str) -> ClassSource | None:
+        source = super()._type_source(reference)
+        if source is None or not self._method_proofs:
+            return source
+        return replace(
+            source,
+            storage_effects=source.storage_effects
+            or has_storage_effect(reference, self._context_effects)
+            or has_storage_effect(source.qualified_name, self._context_effects),
+        )
+
+    def _flow_lookup(self) -> Lookup:
+        if self._method_proofs:
+            return MethodContextLookup(self._type_source, self._method_proofs, self.evaluate_factory_call)
+        return super()._flow_lookup()
+
+    def _factory_method_has_effect(self, reference: str, file: str) -> bool:
+        return (
+            super()._factory_method_has_effect(reference, file)
+            or has_construction_effect(reference, self._context_effects)
+            or any(effect.startswith(reference + ".") for effect in self._context_effects)
+        )
+
+    def _factory_context(self, proof: FactoryCallProof, proofs: frozenset[MethodProof]) -> _ConstructorSnapshot | None:
+        if len(proofs) > MAX_FACTORY_RETURN_DEPTH:
+            return None
+        frozen = proofs
+        if frozen != self._method_proofs:
+            candidate = self._resolve_qualified_node(proof.receiver)
+            if candidate is None or candidate.status != "exact" or not isinstance(candidate.node, ast.ClassDef):
+                # A cheap source-only rejection precedes the whole-downstream
+                # contextual effect pass. It never substitutes for body proof.
+                return None
+            direct = _body_named_binding(candidate.node.body, proof.member)
+            if isinstance(direct.node, ast.FunctionDef) and not factory_body_supported(direct.node):
+                return None
+            if frozen not in self._proof_views:
+                self._proof_views[frozen] = _ConstructorSnapshot(
+                    self._upstream,
+                    self._downstream,
+                    proofs=frozen,
+                    baseline_effects=self._baseline_effects,
+                    flow_engine=self._flow_engine,
+                )
+            view = self._proof_views[frozen]
+            return view if view._proofs_valid else None
+        if not self._proofs_valid:
+            return None
+        return self
+
+    def evaluate_factory_call(
+        self,
+        proof: FactoryCallProof,
+        arguments: tuple[FlowValue | None, ...],
+        positional: int,
+        keywords: tuple[str, ...],
+    ) -> FlowValue | None:
+        proofs = set(self._method_proofs) | {proof}
+        for argument in arguments:
+            nested = method_path_proofs(argument.path, require_complete=True) if argument is not None else None
+            if nested is None:
+                return None
+            proofs.update(nested)
+        view = self._factory_context(proof, frozenset(proofs))
+        if view is None:
+            return None
+        return view.factory_method_result(
+            proof.receiver, proof.member, arguments, positional=positional, keywords=keywords
+        )
+
+    def factory_call_inputs(self, proof: FactoryCallProof) -> tuple[FlowValue | None, ...] | None:
+        # This memo belongs to a fixed endpoint and proof view. It never shares
+        # mutable dataflow or bypasses reconstruction for a different call.
+        return self._memo.get("factory_call_inputs", proof, lambda: self._build_factory_call_inputs(proof))
+
+    def _build_factory_call_inputs(self, proof: FactoryCallProof) -> tuple[FlowValue | None, ...] | None:
+        """Rebuild arguments in an isolated source flow, not from annotations.
+
+        The pending callee has not executed while its arguments are evaluated.
+        Exclude only that exact call's prospective effects; all other calls and
+        writes remain barriers. This view cannot publish a return value itself:
+        the caller must still prove every argument recipe and the method body.
+        """
+        engine = self._flow_engine
+        if engine is None or engine.downstream is not self._downstream:
+            return None
+        view = self._factory_context(proof, self._method_proofs | {proof})
+        if view is None:
+            return None
+        module_name, _ = _file_module(proof.file)
+        module = engine.downstream.modules.get(module_name)
+        call = proof.call_in(module.tree) if module is not None else None
+        if module is None or call is None:
+            return None
+        parents = engine.downstream.source_facts.parents(module.tree)
+        function: ast.AST | None = parents.get(id(call))
+        while function is not None and not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function = parents.get(id(function))
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        # No factory callback is installed on this resolver: reconstruction
+        # cannot recursively invoke itself or assume another unknown return.
+        resolver = _DirectDependencyResolver(engine)
+        resolver._upstream_type_source = view._type_source
+        resolver._reference_prefixes = self._reference_prefixes
+        resolver._storage_downstream_effects = view._context_effects
+        resolver._storage_module_effects = {
+            (id(engine.downstream), item.name): view._construction_effects[item.file]
+            for item in engine.downstream.modules.values()
+        }
+        flow = resolver._function_flow(function, module, capture_call_inputs=True)
+        return flow.invocation_inputs.get(id(call))
+
+    @property
+    def files(self) -> set[str]:
+        return self._combined_files
+
+    def tree(self, file_name: str) -> ast.Module | None:
+        normalized = file_name.replace("\\", "/")
+        if normalized in self._downstream_trees:
+            return self._downstream_trees[normalized]
+        return self._upstream.tree(normalized)
+
+    def upstream_fields(self, reference: str) -> list[dict[str, Any]] | None:
+        layout = dataclass_layout(reference, self._constructor_class_source)
+        if layout is None:
+            return None
+        return [asdict(field) for field in layout.fields if field.owner.startswith("vllm.")]
+
+    def initializer_origin(self, reference: str) -> dict[str, Any] | None:
+        binding = self._effective_member(reference, "__init__")
+        if binding is None:
+            return None
+        return {
+            "file": binding.file,
+            "owner": binding.owner,
+            "name": binding.name,
+            "line": getattr(binding.node, "lineno", None),
+            "status": binding.status,
+        }
+
+    def _effective_init_mutations(
+        self, reference: str, mutations: tuple[dict[str, Any], ...], seen: frozenset[str] = frozenset()
+    ) -> tuple[dict[str, Any], ...]:
+        if reference in seen:
+            return ()
+        direct = tuple(item for item in mutations if item["target"] == reference and item["member"] == "__init__")
+        if direct:
+            return direct
+        source = self._constructor_class_source(reference)
+        if source is None:
+            return ()
+        layout = dataclass_layout(reference, self._constructor_class_source)
+        if layout is not None and layout.generates_initializer:
+            return ()
+        if _body_named_binding(source.node.body, "__init__").status != "missing" or len(source.node.bases) != 1:
+            return ()
+        base = self._base_reference(source.file, source.node.bases[0])
+        return self._effective_init_mutations(base, mutations, seen | {reference}) if base is not None else ()
+
+    def dependency_endpoint(self, dependency: DirectCallDependency | DirectAttributeDependency) -> SourceEndpoint:
+        if not self._proofs_valid:
+            return SourceEndpoint(None, None, dependency.member, symbol_kind="unknown")
+        if dependency.receiver_path and not self._method_proofs:
+            proofs = method_path_proofs(dependency.receiver_path)
+            if proofs is None:
+                return SourceEndpoint(None, None, dependency.member, symbol_kind="unknown")
+            if proofs:
+                if proofs not in self._proof_views:
+                    self._proof_views[proofs] = _ConstructorSnapshot(
+                        self._upstream,
+                        self._downstream,
+                        proofs=proofs,
+                        baseline_effects=self._baseline_effects,
+                    )
+                return self._proof_views[proofs].dependency_endpoint(dependency)
+        endpoint = super().dependency_endpoint(dependency)
+        if not isinstance(dependency, DirectCallDependency) or not dependency.constructor_mutations:
+            return endpoint
+        mutations = dependency.constructor_mutations
+        allocation_changed = any(item["member"] != "__init__" for item in mutations)
+        initializer_mutations = self._effective_init_mutations(dependency.target, mutations)
+        if not allocation_changed and not initializer_mutations:
+            return endpoint
+        fingerprint = hashlib.sha256(
+            json.dumps([endpoint.analysis_fingerprint, mutations], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        unknown_return = dict(endpoint.return_contract or {}, status="unknown")
+        unknown = replace(
+            endpoint, signature_status="unknown", analysis_fingerprint=fingerprint, return_contract=unknown_return
+        )
+        if allocation_changed or not initializer_mutations:
+            return unknown
+        if len({item["file"] for item in initializer_mutations}) != 1 or any(
+            item["scope"] is not None for item in initializer_mutations
+        ):
+            return unknown
+        mutation = max(initializer_mutations, key=lambda item: item["line"])
+        if not mutation["exact_module_assignment"]:
+            return unknown
+        reference = mutation["replacement"]
+        replacement = self._resolve_qualified_node(reference) if reference is not None else None
+        # A dataclass layout proves a plain single-inheritance hierarchy and
+        # excludes custom allocation/subclass hooks through the shared lookup.
+        layout = dataclass_layout(dependency.target, self._constructor_class_source)
+        if (
+            layout is None
+            or replacement is None
+            or replacement.status != "exact"
+            or not isinstance(replacement.node, ast.FunctionDef)
+            or replacement.node.decorator_list
+        ):
+            return unknown
+        signature = _bound_signature(
+            _jsonable_signature(replacement.node), descriptor="ordinary", access_kind="constructor"
+        )
+        status = _signature_status(replacement.node, self._return_resolver(replacement.file))
+        return_contract = ReturnContract(
+            protocol="value",
+            variants=(ReturnShape("object", type_ref=dependency.target),),
+            status="exact" if status != "unknown" else "unknown",
+            provenance=("class_constructor", "post_definition_initializer"),
+        )
+        return replace(
+            endpoint,
+            signature=signature,
+            signature_status=status,
+            analysis_fingerprint=fingerprint,
+            return_contract=return_contract.as_dict(),
+        )
+
+
 def _direct_call_findings(
     dependencies: Iterable[DirectCallDependency],
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
     old_to_new: dict[str, str] | None = None,
+    *,
+    downstream_index: RepositoryIndex | None = None,
 ) -> tuple[list[RangeFinding], list[DirectCallDependency]]:
     """Compare exact downstream call and return-use contracts at both SHAs."""
     findings: list[RangeFinding] = []
     exact_dependencies: list[DirectCallDependency] = []
+    constructor_findings: list[RangeFinding] = []
+    constructor_dependencies: list[DirectCallDependency] = []
+    if downstream_index is not None:
+        dependencies = list(dependencies)
+        composite_bases = {"downstream_constructor", "dataclass_replace"}
+        constructors = [item for item in dependencies if item.resolution_basis in composite_bases or item.receiver_path]
+        dependencies = [
+            item for item in dependencies if item.resolution_basis not in composite_bases and not item.receiver_path
+        ]
+        if constructors:
+            old_view = _ConstructorSnapshot(old_snapshot, downstream_index)
+            new_view = _ConstructorSnapshot(new_snapshot, downstream_index)
+            constructor_findings, constructor_dependencies = _direct_call_findings(
+                constructors, old_view, new_view, old_to_new
+            )
+            for finding in constructor_findings:
+                target = finding.details["target"]
+                if finding.details.get("resolution_basis") == "dataclass_replace":
+                    finding.source = "dataclass_replace_detector"
+                    finding.direction = "downstream_replace_to_dataclass_contract"
+                    finding.change = "dataclass replacement field contract changed: " + finding.change
+                    finding.suggestion = "Update replacement keywords for the exact dataclass field contract."
+                    finding.details["replacement_inheritance"] = {
+                        "class": target,
+                        "upstream_fields_old": old_view.upstream_fields(target),
+                        "upstream_fields_new": new_view.upstream_fields(target),
+                    }
+                    continue
+                if finding.details.get("resolution_basis") != "downstream_constructor":
+                    continue
+                finding.direction = "upstream_inheritance_to_downstream_constructor_call"
+                finding.source = "downstream_constructor_detector"
+                finding.change = "upstream inheritance changed the effective downstream constructor: " + finding.change
+                finding.suggestion = (
+                    "Check this call against the fixed downstream class's effective constructor at each upstream SHA. "
+                    "Use the recorded upstream field owners to identify the required adaptation."
+                )
+                finding.details["constructor_inheritance"] = {
+                    "kind": "effective_downstream_constructor",
+                    "class": target,
+                    "upstream_fields_old": old_view.upstream_fields(target),
+                    "upstream_fields_new": new_view.upstream_fields(target),
+                    "initializer_old": old_view.initializer_origin(target),
+                    "initializer_new": new_view.initializer_origin(target),
+                }
     for dependency in dependencies:
         old_endpoint = old_snapshot.dependency_endpoint(dependency)
         new_endpoint = new_snapshot.dependency_endpoint(dependency)
+        old_call_state = old_snapshot.call_state(dependency, old_endpoint)
+        new_call_state = new_snapshot.call_state(dependency, new_endpoint)
+        replacement_protocol = None
+        if dependency.resolution_basis == "dataclass_replace":
+            replacement_protocol = {
+                "old": old_snapshot._dataclass_replace_protocol(dependency)[1],
+                "new": new_snapshot._dataclass_replace_protocol(dependency)[1],
+            }
         relocation: dict[str, Any] | None = None
         if (
             old_endpoint.file is not None
@@ -3642,6 +4604,8 @@ def _direct_call_findings(
             or old_endpoint.symbol_kind != new_endpoint.symbol_kind
             or old_endpoint.signature_status != new_endpoint.signature_status
             or _ambiguous_binding_changed(old_endpoint, new_endpoint)
+            or replacement_protocol is not None
+            and old_call_state != new_call_state
         )
         if parameter_changed:
             contract_kind = (
@@ -3649,8 +4613,8 @@ def _direct_call_findings(
                 if old_endpoint.symbol_kind not in callable_kinds or new_endpoint.symbol_kind not in callable_kinds
                 else "call_arguments"
             )
-            old_state = _direct_call_state(old_endpoint, dependency)
-            new_state = _direct_call_state(new_endpoint, dependency)
+            old_state = old_call_state
+            new_state = new_call_state
             declared_states = {"old": old_state.as_dict(), "new": new_state.as_dict()}
             old_state = _dispatch_state(old_state, dependency.receiver_binding)
             new_state = _dispatch_state(new_state, dependency.receiver_binding)
@@ -3707,7 +4671,9 @@ def _direct_call_findings(
                         "invocation_kind": dependency.invocation_kind,
                         "lookup_root": dependency.lookup_root,
                         "resolution_basis": dependency.resolution_basis,
+                        **({"replacement_protocol": replacement_protocol} if replacement_protocol is not None else {}),
                         "receiver_binding": dependency.receiver_binding,
+                        "receiver_path": list(dependency.receiver_path),
                         "declared_endpoint_compatibility": declared_states,
                         "call_shape": dependency.call_shape.as_dict(),
                         "parameter_delta": _signature_delta(
@@ -3798,6 +4764,7 @@ def _direct_call_findings(
                 details={
                     "target": dependency.target,
                     "receiver_binding": dependency.receiver_binding,
+                    "receiver_path": list(dependency.receiver_path),
                     "declared_endpoint_compatibility": declared_states,
                     "return_use": dependency.return_use.as_dict(),
                     "upstream_old_return": old_endpoint.return_contract,
@@ -3806,22 +4773,34 @@ def _direct_call_findings(
                 },
             )
         )
-    return findings, exact_dependencies
+    return findings + constructor_findings, exact_dependencies + constructor_dependencies
 
 
 def _direct_attribute_findings(
     dependencies: Iterable[DirectAttributeDependency],
     old_snapshot: GitSnapshot,
     new_snapshot: GitSnapshot,
+    *,
+    downstream_index: RepositoryIndex | None = None,
 ) -> tuple[list[RangeFinding], list[DirectAttributeDependency]]:
     """Compare exact downstream member-read presence at both SHAs."""
 
     findings: list[RangeFinding] = []
     exact_dependencies: list[DirectAttributeDependency] = []
+    old_receiver_snapshot, new_receiver_snapshot = old_snapshot, new_snapshot
+    if downstream_index is not None:
+        dependencies = list(dependencies)
+        if any(item.receiver_path for item in dependencies):
+            # Reuse the same fixed downstream ASTs at both upstream endpoints.
+            # The actual child can shadow an upstream field or descriptor.
+            old_receiver_snapshot = _ConstructorSnapshot(old_snapshot, downstream_index)
+            new_receiver_snapshot = _ConstructorSnapshot(new_snapshot, downstream_index)
     for dependency in dependencies:
         endpoint_receiver = dependency.lookup_root or dependency.receiver_type
-        old_endpoint = old_snapshot.dependency_endpoint(dependency)
-        new_endpoint = new_snapshot.dependency_endpoint(dependency)
+        old_endpoint_view = old_receiver_snapshot if dependency.receiver_path else old_snapshot
+        new_endpoint_view = new_receiver_snapshot if dependency.receiver_path else new_snapshot
+        old_endpoint = old_endpoint_view.dependency_endpoint(dependency)
+        new_endpoint = new_endpoint_view.dependency_endpoint(dependency)
         exact_dependencies.append(dependency)
         old_state = _direct_attribute_state(old_endpoint)
         new_state = _direct_attribute_state(new_endpoint)
@@ -3889,7 +4868,10 @@ def _direct_attribute_findings(
                 old_state=old_state,
                 new_state=new_state,
                 change=(
-                    "declared upstream attribute changed; concrete receiver may resolve a downstream member"
+                    "declared upstream attribute changed; preceding effects invalidated the receiver proof"
+                    if dependency.receiver_binding is not None
+                    and dependency.receiver_binding.get("kind") == "invalidated_parameter_receiver"
+                    else "declared upstream attribute changed; concrete receiver may resolve a downstream member"
                     if dependency.receiver_binding is not None
                     else "upstream attribute presence could not be proven at both endpoints"
                     if unresolved
@@ -3898,7 +4880,10 @@ def _direct_attribute_findings(
                 evidence=[dependency.as_dict()],
                 gates=gates,
                 suggestion=(
-                    "Resolve the caller receiver and local property; retain separate breaks inside its getter."
+                    "Re-establish receiver provenance after preceding effects before proposing field adaptation."
+                    if dependency.receiver_binding is not None
+                    and dependency.receiver_binding.get("kind") == "invalidated_parameter_receiver"
+                    else "Resolve the caller receiver and local property; retain separate breaks inside its getter."
                     if dependency.receiver_binding is not None
                     else "Inspect the unresolved upstream runtime attribute binding; do not assume an introduced break."
                     if unresolved
@@ -4766,15 +5751,50 @@ def validate_current_contracts(
     """Validate exact call, member-presence, and return contracts for one source pair."""
 
     plan = plan or resolve_analysis_plan()
-    discovered_dependencies = DirectCallDetector(engine).discover() if plan.analyze_direct_calls else []
-    discovered_attributes = DirectAttributeDetector(engine).discover() if plan.analyze_direct_attributes else []
+    factory_snapshot = _ConstructorSnapshot(snapshot, engine.downstream, flow_engine=engine)
+    receiver_flow_cache_key = object()
+    discovered_dependencies = (
+        DirectCallDetector(
+            engine,
+            factory_evaluator=factory_snapshot.evaluate_factory_call,
+            factory_input_resolver=factory_snapshot.factory_call_inputs,
+            receiver_flow_cache_key=receiver_flow_cache_key,
+        ).discover()
+        if plan.analyze_direct_calls
+        else []
+    )
+    discovered_attributes = (
+        DirectAttributeDetector(
+            engine,
+            factory_evaluator=factory_snapshot.evaluate_factory_call,
+            factory_input_resolver=factory_snapshot.factory_call_inputs,
+            receiver_flow_cache_key=receiver_flow_cache_key,
+        ).discover()
+        if plan.analyze_direct_attributes
+        else []
+    )
     dependencies: list[DirectCallDependency] = []
     attribute_dependencies: list[DirectAttributeDependency] = []
     findings: list[dict[str, Any]] = []
+    constructor_snapshot = (
+        _ConstructorSnapshot(snapshot, engine.downstream)
+        if any(
+            item.resolution_basis in {"downstream_constructor", "dataclass_replace"} or item.receiver_path
+            for item in discovered_dependencies
+        )
+        or any(item.receiver_path for item in discovered_attributes)
+        else snapshot
+    )
     for dependency in discovered_dependencies:
-        upstream = snapshot.dependency_endpoint(dependency)
+        endpoint_snapshot = (
+            constructor_snapshot
+            if dependency.resolution_basis in {"downstream_constructor", "dataclass_replace"}
+            or dependency.receiver_path
+            else snapshot
+        )
+        upstream = endpoint_snapshot.dependency_endpoint(dependency)
         dependencies.append(dependency)
-        argument_state = _direct_call_state(upstream, dependency)
+        argument_state = endpoint_snapshot.call_state(dependency, upstream)
         if argument_state.compatible is not True:
             argument_state = _dispatch_state(argument_state, dependency.receiver_binding)
             findings.append(
@@ -4815,7 +5835,8 @@ def validate_current_contracts(
                 )
 
     for attribute_dependency in discovered_attributes:
-        upstream = snapshot.dependency_endpoint(attribute_dependency)
+        endpoint_snapshot = constructor_snapshot if attribute_dependency.receiver_path else snapshot
+        upstream = endpoint_snapshot.dependency_endpoint(attribute_dependency)
         attribute_dependencies.append(attribute_dependency)
         state = _direct_attribute_state(upstream)
         if state.compatible is True:
@@ -4973,6 +5994,47 @@ def analyze_range(
     cache_dir: Path | None = None,
     cache_enabled: bool = True,
 ) -> dict[str, Any]:
+    """Run analysis and release all lazy Git readers even on failure."""
+    with ExitStack() as resources:
+        return _analyze_range(
+            vllm_root=vllm_root,
+            ascend_root=ascend_root,
+            old=old,
+            new=new,
+            expect_ascend_sha=expect_ascend_sha,
+            external_roots=external_roots,
+            external_shas=external_shas,
+            profile=profile,
+            scenario=scenario,
+            analysis_workers=analysis_workers,
+            downstream_index_cache_dir=downstream_index_cache_dir,
+            upstream_file_index_cache_dir=upstream_file_index_cache_dir,
+            index_workers=index_workers,
+            cache_dir=cache_dir,
+            cache_enabled=cache_enabled,
+            resources=resources,
+        )
+
+
+def _analyze_range(
+    *,
+    resources: ExitStack,
+    vllm_root: Path,
+    ascend_root: Path,
+    old: str,
+    new: str,
+    expect_ascend_sha: str,
+    external_roots: dict[str, Path] | None = None,
+    external_shas: dict[str, str] | None = None,
+    profile: str = "exact-contracts",
+    scenario: str = MAIN2MAIN_SCENARIO,
+    analysis_workers: int = 3,
+    downstream_index_cache_dir: Path | None = None,
+    upstream_file_index_cache_dir: Path | None = None,
+    index_workers: int = 1,
+    cache_dir: Path | None = None,
+    cache_enabled: bool = True,
+) -> dict[str, Any]:
     """Run the selected source-analysis plan for an exact vLLM range."""
     analysis_started = time.perf_counter()
     phase_started = time.perf_counter()
@@ -5095,6 +6157,7 @@ def analyze_range(
         cache_safe=upstream_cache_safe,
         unsafe_reason=upstream_cache_reason,
     )
+    resources.callback(old_snapshot.close)
     new_snapshot, new_snapshot_cache = _load_snapshot(
         persistent_cache,
         vllm_root,
@@ -5102,6 +6165,7 @@ def analyze_range(
         cache_safe=upstream_cache_safe,
         unsafe_reason=upstream_cache_reason,
     )
+    resources.callback(new_snapshot.close)
     old_to_new, new_to_old = _rename_maps(vllm_root, old_sha, new_sha)
     changed_upstream_files = _changed_python_files(vllm_root, old_sha, new_sha)
     registered_overrides = _registered_oot_overrides(generator)
@@ -5149,6 +6213,10 @@ def analyze_range(
             "vllm_new_sha": new_sha,
         },
     )
+    new_receiver_flow_cache_key = object()
+    old_receiver_flow_cache_key = object()
+
+    discovery_metrics: dict[str, dict[str, Any]] = {}
 
     def analyze_relations() -> tuple[list[RangeFinding], float]:
         started = time.perf_counter()
@@ -5193,7 +6261,9 @@ def analyze_range(
             import_references = cached_imports
         else:
             discovery_started = time.perf_counter()
-            import_references = discover_imports(ascend_root)
+            import_references = discover_imports(
+                ascend_root, trees={m.file: m.tree for m in generator.downstream.modules.values()}
+            )
             discovery_seconds = time.perf_counter() - discovery_started
             if downstream_cache_safe:
                 persistent_cache.store(
@@ -5242,8 +6312,20 @@ def analyze_range(
             discovered_direct_calls = cached_calls["dependencies"]
             historical_candidates = cached_calls["historical_candidates"]
         else:
-            direct_call_detector = DirectCallDetector(generator, historical_type_source=old_snapshot._type_source)
+            call_old_factory = _ConstructorSnapshot(old_snapshot, generator.downstream, flow_engine=generator)
+            call_new_factory = _ConstructorSnapshot(new_snapshot, generator.downstream, flow_engine=generator)
+            direct_call_detector = DirectCallDetector(
+                generator,
+                historical_type_source=old_snapshot._type_source,
+                factory_evaluator=call_new_factory.evaluate_factory_call,
+                historical_factory_evaluator=call_old_factory.evaluate_factory_call,
+                factory_input_resolver=call_new_factory.factory_call_inputs,
+                historical_factory_input_resolver=call_old_factory.factory_call_inputs,
+                receiver_flow_cache_key=new_receiver_flow_cache_key,
+                historical_receiver_flow_cache_key=old_receiver_flow_cache_key,
+            )
             discovered_direct_calls = direct_call_detector.discover()
+            discovery_metrics["direct_calls"] = direct_call_detector.metrics()
             historical_candidates = direct_call_detector.historical_candidates
             if relation_cache_safe:
                 persistent_cache.store(
@@ -5270,6 +6352,7 @@ def analyze_range(
             old_snapshot,
             new_snapshot,
             old_to_new,
+            downstream_index=generator.downstream,
         )
         return (
             branch_findings,
@@ -5314,10 +6397,20 @@ def analyze_range(
             discovered_attributes = cached_attributes["dependencies"]
             historical_candidates = cached_attributes["historical_candidates"]
         else:
+            attribute_old_factory = _ConstructorSnapshot(old_snapshot, generator.downstream, flow_engine=generator)
+            attribute_new_factory = _ConstructorSnapshot(new_snapshot, generator.downstream, flow_engine=generator)
             direct_attribute_detector = DirectAttributeDetector(
-                generator, historical_type_source=old_snapshot._type_source
+                generator,
+                historical_type_source=old_snapshot._type_source,
+                factory_evaluator=attribute_new_factory.evaluate_factory_call,
+                historical_factory_evaluator=attribute_old_factory.evaluate_factory_call,
+                factory_input_resolver=attribute_new_factory.factory_call_inputs,
+                historical_factory_input_resolver=attribute_old_factory.factory_call_inputs,
+                receiver_flow_cache_key=new_receiver_flow_cache_key,
+                historical_receiver_flow_cache_key=old_receiver_flow_cache_key,
             )
             discovered_attributes = direct_attribute_detector.discover()
+            discovery_metrics["direct_attributes"] = direct_attribute_detector.metrics()
             historical_candidates = direct_attribute_detector.historical_attribute_candidates
             if relation_cache_safe:
                 persistent_cache.store(
@@ -5343,6 +6436,7 @@ def analyze_range(
             discovered_attributes,
             old_snapshot,
             new_snapshot,
+            downstream_index=generator.downstream,
         )
         return (
             branch_findings,
@@ -5372,6 +6466,7 @@ def analyze_range(
         + int(plan.analyze_inherited_state)
     )
     effective_workers = min(analysis_workers, branch_count)
+    branches_started = time.perf_counter()
     if effective_workers > 1:
         with ThreadPoolExecutor(
             max_workers=effective_workers,
@@ -5396,6 +6491,7 @@ def analyze_range(
         direct_attribute_result = analyze_direct_attributes() if plan.analyze_direct_attributes else None
         inherited_state_result = analyze_inherited_state() if plan.analyze_inherited_state else None
 
+    _record_diagnostic_timing("analysis_branches_wall", time.perf_counter() - branches_started, timings)
     findings, relation_elapsed = relation_result
     _record_diagnostic_timing("relation_comparison", relation_elapsed, timings)
     if import_result is not None:
@@ -5726,6 +6822,9 @@ def analyze_range(
 
     relation_cache_hit = relation_cache_result.status == "hit"
     stage_timings = {
+        "analysis_branches_wall": timing_value("analysis_branches_wall"),
+        "direct_call_discovery": timings.get("direct_call_discovery"),
+        "direct_attribute_discovery": timings.get("direct_attribute_discovery"),
         "downstream_scanning_parsing": timing_value("repository_indexing.downstream"),
         "downstream_relation_generation": round(
             relation_cache_result.load_seconds
@@ -5790,6 +6889,20 @@ def analyze_range(
                 "events": cache_events,
             },
             "stage_timings_seconds": stage_timings,
+            "reuse_metrics": {
+                "discovery": discovery_metrics,
+                "downstream_source_facts": generator.downstream.source_facts.metrics(),
+                "old_snapshot": old_snapshot._memo.metrics(),
+                "new_snapshot": new_snapshot._memo.metrics(),
+            },
+            "timing_semantics": {
+                "version": 1,
+                "analysis_branches_wall": "Elapsed time covering all scheduled analysis branches, including discovery.",
+                "contract_comparison": "Sum of branch durations, not wall time; parallel branches overlap.",
+                "stage_totals_additive": False,
+                "snapshot_work": "Lazy snapshot work may also be included in branch durations.",
+                "cache_estimated_saved": "Historical build times minus loads, not measured wall-time savings.",
+            },
             "timings_seconds": timings,
         },
         "summary": {
@@ -6012,6 +7125,13 @@ def _root_cause_key(item: dict[str, Any]) -> tuple[object, ...]:
     """Group affected relations by the upstream change that caused them."""
 
     details = item.get("details", {})
+    if item.get("contract_kind") == "patch_consumer_route":
+        return (
+            "patch_consumer_route",
+            details.get("patch_target"),
+            item["upstream"]["new"].get("owner"),
+            details.get("factory_attribute"),
+        )
     old = item["upstream"]["old"]
     new = item["upstream"]["new"]
     root = details.get("root_upstream") or old

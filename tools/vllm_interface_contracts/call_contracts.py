@@ -24,12 +24,16 @@ from __future__ import annotations
 
 import ast
 import json
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import asdict, dataclass, replace
+from types import MappingProxyType
 from typing import Any
 
 from .annotation_names import AnnotationNamespace
-from .dataclass_contracts import ClassSource
+from .construction_effects import construction_effects, has_construction_effect, has_storage_effect
+from .dataclass_contracts import ClassSource, dataclass_storage
+from .factory_returns import factory_body_supported, proven_factory_return
 from .generator import (
     _TRITON_JIT_DECORATOR,
     _TRITON_KERNEL_PROTOCOL,
@@ -40,21 +44,40 @@ from .generator import (
     _function_local_names,
     _function_scope_nodes,
     _inspect_signature,
+    _scope_final_bindings,
     _scope_reference_variants,
+    _ScopeBinding,
+    _ScopePrefixCache,
     _statements_must_terminate,
     _tag_guard_names,
 )
 from .helper_effects import HelperEffects, HelperSummary
+from .method_context import (
+    MAX_METHOD_CONTEXTS,
+    FactoryCallProof,
+    FactoryEvaluator,
+    FactoryInputResolver,
+    MethodCallProof,
+    method_body_hash,
+)
 from .receiver_constraints import ReceiverConstraints
+from .source_facts import SourceFacts
 from .type_flow import (
     TYPE_BUILTINS,
     ContainerFlow,
     FlowValue,
     HelperCallEffects,
+    HelperResolver,
     Lookup,
     TypeShape,
+    factory_context_value,
     instance_field_origin,
+    method_context_value,
+    method_path_proofs,
 )
+
+MAX_FACTORY_RETURN_DEPTH = 16
+MAX_RESOLVER_SCOPE_CACHES = 8
 
 
 @dataclass(frozen=True)
@@ -147,6 +170,7 @@ class DirectCallDependency:
     resolution_basis: str = "new_exact"
     receiver_path: tuple[str, ...] = ()
     receiver_binding: dict[str, Any] | None = None
+    constructor_mutations: tuple[dict[str, Any], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -966,17 +990,50 @@ def _annotation_reference(node: ast.AST | None) -> str | None:
     return _expression_name(node)
 
 
+@dataclass(frozen=True)
+class _ReceiverFlowSummary:
+    """Read-only receiver proof detached from one resolver's callbacks."""
+
+    receivers: Mapping[int, FlowValue]
+    invalidated_receivers: frozenset[int]
+
+
 class _DirectDependencyResolver:
     """Shared exact name, receiver, and MRO resolution for downstream uses."""
 
-    def __init__(self, engine: InterfaceBoundaryGenerator, *, historical_type_source: Lookup | None = None):
+    _reference_prefixes: tuple[str, ...] = ("vllm.",)
+
+    def __init__(
+        self,
+        engine: InterfaceBoundaryGenerator,
+        *,
+        historical_type_source: Lookup | None = None,
+        factory_evaluator: FactoryEvaluator | None = None,
+        historical_factory_evaluator: FactoryEvaluator | None = None,
+        factory_input_resolver: FactoryInputResolver | None = None,
+        historical_factory_input_resolver: FactoryInputResolver | None = None,
+        receiver_flow_cache_key: object | None = None,
+        historical_receiver_flow_cache_key: object | None = None,
+    ):
         self.engine = engine
+        self._facts = getattr(getattr(engine, "downstream", None), "source_facts", None) or SourceFacts()
+        self._prefix_cache = _ScopePrefixCache()
+        self._factory_evaluator = factory_evaluator
+        self._factory_input_resolver = factory_input_resolver
         self._upstream_type_source: Lookup | None = None
+        self._receiver_flow_cache_key = receiver_flow_cache_key
         self._historical_flow_resolver = (
-            _DirectDependencyResolver(engine) if historical_type_source is not None else None
+            _DirectDependencyResolver(
+                engine,
+                receiver_flow_cache_key=historical_receiver_flow_cache_key,
+            )
+            if historical_type_source is not None
+            else None
         )
         if self._historical_flow_resolver is not None:
             self._historical_flow_resolver._upstream_type_source = historical_type_source
+            self._historical_flow_resolver._factory_evaluator = historical_factory_evaluator
+            self._historical_flow_resolver._factory_input_resolver = historical_factory_input_resolver
         self.historical_candidates: list[DirectCallDependency] = []
         self._candidate_roots: dict[tuple[str, int], frozenset[str]] = {}
         self._constructed_instances: dict[
@@ -985,26 +1042,313 @@ class _DirectDependencyResolver:
         ] = {}
         self._function_locals: dict[int, frozenset[str]] = {}
         self._scope_tag_guards: dict[int, set[str]] = {}
+        self._scope_states: dict[int, dict[int, dict[str, tuple[_ScopeBinding, ...]]]] = {}
         self._instance_member_types: dict[tuple[str, str], frozenset[str] | None] = {}
-        self._container_flows: dict[int, ContainerFlow] = {}
+        self._container_flows: dict[
+            tuple[int, bool, tuple[tuple[str, FlowValue | None], ...] | None], ContainerFlow
+        ] = {}
+        self._receiver_flow_summaries: dict[int, _ReceiverFlowSummary] = {}
+        self._factory_returns: dict[tuple[str, tuple[tuple[str, FlowValue | None], ...]], FlowValue | None] = {}
+        self._factory_stack: set[str] = set()
         self._annotation_namespaces: dict[tuple[int, str], AnnotationNamespace] = {}
         self._helper_summaries: dict[tuple[str, tuple[tuple[str, TypeShape | None], ...]], HelperSummary] = {}
         self._parent_maps: dict[str, dict[int, ast.AST]] = {}
         self._stored_field_origins: dict[tuple[str, str], tuple[str, TypeShape, str, bool] | None] = {}
         self._receiver_constraints = ReceiverConstraints(engine)
+        self._storage_module_effects: dict[tuple[int, str], frozenset[str]] = {}
+        self._storage_downstream_effects: frozenset[str] | None = None
+        self._storage_references: dict[str, bool] = {}
+        self._replacement_roots: dict[str, set[str]] = {}
+        self._method_proofs: frozenset[MethodCallProof] = frozenset()
+        self._flow_metrics: dict[str, dict[str, float]] = {}
+
+    def _source_module_effects(self, index: RepositoryIndex, module: ModuleInfo) -> frozenset[str]:
+        return self._facts.get(
+            "construction_effects",
+            (module.tree, module.name, module.is_package),
+            lambda: construction_effects(module.tree, module.name, module.is_package),
+        )
+
+    def _function_nodes(self, function: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.AST, ...]:
+        return self._facts.get("function_scope_nodes", function, lambda: tuple(_function_scope_nodes(function)))
+
+    def metrics(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"flows": self._flow_metrics, "scope_prefixes": self._prefix_cache.metrics()}
+        if self._historical_flow_resolver is not None:
+            result["historical"] = self._historical_flow_resolver.metrics()
+        return result
+
+    def _bind_flow_method(
+        self,
+        call: ast.Call,
+        receiver: FlowValue | None,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        module: ModuleInfo,
+    ) -> HelperResolver | None:
+        fixed = self._bound_factory_method(call, receiver, function, module)
+        if self._factory_evaluator is None or receiver is not None or not isinstance(call.func, ast.Attribute):
+            return fixed
+        expression = _expression_name(call.func.value)
+        if expression is None or expression.split(".")[0] in self._local_names(function):
+            return fixed
+        parents = self._parent_maps[module.name]
+        root = expression.split(".")[0]
+        if self._outer_function_shadows(call, root, parents, function) or (
+            DownstreamConstructorDetector._expression_scope_shadows(call, root, parents)
+        ):
+            return fixed
+        reference = self._resolve_in_scope(
+            call.func.value,
+            function=function,
+            module_info=module,
+            line=call.lineno,
+            reference_prefixes=("vllm.", "vllm_ascend."),
+        )
+        if reference is None:
+            return fixed
+        proof = FactoryCallProof.decode(
+            [
+                module.file.replace("\\", "/"),
+                call.lineno,
+                call.col_offset,
+                call.end_lineno,
+                call.end_col_offset,
+                reference,
+                call.func.attr,
+            ]
+        )
+        if proof is None or proof.call_in(module.tree) is not call:
+            return fixed
+        evaluate = self._factory_evaluator
+
+        def invoke(node: ast.Call, values: tuple[FlowValue | None, ...]) -> HelperCallEffects | None:
+            # The fixed binder may bind successfully but fail its body proof.
+            # Fall back after argument evaluation, without evaluating it twice.
+            prior = fixed(node, values) if fixed is not None else None
+            if prior is not None:
+                return prior
+            if any(isinstance(arg, ast.Starred) for arg in node.args) or any(kw.arg is None for kw in node.keywords):
+                return None
+            positional = len(node.args)
+            keywords = tuple(kw.arg for kw in node.keywords if kw.arg is not None)
+            actual = values
+            if any(value is None or method_path_proofs(value.path, require_complete=True) is None for value in actual):
+                repaired = self._factory_input_resolver(proof) if self._factory_input_resolver is not None else None
+                if repaired is None or len(repaired) != len(values):
+                    return None
+                actual = repaired
+            result = evaluate(proof, actual, positional, keywords)
+            if result is None:
+                return None
+            result = factory_context_value(result, proof, actual, positional, keywords)
+            if result is None:
+                return None
+            return HelperCallEffects(
+                frozenset(range(len(values))),
+                frozenset(),
+                None,
+                None,
+                result if result.owned is None else None,
+                result if result.owned is not None else None,
+            )
+
+        return invoke
+
+    def _bound_factory_method(
+        self,
+        call: ast.Call,
+        receiver: FlowValue | None,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        module: ModuleInfo,
+    ) -> HelperResolver | None:
+        """Bind only a unique fixed downstream method, never an annotation owner."""
+        if not isinstance(call.func, ast.Attribute):
+            return None
+        member = call.func
+        instance = receiver is not None
+        if receiver is not None:
+            if not receiver.constructed or member.attr in dict(receiver.stored_fields):
+                return None
+            class_reference = receiver.shape.reference
+        else:
+            expression = _expression_name(member.value)
+            if expression is None or expression.split(".")[0] in self._local_names(function):
+                return None
+            parents = self._parent_maps[module.name]
+            root = expression.split(".")[0]
+            if self._outer_function_shadows(call, root, parents, function) or (
+                DownstreamConstructorDetector._expression_scope_shadows(call, root, parents)
+            ):
+                return None
+            resolved_class = self._resolve_in_scope(
+                member.value,
+                function=function,
+                module_info=module,
+                line=call.lineno,
+                reference_prefixes=("vllm_ascend.",),
+            )
+            if resolved_class is None:
+                return None
+            class_reference = resolved_class
+        if not class_reference.startswith("vllm_ascend."):
+            return None
+        mro = self.engine._linearized_mro(class_reference)
+        if not mro.complete:
+            return None
+        resolution = self.engine._effective_method_resolution(mro.owners, member.attr)
+        if (
+            len(resolution.callable_owners) != 1
+            or resolution.may_be_missing
+            or resolution.may_be_non_callable
+            or resolution.has_unresolved_value
+        ):
+            return None
+        owner = resolution.callable_owners[0]
+        # An upstream owner preceding the selected method may change at old.
+        if any(not item.startswith("vllm_ascend.") for item in mro.owners[: mro.owners.index(owner) + 1]):
+            return None
+        for item in mro.owners:
+            source = self._type_source(item)
+            if source is None or source.node.keywords:
+                return None
+            if "__init_subclass__" in _scope_final_bindings(source.node.body, set()):
+                # Class creation can replace the apparent method before any
+                # callsite executes; its lexical body is not a runtime proof.
+                return None
+            for decorator in source.node.decorator_list:
+                expression = _expression_name(decorator.func if isinstance(decorator, ast.Call) else decorator)
+                if expression is None or source.resolve(expression) != "dataclasses.dataclass":
+                    return None
+        reference = f"{owner}.{member.attr}"
+        info = self.engine.downstream.find_callable(reference)
+        bindings = self.engine.downstream.find_final_bindings(reference)
+        if (
+            info is None
+            or not isinstance(info.node, ast.FunctionDef)
+            or len(bindings) != 1
+            or bindings[0].node is not info.node
+            or info.node.args.vararg
+            or info.node.args.kwarg
+        ):
+            return None
+        descriptor = info.descriptor_kind
+        if descriptor not in {"ordinary", "staticmethod", "classmethod"}:
+            return None
+        if descriptor == "ordinary" and (not instance or info.node.decorator_list):
+            return None
+        if descriptor != "ordinary" and (
+            len(info.node.decorator_list) != 1
+            or info.decorator_references not in {(descriptor,), (f"builtins.{descriptor}",)}
+        ):
+            return None
+        signature = _inspect_signature(info.signature) if info.signature is not None else None
+        if signature is None:
+            return None
+        proof = MethodCallProof.decode(
+            [
+                module.file.replace("\\", "/"),
+                call.lineno,
+                call.col_offset,
+                call.end_lineno,
+                call.end_col_offset,
+                class_reference,
+                reference,
+                method_body_hash(info.node),
+            ]
+        )
+        if proof is None or proof.call_in(module.tree) is not call:
+            return None
+        proofs = self._method_proofs | {proof}
+        if len(proofs) > MAX_METHOD_CONTEXTS:
+            return None
+        # Keep every other class call, write and escape. The one excluded call
+        # is accepted below only if its actual body has a complete pure return.
+        effects: set[str] = set()
+        context_effects: dict[tuple[int, str], frozenset[str]] = {}
+        for effect_module in self.engine.downstream.modules.values():
+            key = (id(self.engine.downstream), effect_module.name)
+            module_proofs = [item for item in proofs if item.file == effect_module.file.replace("\\", "/")]
+            if module_proofs:
+                calls = [item.call_in(effect_module.tree) for item in module_proofs]
+                if any(item is None for item in calls):
+                    return None
+                context_effects[key] = construction_effects(
+                    effect_module.tree,
+                    effect_module.name,
+                    effect_module.is_package,
+                    bound_receiver_calls=frozenset(id(item) for item in calls),
+                )
+            else:
+                if key not in self._storage_module_effects:
+                    self._storage_module_effects[key] = self._source_module_effects(
+                        self.engine.downstream, effect_module
+                    )
+                context_effects[key] = self._storage_module_effects[key]
+            effects.update(context_effects[key])
+        if (
+            any(has_construction_effect(item, frozenset(effects)) for item in mro.owners)
+            or has_construction_effect(reference, frozenset(effects))
+            or any(effect.startswith(reference + ".") for effect in effects)
+        ):
+            return None
+        method_node = info.node
+        method_module = self.engine.downstream.modules[info.module]
+        # A separate resolver owns the prospective context and all its caches.
+        # Nothing escapes it until the complete fixed method proof succeeds.
+        contextual = _DirectDependencyResolver(self.engine)
+        contextual._upstream_type_source = self._upstream_type_source
+        contextual._reference_prefixes = self._reference_prefixes
+        contextual._method_proofs = frozenset(proofs)
+        contextual._storage_module_effects = context_effects
+        contextual._storage_downstream_effects = frozenset(effects)
+
+        def resolve_bound(node: ast.Call, values: tuple[FlowValue | None, ...]) -> HelperCallEffects | None:
+            if any(isinstance(arg, ast.Starred) for arg in node.args) or any(kw.arg is None for kw in node.keywords):
+                return None
+            implicit: tuple[FlowValue | None, ...] = ()
+            if descriptor == "ordinary":
+                implicit = (receiver,)
+            elif descriptor == "classmethod":
+                implicit = (FlowValue(TypeShape("class", (TypeShape(class_reference),)), (class_reference,)),)
+            try:
+                bound = signature.bind(
+                    *implicit,
+                    *values[: len(node.args)],
+                    **{kw.arg: values[len(node.args) + offset] for offset, kw in enumerate(node.keywords) if kw.arg},
+                )
+            except TypeError:
+                return None
+            contextual._factory_stack = set(self._factory_stack)
+            result = contextual._factory_return(reference, method_node, method_module, dict(bound.arguments))
+            if result is None:
+                return None
+            result = method_context_value(result, proof)
+            if result is None:
+                return None
+            return HelperCallEffects(
+                frozenset(range(len(values))),
+                frozenset(),
+                None,
+                None,
+                result if result.owned is None else None,
+                result if result.owned is not None else None,
+            )
+
+        return resolve_bound
 
     def _helper_call_effects(
         self, call: ast.Call, values: tuple[FlowValue | None, ...], function: ast.AST, module: ModuleInfo
     ) -> HelperCallEffects | None:
         expression = _expression_name(call.func)
-        if not any(
-            value is not None and ("vllm." in value.shape.render() or any("vllm." in root for root in value.roots))
-            for value in values
-        ):
-            return None
         if expression is None or not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return None
         if expression.split(".", 1)[0] in self._local_names(function):
+            return None
+        parents = self._parent_maps[module.name]
+        root = expression.split(".", 1)[0]
+        if self._outer_function_shadows(call, root, parents, function) or (
+            DownstreamConstructorDetector._expression_scope_shadows(call, root, parents)
+        ):
             return None
         if any(isinstance(arg, ast.Starred) for arg in call.args) or any(kw.arg is None for kw in call.keywords):
             return None
@@ -1041,6 +1385,17 @@ class _DirectDependencyResolver:
             for name, position in positions.items()
             for value in (values[position],)
         }
+        exact_return = self._factory_return(
+            reference,
+            info.node,
+            index.modules[info.module],
+            {name: values[position] for name, position in positions.items()},
+        )
+        if exact_return is None and not any(
+            value is not None and ("vllm." in value.shape.render() or any("vllm." in root for root in value.roots))
+            for value in values
+        ):
+            return None
         key = (reference, tuple(sorted(shapes.items())))
         if key not in self._helper_summaries:
             helper_module = index.modules[info.module]
@@ -1053,6 +1408,16 @@ class _DirectDependencyResolver:
 
             self._helper_summaries[key] = HelperEffects(info.node, shapes, resolve, self._type_source).summary
         summary = self._helper_summaries[key]
+        unsafe_roots = frozenset(
+            root
+            for name, position in positions.items()
+            if name in summary.unsafe
+            for value in (values[position],)
+            if value is not None
+            for root in value.roots
+        )
+        if exact_return is not None and exact_return.roots & unsafe_roots:
+            exact_return = None
         mutated_return = bool(summary.returned & summary.unsafe)
         return_path = None
         if not mutated_return and summary.return_path is not None and summary.return_path[0] in positions:
@@ -1064,17 +1429,69 @@ class _DirectDependencyResolver:
             frozenset(position for name, position in positions.items() if name in summary.returned),
             None if mutated_return else summary.return_shape,
             return_path,
+            exact_return if exact_return is not None and exact_return.owned is None else None,
+            exact_return if exact_return is not None and exact_return.owned is not None else None,
         )
+
+    def _factory_return(
+        self,
+        reference: str,
+        function: ast.FunctionDef,
+        module: ModuleInfo,
+        parameters: dict[str, FlowValue | None],
+    ) -> FlowValue | None:
+        """Keep a replayable allocation only when all supported paths agree.
+
+        New allocations discard their helper-local outer identity; returned
+        inputs retain caller identities and alias origins. Closures, escapes and
+        unknown runtime protocols cannot be justified by annotations alone.
+        """
+        if reference in self._factory_stack or len(self._factory_stack) >= MAX_FACTORY_RETURN_DEPTH:
+            return None
+        if any(value is None for value in parameters.values()):
+            return None
+        key = (reference, tuple(sorted(parameters.items())))
+        if key in self._factory_returns:
+            return self._factory_returns[key]
+        self._factory_returns[key] = None
+        if not factory_body_supported(function):
+            return None
+        self._factory_stack.add(reference)
+        try:
+            flow = self._function_flow(function, module, factory_parameters=parameters)
+            if has_construction_effect(reference, self._storage_downstream_effects or frozenset()):
+                # A source-visible function-object write/escape invalidates the
+                # body proof even when its name still resolves to one FunctionDef.
+                return None
+            self._factory_returns[key] = proven_factory_return(flow, parameters)
+            return self._factory_returns[key]
+        finally:
+            self._factory_stack.remove(reference)
 
     def _annotation_namespace(self, index: RepositoryIndex, module: ModuleInfo) -> AnnotationNamespace:
         key = (id(index), module.name)
         if key not in self._annotation_namespaces:
-            self._annotation_namespaces[key] = AnnotationNamespace(module.tree, module.name, module.is_package)
+            self._annotation_namespaces[key] = self._facts.get(
+                "annotation_namespace",
+                (index, module.tree, module.name, module.is_package),
+                lambda: AnnotationNamespace(module.tree, module.name, module.is_package, source_facts=self._facts),
+            )
         return self._annotation_namespaces[key]
+
+    def _context_source(self, source: ClassSource | None, reference: str) -> ClassSource | None:
+        if source is None or not self._method_proofs:
+            return source
+        effects = self._storage_downstream_effects or frozenset()
+        return replace(
+            source,
+            storage_effects=source.storage_effects
+            or has_storage_effect(reference, effects)
+            or has_storage_effect(source.qualified_name, effects),
+        )
 
     def _type_source(self, reference: str) -> ClassSource | None:
         if reference.startswith("vllm.") and self._upstream_type_source is not None:
-            return self._upstream_type_source(reference)
+            return self._context_source(self._upstream_type_source(reference), reference)
         index = self.engine.upstream if reference.startswith("vllm.") else self.engine.downstream
         info = index.find_callable(reference)
         if info is None or not isinstance(info.node, ast.ClassDef):
@@ -1087,18 +1504,126 @@ class _DirectDependencyResolver:
             target = namespace.resolve(expression)
             return index.canonical_name(target) if target is not None else None
 
-        return ClassSource(info.node, resolve, info.file, reference)
+        effect_key = (id(index), info.module)
+        if effect_key not in self._storage_module_effects:
+            module = index.modules[info.module]
+            self._storage_module_effects[effect_key] = self._source_module_effects(index, module)
+        effects = self._storage_module_effects[effect_key]
+        return self._context_source(
+            ClassSource(
+                info.node,
+                resolve,
+                info.file,
+                reference,
+                has_storage_effect(reference, effects)
+                or has_storage_effect(f"{info.module}.{info.node.name}", effects),
+            ),
+            reference,
+        )
 
-    def _container_receiver(
+    def _storage_constructor(
         self,
-        member: ast.Attribute,
-        function: ast.FunctionDef | ast.AsyncFunctionDef | None,
+        call: ast.Call,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
         module: ModuleInfo,
-    ) -> FlowValue | None:
-        if function is None:
+    ) -> str | None:
+        expression = _expression_name(call.func)
+        if expression is None:
             return None
-        key = id(function)
+        parents = self._parent_maps[module.name]
+        root = expression.split(".")[0]
+        if self._outer_function_shadows(call, root, parents, function) or (
+            DownstreamConstructorDetector._expression_scope_shadows(call, root, parents)
+        ):
+            return None
+        reference = self._resolve_in_scope(
+            call.func,
+            function=function,
+            module_info=module,
+            line=call.lineno,
+            reference_prefixes=("vllm.", "vllm_ascend."),
+        )
+        if reference is None:
+            return None
+        if reference not in self._storage_references:
+            # Source layout is a cheap filter before collecting global downstream
+            # class writes/escapes. The ordinary index and old snapshot remain
+            # separate, so a new-only storage layout cannot stand in for old.
+            if dataclass_storage(reference, self._type_source) is None:
+                self._storage_references[reference] = False
+            else:
+                if self._storage_downstream_effects is None:
+                    effects: set[str] = set()
+                    for item in self.engine.downstream.modules.values():
+                        key = (id(self.engine.downstream), item.name)
+                        if key not in self._storage_module_effects:
+                            self._storage_module_effects[key] = self._source_module_effects(
+                                self.engine.downstream, item
+                            )
+                        effects.update(self._storage_module_effects[key])
+                    self._storage_downstream_effects = frozenset(effects)
+                downstream_effects = self._storage_downstream_effects
+
+                def lookup(name: str) -> ClassSource | None:
+                    if has_construction_effect(name, downstream_effects):
+                        return None
+                    return self._type_source(name)
+
+                self._storage_references[reference] = dataclass_storage(reference, lookup) is not None
+        return reference if self._storage_references[reference] else None
+
+    def _replacement_callable(
+        self, call: ast.Call, function: ast.FunctionDef | ast.AsyncFunctionDef, module: ModuleInfo
+    ) -> bool:
+        if module.name not in self._replacement_roots:
+            self._replacement_roots[module.name] = DataclassReplaceDetector._replace_roots(
+                module.tree, self._facts.nodes(module.tree)
+            )
+        expression = _expression_name(call.func)
+        if expression is None or expression.split(".")[0] not in self._replacement_roots[module.name]:
+            return False
+        root = expression.split(".")[0]
+        parents = self._parent_maps[module.name]
+        if self._outer_function_shadows(call, root, parents, function) or (
+            DownstreamConstructorDetector._expression_scope_shadows(call, root, parents)
+        ):
+            return False
+        if (
+            self._resolve_in_scope(
+                call.func,
+                function=function,
+                module_info=module,
+                line=call.lineno,
+                reference_prefixes=("dataclasses.",),
+            )
+            != "dataclasses.replace"
+        ):
+            return False
+        effects = self._storage_downstream_effects or frozenset()
+        for module_effects in self._storage_module_effects.values():
+            effects |= module_effects
+        return not has_construction_effect("dataclasses.replace", effects)
+
+    def _function_flow(
+        self,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        module: ModuleInfo,
+        *,
+        capture_call_inputs: bool = False,
+        factory_parameters: dict[str, FlowValue | None] | None = None,
+    ) -> ContainerFlow:
+        # Actual arguments and return capture must never reuse an
+        # annotation-only flow cached for ordinary receiver discovery.
+        key = (
+            id(function),
+            capture_call_inputs,
+            tuple(sorted(factory_parameters.items())) if factory_parameters is not None else None,
+        )
+        mode = "factory" if factory_parameters is not None else "call_inputs" if capture_call_inputs else "receivers"
+        metrics = self._flow_metrics.setdefault(mode, {"requests": 0, "builds": 0, "hits": 0, "build_seconds": 0})
+        metrics["requests"] += 1
         if key not in self._container_flows:
+            started = time.perf_counter()
             namespace = self._annotation_namespace(self.engine.downstream, module)
 
             def resolve(expression: str) -> str | None:
@@ -1117,18 +1642,19 @@ class _DirectDependencyResolver:
 
             instance_fields = {}
             if module.name not in self._parent_maps:
-                self._parent_maps[module.name] = _parents(module.tree)
+                self._parent_maps[module.name] = self._facts.parents(module.tree)
             parents = self._parent_maps[module.name]
             owner = self._class_name(function, parents, module.name)
             args = [*function.args.posonlyargs, *function.args.args]
             if (
                 owner is not None
+                and factory_parameters is None
                 and args
                 and not function.decorator_list
                 and isinstance(parents.get(id(function)), ast.ClassDef)
             ):
                 receiver = args[0].arg
-                for child in ast.walk(function):
+                for child in self._facts.nodes(function):
                     if (
                         isinstance(child, ast.Attribute)
                         and isinstance(child.value, ast.Name)
@@ -1161,11 +1687,67 @@ class _DirectDependencyResolver:
                 self._type_source,
                 runtime_resolve=runtime,
                 helper_resolve=lambda call, values: self._helper_call_effects(call, values, function, module),
+                method_bind=lambda call, receiver: self._bind_flow_method(call, receiver, function, module),
+                constructor_resolve=lambda call: self._storage_constructor(call, function, module),
+                replacement_resolve=lambda call: self._replacement_callable(call, function, module),
+                capture_call_inputs=capture_call_inputs,
+                capture_returns=factory_parameters is not None,
+                parameters=factory_parameters,
                 instance_fields=instance_fields,
                 instance_owner=owner,
             )
-        value = self._container_flows[key].receivers.get(id(member))
-        if value is None or len(value.path) < 2 or not value.shape.reference.startswith("vllm."):
+            metrics["builds"] += 1
+            metrics["build_seconds"] += time.perf_counter() - started
+        else:
+            metrics["hits"] += 1
+        if factory_parameters is not None:
+            return self._container_flows.pop(key)
+        return self._container_flows[key]
+
+    def _receiver_flow(
+        self,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        module: ModuleInfo,
+    ) -> ContainerFlow | _ReceiverFlowSummary:
+        if self._receiver_flow_cache_key is None:
+            return self._function_flow(function, module)
+        local_key = id(function)
+        if local_key in self._receiver_flow_summaries:
+            return self._receiver_flow_summaries[local_key]
+
+        def build() -> _ReceiverFlowSummary:
+            flow = self._function_flow(function, module)
+            return _ReceiverFlowSummary(
+                MappingProxyType(dict(flow.receivers)),
+                frozenset(flow.invalidated_receivers),
+            )
+
+        summary = self._facts.get(
+            "receiver_flow_summary",
+            (self._receiver_flow_cache_key, function),
+            build,
+        )
+        self._receiver_flow_summaries[local_key] = summary
+        return summary
+
+    def _container_receiver(
+        self,
+        member: ast.Attribute,
+        function: ast.FunctionDef | ast.AsyncFunctionDef | None,
+        module: ModuleInfo,
+    ) -> FlowValue | None:
+        if function is None:
+            return None
+        value = self._receiver_flow(function, module).receivers.get(id(member))
+        if (
+            value is None
+            or (len(value.path) < 2 and not value.constructed)
+            or not (
+                value.shape.reference.startswith("vllm.")
+                or value.constructed
+                and value.shape.reference.startswith("vllm_ascend.")
+            )
+        ):
             if self._historical_flow_resolver is not None:
                 # Keep an independent old-source interpretation. A field removed
                 # at new may otherwise erase types needed to discover later uses.
@@ -1175,6 +1757,22 @@ class _DirectDependencyResolver:
             return None
         return value
 
+    def _receiver_proof_invalidated(
+        self,
+        member: ast.Attribute,
+        function: ast.FunctionDef | ast.AsyncFunctionDef | None,
+        module: ModuleInfo,
+    ) -> bool:
+        """Veto nominal fallback only after flow explicitly lost a receiver."""
+        if function is None:
+            return False
+        if id(member) in self._receiver_flow(function, module).invalidated_receivers:
+            return True
+        return (
+            self._historical_flow_resolver is not None
+            and self._historical_flow_resolver._receiver_proof_invalidated(member, function, module)
+        )
+
     def _local_names(
         self,
         function: ast.AsyncFunctionDef | ast.FunctionDef | None,
@@ -1183,7 +1781,9 @@ class _DirectDependencyResolver:
             return frozenset()
         key = id(function)
         if key not in self._function_locals:
-            self._function_locals[key] = frozenset(_function_local_names(function))
+            self._function_locals[key] = self._facts.get(
+                "function_local_names", function, lambda: frozenset(_function_local_names(function))
+            )
         return self._function_locals[key]
 
     def _tag_guards(self, statements: Sequence[ast.stmt]) -> set[str]:
@@ -1211,21 +1811,25 @@ class _DirectDependencyResolver:
         if cache_key in self._candidate_roots:
             return self._candidate_roots[cache_key]
         roots = {
-            local for local, target in module_info.imports.items() if target == "vllm" or target.startswith("vllm.")
+            local
+            for local, target in module_info.imports.items()
+            if target == "vllm" or target.startswith(self._reference_prefixes)
         }
-        nodes = list(_function_scope_nodes(function)) if function is not None else list(module_info.tree.body)
+        if "vllm_ascend." in self._reference_prefixes:
+            roots.update(node.name for node in module_info.tree.body if isinstance(node, ast.ClassDef))
+        nodes = self._function_nodes(function) if function is not None else tuple(module_info.tree.body)
         assignments: list[tuple[set[str], str | None]] = []
         for node in nodes:
             if isinstance(node, ast.Import):
                 roots.update(
                     alias.asname or alias.name.split(".", 1)[0]
                     for alias in node.names
-                    if alias.name == "vllm" or alias.name.startswith("vllm.")
+                    if alias.name == "vllm" or alias.name.startswith(self._reference_prefixes)
                 )
             elif (
                 isinstance(node, ast.ImportFrom)
                 and node.module
-                and (node.module == "vllm" or node.module.startswith("vllm."))
+                and (node.module == "vllm" or node.module.startswith(self._reference_prefixes))
             ):
                 roots.update(alias.asname or alias.name for alias in node.names if alias.name != "*")
             elif isinstance(node, (ast.Assign, ast.AnnAssign)):
@@ -1260,7 +1864,7 @@ class _DirectDependencyResolver:
             return self._constructed_instances[cache_key]
         candidates: dict[str, list[ast.AnnAssign | ast.Call | None]] = {}
         instance_candidates: set[str] = set()
-        for node in _function_scope_nodes(function):
+        for node in self._function_nodes(function):
             if not isinstance(node, (ast.Assign, ast.AnnAssign)):
                 continue
             targets = self._assignment_targets(node)
@@ -1290,12 +1894,23 @@ class _DirectDependencyResolver:
     def _no_fallback(_node: ast.AST) -> set[str | None]:
         return {None}
 
+    def _scope_state_cache(self, statements: Sequence[ast.stmt]) -> dict[int, dict[str, tuple[_ScopeBinding, ...]]]:
+        # Source bodies live for this resolver's lifetime. Cache only immutable
+        # scope states, never fallback results that depend on caller shadowing.
+        key = id(statements)
+        if key not in self._scope_states:
+            if len(self._scope_states) >= MAX_RESOLVER_SCOPE_CACHES:
+                self._scope_states.pop(next(iter(self._scope_states)))
+            self._scope_states[key] = {}
+        return self._scope_states[key]
+
     def _module_reference(
         self,
         expression: ast.AST,
         *,
         module_info: ModuleInfo,
         line: int,
+        reference_prefixes: tuple[str, ...] | None = None,
     ) -> str | None:
         """Resolve a name from module flow at one exact program point.
 
@@ -1313,17 +1928,20 @@ class _DirectDependencyResolver:
             module=module_info.name,
             is_package=module_info.is_package,
             fallback=self._no_fallback,
+            state_cache=self._scope_state_cache(module_info.tree.body),
+            prefix_cache=self._prefix_cache,
         )
         concrete = {item for item in variants if item is not None}
         if len(variants) != 1 or len(concrete) != 1:
             return None
         result = next(iter(concrete))
-        return result if result.startswith("vllm.") else None
+        return result if result.startswith(reference_prefixes or self._reference_prefixes) else None
 
     def _module_fallback(
         self,
         module_info: ModuleInfo,
         blocked_names: set[str] | frozenset[str],
+        reference_prefixes: tuple[str, ...] | None = None,
     ) -> Callable[[ast.AST], set[str | None]]:
         final_line = (
             max(
@@ -1344,13 +1962,14 @@ class _DirectDependencyResolver:
                 node,
                 module_info=module_info,
                 line=final_line,
+                reference_prefixes=reference_prefixes,
             )
             return {resolved} if resolved is not None else {None}
 
         return resolve
 
-    @staticmethod
     def _name_reassigned_before(
+        self,
         function: ast.AsyncFunctionDef | ast.FunctionDef,
         name: str,
         point: ast.AST,
@@ -1359,24 +1978,31 @@ class _DirectDependencyResolver:
             getattr(point, "lineno", 0),
             getattr(point, "col_offset", 0),
         )
-        for candidate in _function_scope_nodes(function):
+
+        def writes() -> dict[str, tuple[ast.AST, ...]]:
+            result: dict[str, list[ast.AST]] = {}
+            for candidate in self._function_nodes(function):
+                names: set[str] = set()
+                if isinstance(candidate, ast.Name) and isinstance(candidate.ctx, (ast.Del, ast.Store)):
+                    names.add(candidate.id)
+                elif isinstance(candidate, (ast.Import, ast.ImportFrom)):
+                    names = (
+                        {alias.asname or alias.name.split(".", 1)[0] for alias in candidate.names}
+                        if isinstance(candidate, ast.Import)
+                        else {alias.asname or alias.name for alias in candidate.names if alias.name != "*"}
+                    )
+                for bound in names:
+                    result.setdefault(bound, []).append(candidate)
+            return {bound: tuple(nodes) for bound, nodes in result.items()}
+
+        index = self._facts.get("function_writes", function, writes)
+        for candidate in index.get(name, ()):
             candidate_position = (
                 getattr(candidate, "lineno", point_position[0]),
                 getattr(candidate, "col_offset", 0),
             )
-            if candidate_position >= point_position:
-                continue
-            if isinstance(candidate, ast.Name) and isinstance(candidate.ctx, (ast.Del, ast.Store)):
-                if candidate.id == name:
-                    return True
-            if isinstance(candidate, (ast.Import, ast.ImportFrom)):
-                bound = (
-                    {alias.asname or alias.name.split(".", 1)[0] for alias in candidate.names}
-                    if isinstance(candidate, ast.Import)
-                    else {alias.asname or alias.name for alias in candidate.names if alias.name != "*"}
-                )
-                if name in bound:
-                    return True
+            if candidate_position < point_position:
+                return True
         return False
 
     def _outer_function_shadows(
@@ -1709,17 +2335,44 @@ class _DirectDependencyResolver:
         module: ModuleInfo,
         receiver_type: str | None,
         resolution_basis: str,
+        receiver_path: tuple[str, ...] = (),
     ) -> dict[str, Any] | None:
         member = _member_access(node)
         if (
-            resolution_basis != "parameter_annotation"
+            resolution_basis not in {"parameter_annotation", "typed_container_flow"}
             or receiver_type is None
             or function is None
             or member is None
-            or not isinstance(member.value, ast.Name)
         ):
             return None
-        return self._receiver_constraints.evidence(receiver_type, member.attr, module, function, member.value.id)
+        parameter = (
+            member.value.id
+            if resolution_basis == "parameter_annotation" and isinstance(member.value, ast.Name)
+            else None
+        )
+        if parameter is not None and self._receiver_proof_invalidated(member, function, module):
+            return {
+                "kind": "invalidated_parameter_receiver",
+                "declared_type": receiver_type,
+                "parameter": parameter,
+                "receiver_expression": ast.unparse(member.value),
+                "file": module.file,
+                "line": member.lineno,
+                "source": "ordered_container_flow",
+                "reason": "preceding effects invalidated receiver provenance; the annotation is not an exact binding",
+            }
+        evidence = self._receiver_constraints.evidence(receiver_type, member.attr, module, function, parameter)
+        if evidence is not None and resolution_basis == "typed_container_flow":
+            # A path through annotated container elements/fields is still a
+            # declared type. Do not invent a runtime subclass or pass a local
+            # alias as if it were the helper's formal parameter.
+            evidence = dict(
+                evidence,
+                kind="container_annotation_with_local_member_alternatives",
+                receiver_path=receiver_path,
+                receiver_expression=ast.unparse(member.value),
+            )
+        return evidence
 
     def _resolve_in_scope(
         self,
@@ -1728,6 +2381,7 @@ class _DirectDependencyResolver:
         function: ast.AsyncFunctionDef | ast.FunctionDef | None,
         module_info: ModuleInfo,
         line: int,
+        reference_prefixes: tuple[str, ...] | None = None,
     ) -> str | None:
         expression_name = _expression_name(expression)
         if expression_name is None:
@@ -1738,6 +2392,7 @@ class _DirectDependencyResolver:
                 expression,
                 module_info=module_info,
                 line=line,
+                reference_prefixes=reference_prefixes,
             )
         statements: Sequence[ast.stmt] = function.body
         variants = _scope_reference_variants(
@@ -1747,13 +2402,15 @@ class _DirectDependencyResolver:
             tag_guard_names=self._tag_guards(statements),
             module=module_info.name,
             is_package=module_info.is_package,
-            fallback=self._module_fallback(module_info, local_names),
+            fallback=self._module_fallback(module_info, local_names, reference_prefixes),
+            state_cache=self._scope_state_cache(statements),
+            prefix_cache=self._prefix_cache,
         )
         concrete = {item for item in variants if item is not None}
         if len(variants) != 1 or len(concrete) != 1:
             return None
         result = next(iter(concrete))
-        return result if result.startswith("vllm.") else None
+        return result if result.startswith(reference_prefixes or self._reference_prefixes) else None
 
     def _constructed_instance_target(
         self,
@@ -1885,8 +2542,8 @@ class DirectCallDetector(_DirectDependencyResolver):
         self.historical_candidates = []
         for module_info in self.engine.downstream.modules.values():
             tree = module_info.tree
-            parents = _parents(tree)
-            for node in ast.walk(tree):
+            parents = self._facts.parents(tree)
+            for node in self._facts.nodes(tree):
                 if not isinstance(node, ast.Call) or _under_version_guard(node, parents):
                     continue
                 invocation_kind = "python_call"
@@ -1924,6 +2581,12 @@ class DirectCallDetector(_DirectDependencyResolver):
                 flow = None
                 if invocation_kind == "python_call" and isinstance(callable_node, ast.Attribute):
                     flow = self._container_receiver(callable_node, function, module_info)
+                    if (
+                        flow is None
+                        and self._receiver_proof_invalidated(callable_node, function, module_info)
+                        and (special is None or special[5] != "parameter_annotation")
+                    ):
+                        continue
                     if flow is not None:
                         receiver = flow.shape.reference
                         special = (
@@ -1932,7 +2595,7 @@ class DirectCallDetector(_DirectDependencyResolver):
                             receiver,
                             callable_node.attr,
                             None,
-                            "typed_container_flow",
+                            "constructed_storage" if flow.constructed else "typed_container_flow",
                         )
                 receiver_type: str | None
                 member: str | None
@@ -1973,7 +2636,12 @@ class DirectCallDetector(_DirectDependencyResolver):
                     lookup_root = None
                     resolution_basis = "new_exact"
                 target = next(iter(targets))
-                if not target.startswith("vllm."):
+                if not (
+                    target.startswith("vllm.")
+                    or flow is not None
+                    and flow.constructed
+                    and target.startswith("vllm_ascend.")
+                ):
                     continue
                 scope_node = function or tree
                 owner = self._class_name(node, parents, module_info.name)
@@ -1995,13 +2663,39 @@ class DirectCallDetector(_DirectDependencyResolver):
                     resolution_basis=resolution_basis,
                     receiver_path=flow.path if flow is not None else (),
                     receiver_binding=self._receiver_binding_evidence(
-                        node, function, module_info, receiver_type, resolution_basis
+                        node,
+                        function,
+                        module_info,
+                        receiver_type,
+                        resolution_basis,
+                        flow.path if flow is not None else (),
                     ),
                 )
                 if lookup_root is not None:
                     self.historical_candidates.append(dependency)
                 else:
                     dependencies.append(dependency)
+        dependencies.extend(DownstreamConstructorDetector(self.engine).discover())
+        historical_source = (
+            self._historical_flow_resolver._upstream_type_source if self._historical_flow_resolver is not None else None
+        )
+        replacements = DataclassReplaceDetector(
+            self.engine,
+            historical_type_source=historical_source,
+            factory_evaluator=self._factory_evaluator,
+            factory_input_resolver=self._factory_input_resolver,
+            historical_factory_input_resolver=(
+                self._historical_flow_resolver._factory_input_resolver
+                if self._historical_flow_resolver is not None
+                else None
+            ),
+            historical_factory_evaluator=(
+                self._historical_flow_resolver._factory_evaluator
+                if self._historical_flow_resolver is not None
+                else None
+            ),
+        )
+        dependencies.extend(replacements.discover())
         unique = {
             (
                 item.file,
@@ -2021,11 +2715,358 @@ class DirectCallDetector(_DirectDependencyResolver):
         return [unique[key] for key in sorted(unique)]
 
 
+class DataclassReplaceDetector(_DirectDependencyResolver):
+    """Trace stdlib replacement to a proven concrete dataclass instance."""
+
+    _reference_prefixes = ("vllm.", "vllm_ascend.", "dataclasses.")
+
+    @staticmethod
+    def _replace_roots(tree: ast.Module, nodes: Iterable[ast.AST] | None = None) -> set[str]:
+        roots: set[str] = set()
+        assignments = []
+        for node in ast.walk(tree) if nodes is None else nodes:
+            if isinstance(node, ast.Import):
+                roots.update(alias.asname or alias.name for alias in node.names if alias.name == "dataclasses")
+            elif isinstance(node, ast.ImportFrom) and node.module == "dataclasses":
+                roots.update(alias.asname or alias.name for alias in node.names if alias.name == "replace")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                assignments.append(node)
+        changed = True
+        while changed:
+            changed = False
+            for assignment in assignments:
+                name = _expression_name(assignment.value)
+                if name is not None and name.split(".")[0] in roots:
+                    additions = _DirectDependencyResolver._assignment_targets(assignment) - roots
+                    roots.update(additions)
+                    changed = changed or bool(additions)
+        return roots
+
+    def discover(self) -> list[DirectCallDependency]:
+        dependencies: list[DirectCallDependency] = []
+        if self._historical_flow_resolver is not None:
+            self._historical_flow_resolver._reference_prefixes = self._reference_prefixes
+        for module in self.engine.downstream.modules.values():
+            roots = self._replace_roots(module.tree, self._facts.nodes(module.tree))
+            if not roots:
+                continue
+            parents = self._facts.parents(module.tree)
+            for node in self._facts.nodes(module.tree):
+                if not isinstance(node, ast.Call) or len(node.args) != 1 or _under_version_guard(node, parents):
+                    continue
+                function = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
+                if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                expression = _expression_name(node.func)
+                if expression is None:
+                    continue
+                root = expression.split(".")[0]
+                if root not in roots:
+                    continue
+                if self._outer_function_shadows(node, root, parents, function) or (
+                    DownstreamConstructorDetector._expression_scope_shadows(node, root, parents)
+                ):
+                    continue
+                if self._resolve_in_scope(node.func, function=function, module_info=module, line=node.lineno) != (
+                    "dataclasses.replace"
+                ):
+                    continue
+                values = self._function_flow(function, module, capture_call_inputs=True).call_inputs.get(id(node), ())
+                value = values[0] if values else None
+                if (value is None or not value.constructed) and self._historical_flow_resolver is not None:
+                    values = self._historical_flow_resolver._function_flow(
+                        function, module, capture_call_inputs=True
+                    ).call_inputs.get(id(node), ())
+                    value = values[0] if values else None
+                if (
+                    value is None
+                    or not value.constructed
+                    or not value.shape.reference.startswith(("vllm.", "vllm_ascend."))
+                ):
+                    continue
+                effects = self._storage_downstream_effects or frozenset()
+                for module_effects in self._storage_module_effects.values():
+                    effects |= module_effects
+                if self._historical_flow_resolver is not None:
+                    effects |= self._historical_flow_resolver._storage_downstream_effects or frozenset()
+                if has_construction_effect("dataclasses.replace", effects):
+                    continue
+                target = value.shape.reference
+                if target.startswith("vllm_ascend.") and not any(
+                    owner.startswith("vllm.") for owner in self.engine._linearized_mro(target).owners
+                ):
+                    continue
+                owner = self._class_name(node, parents, module.name)
+                # The object argument chooses the runtime class; remaining
+                # keywords bind to that class's replacement field protocol.
+                shape = call_shape(ast.Call(func=node.func, args=[], keywords=node.keywords))
+                dependencies.append(
+                    DirectCallDependency(
+                        target=target,
+                        access_kind="constructor",
+                        file=module.file,
+                        line=node.lineno,
+                        column=node.col_offset,
+                        owner=owner.rsplit(".", 1)[-1] if owner else None,
+                        scope=function.name,
+                        callee=ast.unparse(node.func),
+                        call_shape=shape,
+                        return_use=infer_return_use(node, parents, function),
+                        resolution_basis="dataclass_replace",
+                        receiver_path=value.path,
+                    )
+                )
+        return dependencies
+
+
+class DownstreamConstructorDetector(_DirectDependencyResolver):
+    """Find concrete local class calls whose inheritance includes upstream code."""
+
+    _reference_prefixes = ("vllm.", "vllm_ascend.")
+
+    @staticmethod
+    def _expression_scope_shadows(node: ast.AST, root: str, parents: dict[int, ast.AST]) -> bool:
+        current = parents.get(id(node))
+        while current is not None:
+            if isinstance(current, ast.Lambda) and any(child is node for child in ast.walk(current.body)):
+                arguments = [*current.args.posonlyargs, *current.args.args, *current.args.kwonlyargs]
+                arguments.extend(arg for arg in (current.args.vararg, current.args.kwarg) if arg is not None)
+                if any(arg.arg == root for arg in arguments):
+                    return True
+            if isinstance(current, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                # Python evaluates the outermost iterable in the enclosing scope.
+                in_outer_iterable = bool(current.generators) and any(
+                    child is node for child in ast.walk(current.generators[0].iter)
+                )
+                if not in_outer_iterable and any(
+                    isinstance(child, ast.Name) and child.id == root
+                    for generator in current.generators
+                    for child in ast.walk(generator.target)
+                ):
+                    return True
+            current = parents.get(id(current))
+        return False
+
+    def _mutations(self) -> dict[str, list[dict[str, Any]]]:
+        """Record class-call protocol writes using the shared scope resolver."""
+        mutations: dict[str, list[dict[str, Any]]] = {}
+        members = {"__init__", "__new__", "__bases__", "__call__", "__dataclass_fields__"}
+        for module in self.engine.downstream.modules.values():
+            parents = self._facts.parents(module.tree)
+            for node in self._facts.nodes(module.tree):
+                owner_node: ast.AST | None = None
+                replacement: ast.AST | None = None
+                member: str | None = None
+                statement = parents.get(id(node))
+                if (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.ctx, (ast.Store, ast.Del))
+                    and node.attr in members
+                ):
+                    owner_node, member = node.value, node.attr
+                    if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                        replacement = statement.value
+                elif isinstance(node, ast.Call) and _expression_name(node.func) in {"setattr", "delattr"}:
+                    if (
+                        len(node.args) >= 2
+                        and isinstance(node.args[1], ast.Constant)
+                        and isinstance(node.args[1].value, str)
+                        and node.args[1].value in members
+                    ):
+                        owner_node, member = node.args[0], node.args[1].value
+                        replacement = node.args[2] if len(node.args) == 3 and not node.keywords else None
+                if (
+                    not isinstance(node, (ast.Attribute, ast.Call))
+                    or owner_node is None
+                    or member is None
+                    or _under_version_guard(node, parents)
+                ):
+                    continue
+                owner_name = _expression_name(owner_node)
+                if owner_name is None or self._expression_scope_shadows(node, owner_name.split(".", 1)[0], parents):
+                    continue
+                function_node = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
+                function = function_node if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+                target = self._resolve_in_scope(owner_node, function=function, module_info=module, line=node.lineno)
+                if target is None:
+                    continue
+                target = self.engine.downstream.canonical_name(target)
+                replacement_ref = (
+                    self._resolve_in_scope(replacement, function=function, module_info=module, line=node.lineno)
+                    if replacement is not None
+                    else None
+                )
+                direct_module_statement = statement is not None and parents.get(id(statement)) is module.tree
+                stable_replacement = replacement_ref is not None
+                if replacement_ref is not None and replacement_ref.startswith("vllm_ascend."):
+                    bindings = self.engine.downstream.find_final_bindings(replacement_ref)
+                    info = self.engine.downstream.find_callable(replacement_ref)
+                    stable_replacement = (
+                        len(bindings) == 1
+                        and info is not None
+                        and (info.file != module.file or bindings[0].line < node.lineno)
+                    )
+                if isinstance(node, ast.Call):
+                    # A shadowed setter is an unknown consumer, not the builtin.
+                    setter = _expression_name(node.func)
+                    direct_module_statement = direct_module_statement and (
+                        setter not in self._local_names(function)
+                        and self._resolve_in_scope(node.func, function=function, module_info=module, line=node.lineno)
+                        is None
+                    )
+                mutations.setdefault(target, []).append(
+                    {
+                        "target": target,
+                        "member": member,
+                        "file": module.file,
+                        "line": node.lineno,
+                        "scope": function.name if function is not None else None,
+                        "expression": ast.unparse(statement or node),
+                        "replacement": replacement_ref,
+                        "exact_module_assignment": bool(direct_module_statement and stable_replacement),
+                    }
+                )
+        return mutations
+
+    def discover(self) -> list[DirectCallDependency]:
+        dependencies: list[DirectCallDependency] = []
+        eligible: dict[str, bool] = {}
+        mutations = self._mutations()
+        for module in self.engine.downstream.modules.values():
+            parents = self._facts.parents(module.tree)
+            roots = set(module.imports)
+            # This is only a prefilter. Lazy imports still need the shared
+            # statement-order resolver below to prove their actual binding.
+            for imported in self._facts.nodes(module.tree):
+                if isinstance(imported, (ast.Import, ast.ImportFrom)):
+                    roots.update(alias.asname or alias.name.split(".", 1)[0] for alias in imported.names)
+            roots.update(node.name for node in self._facts.nodes(module.tree) if isinstance(node, ast.ClassDef))
+            assignments = [
+                node for node in self._facts.nodes(module.tree) if isinstance(node, (ast.Assign, ast.AnnAssign))
+            ]
+            changed = True
+            while changed:
+                changed = False
+                for assignment in assignments:
+                    reference = _expression_name(assignment.value)
+                    if reference is not None and reference.split(".", 1)[0] in roots:
+                        additions = self._assignment_targets(assignment) - roots
+                        roots.update(additions)
+                        changed = changed or bool(additions)
+            for node in self._facts.nodes(module.tree):
+                if not isinstance(node, ast.Call) or _under_version_guard(node, parents):
+                    continue
+                expression = _expression_name(node.func)
+                if expression is None or expression.split(".", 1)[0] not in roots:
+                    continue
+                if self._expression_scope_shadows(node, expression.split(".", 1)[0], parents):
+                    continue
+                function_node = _nearest(node, parents, (ast.FunctionDef, ast.AsyncFunctionDef))
+                function = function_node if isinstance(function_node, (ast.FunctionDef, ast.AsyncFunctionDef)) else None
+                if self._outer_function_shadows(node, expression.split(".", 1)[0], parents, function):
+                    continue
+                resolved = self._resolve_in_scope(node.func, function=function, module_info=module, line=node.lineno)
+                if resolved is None or not resolved.startswith("vllm_ascend."):
+                    continue
+                target = self.engine.downstream.canonical_name(resolved)
+                if target not in eligible:
+                    info = self.engine.downstream.find_callable(target)
+                    bindings = self.engine.downstream.find_final_bindings(target)
+                    eligible[target] = (
+                        info is not None
+                        and isinstance(info.node, ast.ClassDef)
+                        and len(bindings) == 1
+                        and bindings[0].node is info.node
+                        and any(owner.startswith("vllm.") for owner in self.engine._linearized_mro(target).owners)
+                    )
+                if not eligible[target]:
+                    continue
+                owner = self._class_name(node, parents, module.name)
+                relevant_mutations = tuple(
+                    mutation
+                    for class_owner in self.engine._linearized_mro(target).owners
+                    for mutation in mutations.get(class_owner, ())
+                    if not (
+                        function is None
+                        and mutation["scope"] is None
+                        and mutation["file"] == module.file
+                        and mutation["line"] > node.lineno
+                    )
+                )
+                if function is not None and relevant_mutations:
+                    invocations = []
+                    for statement in module.tree.body:
+                        value = (
+                            statement.value if isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign)) else None
+                        )
+                        if not isinstance(value, ast.Call):
+                            continue
+                        reference = self._resolve_in_scope(
+                            value.func, function=None, module_info=module, line=value.lineno
+                        )
+                        called = self.engine.downstream.find_callable(reference) if reference is not None else None
+                        if called is not None and called.node is function:
+                            invocations.append(value.lineno)
+                    # A module-final initializer cannot describe both the
+                    # helper's early invocation and its possible later calls.
+                    # Preserve this temporal ambiguity instead of silently
+                    # treating the later initializer as retroactive.
+                    relevant_mutations = tuple(
+                        dict(
+                            mutation,
+                            exact_module_assignment=False,
+                            earlier_module_invocations=[line for line in invocations if line < mutation["line"]],
+                        )
+                        if mutation["file"] == module.file
+                        and mutation["scope"] is None
+                        and any(line < mutation["line"] for line in invocations)
+                        else mutation
+                        for mutation in relevant_mutations
+                    )
+                dependencies.append(
+                    DirectCallDependency(
+                        target=target,
+                        access_kind="constructor",
+                        file=module.file,
+                        line=node.lineno,
+                        column=node.col_offset,
+                        owner=owner.rsplit(".", 1)[-1] if owner else None,
+                        scope=function.name if function is not None else None,
+                        callee=ast.unparse(node.func),
+                        call_shape=call_shape(node),
+                        return_use=infer_return_use(node, parents, function or module.tree),
+                        resolution_basis="downstream_constructor",
+                        constructor_mutations=relevant_mutations,
+                    )
+                )
+        return dependencies
+
+
 class DirectAttributeDetector(_DirectDependencyResolver):
     """Discover exact downstream reads of upstream members."""
 
-    def __init__(self, engine: InterfaceBoundaryGenerator, *, historical_type_source: Lookup | None = None):
-        super().__init__(engine, historical_type_source=historical_type_source)
+    def __init__(
+        self,
+        engine: InterfaceBoundaryGenerator,
+        *,
+        historical_type_source: Lookup | None = None,
+        factory_evaluator: FactoryEvaluator | None = None,
+        historical_factory_evaluator: FactoryEvaluator | None = None,
+        factory_input_resolver: FactoryInputResolver | None = None,
+        historical_factory_input_resolver: FactoryInputResolver | None = None,
+        receiver_flow_cache_key: object | None = None,
+        historical_receiver_flow_cache_key: object | None = None,
+    ):
+        super().__init__(
+            engine,
+            historical_type_source=historical_type_source,
+            factory_evaluator=factory_evaluator,
+            historical_factory_evaluator=historical_factory_evaluator,
+            factory_input_resolver=factory_input_resolver,
+            historical_factory_input_resolver=historical_factory_input_resolver,
+            receiver_flow_cache_key=receiver_flow_cache_key,
+            historical_receiver_flow_cache_key=historical_receiver_flow_cache_key,
+        )
         self.historical_attribute_candidates: list[DirectAttributeDependency] = []
         self._defined_member_cache: dict[tuple[int, str, str], bool] = {}
         self._patch_receivers: dict[int, set[str]] = {}
@@ -2258,8 +3299,8 @@ class DirectAttributeDetector(_DirectDependencyResolver):
         dependencies: list[DirectAttributeDependency] = []
         for module_info in self.engine.downstream.modules.values():
             tree = module_info.tree
-            parents = _parents(tree)
-            for node in ast.walk(tree):
+            parents = self._facts.parents(tree)
+            for node in self._facts.nodes(tree):
                 if (
                     not isinstance(node, ast.Attribute)
                     or not _attribute_is_read(node, parents)
@@ -2297,9 +3338,22 @@ class DirectAttributeDetector(_DirectDependencyResolver):
                     special = self._constructed_instance_target(node, function, module_info)
 
                 flow = self._container_receiver(node, function, module_info)
+                if (
+                    flow is None
+                    and self._receiver_proof_invalidated(node, function, module_info)
+                    and (special is None or special[5] != "parameter_annotation")
+                ):
+                    continue
                 if flow is not None:
                     receiver = flow.shape.reference
-                    special = (f"{receiver}.{node.attr}", "instance", receiver, node.attr, None, "typed_container_flow")
+                    special = (
+                        f"{receiver}.{node.attr}",
+                        "instance",
+                        receiver,
+                        node.attr,
+                        None,
+                        "constructed_storage" if flow.constructed else "typed_container_flow",
+                    )
                 receiver_type: str | None
                 member: str | None
                 lookup_root: str | None
@@ -2348,7 +3402,12 @@ class DirectAttributeDetector(_DirectDependencyResolver):
                     expression=ast.unparse(node),
                     receiver_path=flow.path if flow is not None else (),
                     receiver_binding=self._receiver_binding_evidence(
-                        node, function, module_info, receiver_type, resolution_basis
+                        node,
+                        function,
+                        module_info,
+                        receiver_type,
+                        resolution_basis,
+                        flow.path if flow is not None else (),
                     ),
                     receiver_type=receiver_type,
                     member=member,

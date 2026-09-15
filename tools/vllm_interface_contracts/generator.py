@@ -49,7 +49,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -58,6 +58,8 @@ from typing import Any, TypeVar, cast
 
 from . import schema as _boundary_schema
 from .analysis_plans import MAIN2MAIN_PLAN, AnalysisPlan
+from .cache import require_private_cache_path
+from .source_facts import SourceFacts
 
 SCHEMA_VERSION = 6
 GENERATOR_VERSION = "0.47.0"
@@ -219,6 +221,12 @@ def _merge_scope_binding_states(
     live_states = [state for state in states if state is not None]
     if not live_states:
         return None
+    if len(live_states) == 1:
+        # Preserve normalization for callers with duplicate/unsorted bindings,
+        # but avoid hashing and sorting the overwhelmingly common singleton.
+        return {
+            name: values if len(values) <= 1 else tuple(sorted(set(values))) for name, values in live_states[0].items()
+        }
     names = {name for state in live_states for name in state}
     merged: dict[str, tuple[_ScopeBinding, ...]] = {}
     for name in names:
@@ -269,7 +277,8 @@ _HANDLER_ALWAYS = "always"
 def _clone_scope_binding_state(
     state: dict[str, tuple[_ScopeBinding, ...]],
 ) -> dict[str, tuple[_ScopeBinding, ...]]:
-    return {name: tuple(values) for name, values in state.items()}
+    # Binding tuples and their values are immutable; only the mapping is mutable.
+    return state.copy()
 
 
 def _scope_state_key(
@@ -283,7 +292,11 @@ def _compact_scope_states(
 ) -> list[dict[str, tuple[_ScopeBinding, ...]]]:
     """Merge path states without losing any per-name binding alternative."""
 
-    unique = {_scope_state_key(state): state for state in states}
+    candidates = list(states)
+    if len(candidates) <= 1:
+        merged = _merge_scope_binding_states(candidates)
+        return [merged] if merged is not None else []
+    unique = {_scope_state_key(state): state for state in candidates}
     if not unique:
         return []
     merged = _merge_scope_binding_states(list(unique.values()))
@@ -862,10 +875,54 @@ def _scope_final_bindings(
     return _scope_final_binding_state(statements, tag_guard_names) or {}
 
 
+class _ScopePrefixCache:
+    """Bounded namespace memo for one immutable module's analysis.
+
+    Keys retain the actual AST statements, not process-local numeric IDs.
+    Equal prefixes share a state even when queries use different line numbers.
+    Returned dictionaries are independent; binding alternatives are immutable.
+    """
+
+    def __init__(self, max_entries: int = 256):
+        if max_entries < 1:
+            raise ValueError("max_entries must be at least 1")
+        self.max_entries = max_entries
+        self.requests = 0
+        self.builds = 0
+        self.evictions = 0
+        self._states: OrderedDict[
+            tuple[tuple[ast.stmt, ...], frozenset[str]],
+            dict[str, tuple[_ScopeBinding, ...]],
+        ] = OrderedDict()
+
+    def resolve(self, prefix: tuple[ast.stmt, ...], tag_guard_names: set[str]) -> dict[str, tuple[_ScopeBinding, ...]]:
+        self.requests += 1
+        key = (prefix, frozenset(tag_guard_names))
+        if key not in self._states:
+            self.builds += 1
+            state = _scope_final_binding_state(prefix, tag_guard_names) or {}
+            self._states[key] = state
+            if len(self._states) > self.max_entries:
+                self._states.popitem(last=False)
+                self.evictions += 1
+        self._states.move_to_end(key)
+        return dict(self._states[key])
+
+    def metrics(self) -> dict[str, int]:
+        return {
+            "requests": self.requests,
+            "builds": self.builds,
+            "hits": self.requests - self.builds,
+            "evictions": self.evictions,
+        }
+
+
 def _scope_state_before(
     statements: Sequence[ast.stmt],
     line: int,
     tag_guard_names: set[str],
+    *,
+    prefix_cache: _ScopePrefixCache | None = None,
 ) -> dict[str, tuple[_ScopeBinding, ...]]:
     """Return bindings after statements that finish before ``line``.
 
@@ -876,11 +933,13 @@ def _scope_state_before(
     those rules, so descriptor resolution reuses its state.
     """
 
-    prefix = [
+    prefix = tuple(
         statement
         for statement in statements
         if getattr(statement, "end_lineno", getattr(statement, "lineno", 0)) < line
-    ]
+    )
+    if prefix_cache is not None:
+        return prefix_cache.resolve(prefix, tag_guard_names)
     return _scope_final_binding_state(prefix, tag_guard_names) or {}
 
 
@@ -912,6 +971,9 @@ def _import_binding_reference(
     return None
 
 
+MAX_SCOPE_STATE_CACHE_ENTRIES = 16
+
+
 def _scope_reference_variants(
     expression_node: ast.AST,
     *,
@@ -922,6 +984,8 @@ def _scope_reference_variants(
     is_package: bool,
     fallback: Callable[[ast.AST], set[str | None]] | None = None,
     seen: frozenset[tuple[str, int]] = frozenset(),
+    state_cache: dict[int, dict[str, tuple[_ScopeBinding, ...]]] | None = None,
+    prefix_cache: _ScopePrefixCache | None = None,
 ) -> set[str | None]:
     """Resolve one expression on every normal path reaching ``line``.
 
@@ -936,7 +1000,21 @@ def _scope_reference_variants(
     if expression is None:
         return {None}
     root, separator, remainder = expression.partition(".")
-    state = _scope_state_before(statements, line, tag_guard_names)
+    # The optional cache belongs to one immutable statements/guard view. Keep
+    # it caller-owned so different modules and annotation/runtime views cannot
+    # share bindings. Alias recursion below uses that same view at an earlier line.
+    if state_cache is not None and line in state_cache:
+        state = state_cache[line]
+    else:
+        state = (
+            _scope_state_before(statements, line, tag_guard_names, prefix_cache=prefix_cache)
+            if prefix_cache is not None
+            else _scope_state_before(statements, line, tag_guard_names)
+        )
+        if state_cache is not None:
+            if len(state_cache) >= MAX_SCOPE_STATE_CACHE_ENTRIES:
+                state_cache.pop(next(iter(state_cache)))
+            state_cache[line] = state
     bindings = state.get(root, ())
 
     def fallback_references() -> set[str | None]:
@@ -978,6 +1056,8 @@ def _scope_reference_variants(
                     is_package=is_package,
                     fallback=fallback,
                     seen=frozenset((*seen, recursion_key)),
+                    state_cache=state_cache,
+                    prefix_cache=prefix_cache,
                 )
                 references.update(
                     (f"{item}.{remainder}" if item is not None and separator else item) for item in nested
@@ -1012,6 +1092,7 @@ def _scope_decorator_reference_tuple(
     tag_guard_names: set[str],
     module: str,
     is_package: bool,
+    prefix_cache: _ScopePrefixCache | None = None,
 ) -> tuple[str | None, ...]:
     """Resolve function decorators against their enclosing module scope."""
 
@@ -1029,6 +1110,7 @@ def _scope_decorator_reference_tuple(
                 tag_guard_names=tag_guard_names,
                 module=module,
                 is_package=is_package,
+                prefix_cache=prefix_cache,
             ),
         )
     )
@@ -2668,6 +2750,7 @@ class RepositoryIndex:
         if not self.package_root.is_dir():
             raise ValueError(f"package directory not found: {self.package_root}")
 
+        self.source_facts = SourceFacts()
         self.modules: dict[str, ModuleInfo] = {}
         self.classes: dict[str, ClassInfo] = {}
         self.callables: dict[str, CallableInfo] = {}
@@ -2710,6 +2793,7 @@ class RepositoryIndex:
         """
 
         state = dict(self.__dict__)
+        state.pop("source_facts", None)
         nodes_by_id = {id(node): node for module in self.modules.values() for node in ast.walk(module.tree)}
         for name in (
             "_descriptor_kinds_by_node",
@@ -2735,6 +2819,7 @@ class RepositoryIndex:
             serialized = cast(list[tuple[ast.AST, object]], state.pop(f"__serialized{name}"))
             state[name] = {id(node): value for node, value in serialized}
         self.__dict__.update(state)
+        self.source_facts = SourceFacts()
 
     @classmethod
     def _from_serial_file_fragments(
@@ -2792,6 +2877,7 @@ class RepositoryIndex:
             loose_functions: dict[str, list[CallableInfo]] = defaultdict(list)
             star_imports: list[str] = []
             annotated_exports: list[tuple[str, str]] = []
+            prefix_cache = _ScopePrefixCache()
             tag_guard_names = _tag_guard_names(tree.body)
             module_final_bindings = _scope_final_bindings(
                 tree.body,
@@ -2800,10 +2886,11 @@ class RepositoryIndex:
             self.final_bindings.update(
                 {f"{module}.{name}": alternatives for name, alternatives in module_final_bindings.items()}
             )
-            module_must_names = _scope_must_bound_names(
-                tree.body,
-                tag_guard_names,
-            )
+            module_must_names = {
+                name
+                for name, alternatives in module_final_bindings.items()
+                if alternatives and all(binding.kind != "unbound" for binding in alternatives)
+            }
             module_statements = list(
                 _main_module_statements(
                     tree.body,
@@ -2912,6 +2999,7 @@ class RepositoryIndex:
                         active_tag_guards: set[str] = tag_guard_names,
                         current_module: str = module,
                         current_is_package: bool = is_package,
+                        prefix_cache: _ScopePrefixCache = prefix_cache,
                     ) -> set[str | None]:
                         return _scope_reference_variants(
                             expression,
@@ -2920,6 +3008,7 @@ class RepositoryIndex:
                             tag_guard_names=active_tag_guards,
                             module=current_module,
                             is_package=current_is_package,
+                            prefix_cache=prefix_cache,
                         )
 
                     def class_reference_resolver(
@@ -2929,6 +3018,7 @@ class RepositoryIndex:
                         active_tag_guards: set[str] = tag_guard_names,
                         current_class: str = qualified_name,
                         module_fallback: Callable[[ast.AST], set[str | None]] = module_reference_resolver,
+                        prefix_cache: _ScopePrefixCache = prefix_cache,
                     ) -> set[str | None]:
                         return _scope_reference_variants(
                             expression,
@@ -2938,6 +3028,7 @@ class RepositoryIndex:
                             module=current_class,
                             is_package=False,
                             fallback=module_fallback,
+                            prefix_cache=prefix_cache,
                         )
 
                     class_functions = sorted(
@@ -2967,6 +3058,7 @@ class RepositoryIndex:
                         current_imports: dict[str, str] = imports,
                         local_classes: dict[str, ClassInfo] = classes,
                         local_functions: dict[str, CallableInfo] = functions,
+                        prefix_cache: _ScopePrefixCache = prefix_cache,
                     ) -> ast.AST | None:
                         expression = _expression_name(expression_node)
                         if expression is None:
@@ -2976,6 +3068,7 @@ class RepositoryIndex:
                                 class_node.body,
                                 line,
                                 active_tag_guards,
+                                prefix_cache=prefix_cache,
                             )
                             local_nodes = {
                                 alternative.node
@@ -3038,6 +3131,7 @@ class RepositoryIndex:
                             node.body,
                             function_line,
                             tag_guard_names,
+                            prefix_cache=prefix_cache,
                         )
                         for alternatives in class_state.values():
                             for alternative in alternatives:
@@ -3248,6 +3342,7 @@ class RepositoryIndex:
                         tag_guard_names=tag_guard_names,
                         module=module,
                         is_package=is_package,
+                        prefix_cache=prefix_cache,
                     )
                     self._decorator_references_by_node[id(node)] = decorator_references
                     function_info = CallableInfo(
@@ -3305,6 +3400,7 @@ class RepositoryIndex:
                         tag_guard_names=tag_guard_names,
                         module=module,
                         is_package=is_package,
+                        prefix_cache=prefix_cache,
                     )
                     self._decorator_references_by_node[id(candidate)] = decorator_references
                     variants_list.append(
@@ -3346,6 +3442,7 @@ class RepositoryIndex:
                     tag_guard_names=tag_guard_names,
                     module=module,
                     is_package=is_package,
+                    prefix_cache=prefix_cache,
                 )
                 self._decorator_references_by_node.setdefault(
                     id(walked_node),
@@ -3961,19 +4058,22 @@ class RepositoryIndex:
         visited_aliases: set[str] = set()
         while result not in visited:
             visited.add(result)
-            replacement = None
-            for alias in sorted(self.aliases, key=len, reverse=True):
-                if result == alias or result.startswith(f"{alias}."):
-                    if alias in visited_aliases:
-                        # An alias can only match again when another alias maps
-                        # back to it or when it expands into its own namespace.
-                        # Neither chain has one statically provable canonical
-                        # target, so fail closed instead of growing forever.
-                        return qualified_name
-                    visited_aliases.add(alias)
-                    replacement = f"{self.aliases[alias]}{result[len(alias) :]}"
+            # Only dot-delimited prefixes can match. Check the longest first
+            # instead of sorting and scanning every alias in the repository.
+            # Read the live table: aliases can change during index finalization.
+            alias = result
+            while alias not in self.aliases:
+                if "." not in alias:
                     break
-            if replacement is None or replacement == result:
+                alias = alias.rsplit(".", 1)[0]
+            if alias not in self.aliases:
+                break
+            if alias in visited_aliases:
+                # Preserve cycle and self-expansion handling from alias lookup.
+                return qualified_name
+            visited_aliases.add(alias)
+            replacement = f"{self.aliases[alias]}{result[len(alias) :]}"
+            if replacement == result:
                 break
             result = replacement
         return result
@@ -4360,6 +4460,24 @@ def _repository_index_from_file_fragments(
 ) -> tuple[RepositoryIndex, dict[str, object]]:
     if index_workers < 1:
         raise ValueError("index_workers must be at least 1")
+    if cache_dir is not None:
+        database_path = cache_dir / (
+            f"{package_name}-file-fragments-v{REPOSITORY_FILE_FRAGMENT_CACHE_SCHEMA_VERSION}.sqlite3"
+        )
+        try:
+            for suffix in ("", "-journal", "-wal", "-shm"):
+                require_private_cache_path(Path(str(database_path) + suffix))
+        except OSError as error:
+            index, bypass_status = _repository_index_from_file_fragments(
+                repo_root,
+                package_name,
+                ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+                source_version=source_version,
+                cache_dir=None,
+                index_workers=index_workers,
+            )
+            bypass_status.update(enabled=True, status="bypassed", reason=str(error))
+            return index, bypass_status
     repo_root = repo_root.resolve()
     package_root = repo_root / package_name
     paths = sorted(package_root.rglob("*.py"))
@@ -4435,6 +4553,7 @@ def _repository_index_from_file_fragments(
                 status.update(status="corrupt", reason=f"{type(error).__name__}: {error}")
                 corrupt_database = True
                 try:
+                    require_private_cache_path(database)
                     database.unlink(missing_ok=True)
                     connection = sqlite3.connect(database, timeout=30)
                     connection.execute(
@@ -4636,8 +4755,20 @@ def _repository_index_with_cache(
 
     serialized_identity = json.dumps(identity, sort_keys=True, separators=(",", ":"))
     cache_key = hashlib.sha256(serialized_identity.encode()).hexdigest()
-    cache_path = cache_dir.resolve() / f"{package_name}-{cache_key}.pickle"
+    cache_path = cache_dir / f"{package_name}-{cache_key}.pickle"
     status.update(key=cache_key, path=str(cache_path))
+    try:
+        require_private_cache_path(cache_path)
+    except OSError as error:
+        status.update(status="bypassed", reason=str(error))
+        return (
+            RepositoryIndex(
+                repo_root,
+                package_name,
+                ordinary_descriptor_decorators=ordinary_descriptor_decorators,
+            ),
+            status,
+        )
     invalid_cache = False
     load_started = time.perf_counter()
     try:
@@ -4668,6 +4799,7 @@ def _repository_index_with_cache(
         invalid_cache = True
         status.update(status="corrupt", reason=f"{type(error).__name__}: {error}")
         with contextlib.suppress(OSError):
+            require_private_cache_path(cache_path)
             cache_path.unlink()
 
     status["load_seconds"] = round(time.perf_counter() - load_started, 6)
@@ -4682,6 +4814,7 @@ def _repository_index_with_cache(
     temporary_path: Path | None = None
     write_started = time.perf_counter()
     try:
+        require_private_cache_path(cache_path)
         cache_dir.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
             mode="wb",
@@ -4703,12 +4836,15 @@ def _repository_index_with_cache(
             )
             stream.flush()
             os.fsync(stream.fileno())
+        require_private_cache_path(cache_path)
         os.replace(temporary_path, cache_path)
         status["status"] = "invalid_rebuilt" if invalid_cache else "miss"
     except Exception as error:  # A cache write failure must fall back to the fresh index.
         status.update(status="write_error", reason=f"{type(error).__name__}: {error}")
         if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                require_private_cache_path(temporary_path)
+                temporary_path.unlink(missing_ok=True)
     status["write_seconds"] = round(time.perf_counter() - write_started, 6)
     return index, status
 

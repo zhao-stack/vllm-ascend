@@ -127,7 +127,7 @@ class ReceiverConstraints:
         member: str,
         module: ModuleInfo,
         function: ast.FunctionDef | ast.AsyncFunctionDef,
-        parameter: str,
+        parameter: str | None,
     ) -> dict[str, Any] | None:
         alternatives = self.local_members(declared_type, member)
         if not alternatives:
@@ -136,6 +136,6 @@ class ReceiverConstraints:
             "kind": "base_annotation_with_local_member_alternatives",
             "declared_type": declared_type,
             "local_members": alternatives,
-            "caller_contexts": self.caller_contexts(module, function, parameter),
+            "caller_contexts": self.caller_contexts(module, function, parameter) if parameter is not None else (),
             "status": "concrete_receiver_unresolved",
         }

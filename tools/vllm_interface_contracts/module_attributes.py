@@ -85,6 +85,16 @@ def _typing_module_body(tree: ast.Module, *, annotation_mode: bool) -> list[ast.
     aliases = {name: kind for name, kind in candidates.items() if counts.get(name) == 1}
 
     class RuntimeBody(ast.NodeTransformer):
+        def generic_visit(self, node: ast.AST) -> ast.AST:
+            # Copy only the visited module-level structure. Function/class
+            # bodies are immutable inputs and need not be duplicated. Copy
+            # lists as well: NodeTransformer edits list fields in place.
+            result = copy.copy(node)
+            for field, value in ast.iter_fields(node):
+                if isinstance(value, list):
+                    setattr(result, field, list(value))
+            return super().generic_visit(result)
+
         def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
             return node
 
@@ -108,7 +118,7 @@ def _typing_module_body(tree: ast.Module, *, annotation_mode: bool) -> list[ast.
                 return replacement.body
             return self.generic_visit(node)
 
-    transformed = RuntimeBody().visit(copy.deepcopy(tree))
+    transformed = RuntimeBody().visit(tree)
     assert isinstance(transformed, ast.Module)
     return transformed.body
 
