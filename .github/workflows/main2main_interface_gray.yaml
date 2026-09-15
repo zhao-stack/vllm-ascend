@@ -1,0 +1,157 @@
+name: Main2Main Interface Gray (CPU, QA off)
+run-name: Interface gray ${{ inputs.vllm_new_sha }} / cache ${{ inputs.cache_generation }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_old_sha:
+        description: Exact old vLLM SHA (historical replay)
+        required: true
+        default: '0351e9aa1fdf1a51329d1906881528dfe61fc88e'
+      vllm_new_sha:
+        description: Exact new vLLM SHA
+        required: true
+        default: 'beca88e59ea75a7aa1af72a5ae50188fa91d4e3d'
+      ascend_baseline_sha:
+        description: Exact pre-adaptation Ascend SHA
+        required: true
+        default: '61cfd1fc6a79ae139a3c5bdb8051ba7edb9c022e'
+      engine_sha:
+        description: Exact complete-engine commit in this fork
+        required: true
+        default: '349ebcae3df8125d512e4393926b82cd66c543f4'
+      force_rescan:
+        description: Bypass report reuse for this run
+        type: boolean
+        default: false
+      cache_generation:
+        description: Increment to replace an immutable bad cache
+        required: true
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main2main-interface-gray-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    if: github.repository == 'zhao-stack/vllm-ascend'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate dispatch inputs
+        env:
+          OLD_SHA: ${{ inputs.vllm_old_sha }}
+          NEW_SHA: ${{ inputs.vllm_new_sha }}
+          ASCEND_SHA: ${{ inputs.ascend_baseline_sha }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+          CACHE_GENERATION: ${{ inputs.cache_generation }}
+        run: |
+          set -euo pipefail
+          for value in "$OLD_SHA" "$NEW_SHA" "$ASCEND_SHA" "$ENGINE_SHA"; do
+            [[ "$value" =~ ^[0-9a-f]{40}$ ]] || { echo 'Expected full commit SHA'; exit 1; }
+          done
+          [[ "$CACHE_GENERATION" =~ ^[0-9]+$ ]] || exit 1
+
+      - name: Checkout gray runner
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          path: gray-code
+          persist-credentials: false
+
+      - name: Checkout pinned complete engine
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.engine_sha }}
+          path: engine
+          sparse-checkout: tools/vllm_interface_contracts
+          persist-credentials: false
+
+      - name: Checkout pinned vLLM source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: vllm-project/vllm
+          ref: ${{ inputs.vllm_new_sha }}
+          path: vllm-source
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+
+      - name: Checkout pinned Ascend baseline
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: vllm-project/vllm-ascend
+          ref: ${{ inputs.ascend_baseline_sha }}
+          path: ascend-source
+          persist-credentials: false
+
+      - name: Set up Python (no runtime packages)
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify sources and compute report fingerprint
+        id: inputs
+        env:
+          OLD_SHA: ${{ inputs.vllm_old_sha }}
+          NEW_SHA: ${{ inputs.vllm_new_sha }}
+          ASCEND_SHA: ${{ inputs.ascend_baseline_sha }}
+          ENGINE_SHA: ${{ inputs.engine_sha }}
+        run: |
+          python -B gray-code/tools/main2main_gray/run.py prepare \
+            --engine-root engine --engine-sha "$ENGINE_SHA" \
+            --vllm-root vllm-source --old "$OLD_SHA" --new "$NEW_SHA" \
+            --ascend-root ascend-source --ascend-sha "$ASCEND_SHA" \
+            --output output --github-output "$GITHUB_OUTPUT"
+
+      - name: Restore exact report cache
+        id: cache
+        if: ${{ !inputs.force_rescan }}
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: report-cache
+          key: ${{ steps.inputs.outputs.cache_key }}-g${{ inputs.cache_generation }}
+
+      - name: Analyze or reuse report (QA disabled)
+        id: scan
+        env:
+          FORCE_RESCAN: ${{ inputs.force_rescan }}
+        run: |
+          args=()
+          if [[ "$FORCE_RESCAN" == 'true' ]]; then args+=(--force-rescan); fi
+          python -B gray-code/tools/main2main_gray/run.py scan \
+            --output output --cache-dir report-cache \
+            --github-output "$GITHUB_OUTPUT" "${args[@]}"
+
+      - name: Save successful report cache
+        if: ${{ success() && steps.cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: report-cache
+          key: ${{ steps.inputs.outputs.cache_key }}-g${{ inputs.cache_generation }}
+
+      - name: Publish run summary
+        if: always()
+        run: |
+          if [[ -f output/summary.md ]]; then
+            cat output/summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'Scan did not complete. QA is disabled. Inspect step logs and artifacts.' >> "$GITHUB_STEP_SUMMARY"
+            if [[ -f output/run-status.json ]]; then cat output/run-status.json; fi
+          fi
+
+      - name: Upload scan and QA handoff evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: main2main-interface-gray-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14
