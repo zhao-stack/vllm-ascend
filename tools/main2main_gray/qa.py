@@ -44,6 +44,10 @@ def payload(markdown: str, ids: list[str]) -> dict:
         "Judge only the supplied excerpts and reasons. Missing or truncated evidence, especially "
         "proof that an upstream symbol was removed or migrated, requires insufficient_evidence. "
         "Do not approve source adaptation: no adapted diff is supplied. Review each requested root once. "
+        "Apply Python runtime semantics: an assignment under `if TYPE_CHECKING:` does not run at runtime. "
+        "Type-only annotations and comment/docstring matches do not prove runtime availability. "
+        "Read the lexical guards attached to every search hit before rejecting a removal finding. "
+        "For envs module attributes distinguish its runtime registry from its type-checking declarations. "
         "Do not copy candidate labels as conclusions. Write concise Chinese reasons. "
         'Schema: {"reviews":[{"root_cause_id":"<id>","verdict":"confirm|reject|insufficient_evidence",'
         '"reason":"<reason and missing evidence if any>","evidence":["<exact source URL from input>"]}]}. '
