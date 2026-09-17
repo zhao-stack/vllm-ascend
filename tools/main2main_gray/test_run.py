@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from qa_markdown import change_evidence
 from resolve import resolve_range
 from run import cache_key, git
 
@@ -206,6 +207,19 @@ class GrayTests(unittest.TestCase):
         self.assertEqual(result["fallback_reason"], "baseline_rebase_conflict")
         self.assertEqual(result["vllm_ascend_sha"], source)
         self.assertFalse(git(self.down, "status", "--porcelain"))
+
+    def test_removal_evidence_distinguishes_typing_guard(self):
+        self.write(self.up, "vllm/constants.py", "VALUE = 1\n")
+        old = self.commit(self.up)
+        self.write(
+            self.up, "vllm/constants.py", "from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    VALUE: int\n"
+        )
+        new = self.commit(self.up)
+        evidence = change_evidence(self.up, old, new, {"file": "vllm/constants.py", "name": "VALUE"})
+        self.assertIn("-VALUE = 1", evidence)
+        self.assertIn("if TYPE_CHECKING:", evidence)
+        self.assertIn(f"/blob/{new}/vllm/constants.py#L3", evidence)
+        self.assertIn("匹配 1 行", evidence)
 
     def test_fingerprint_changes(self):
         self.prepare()
