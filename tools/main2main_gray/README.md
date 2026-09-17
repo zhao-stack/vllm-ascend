@@ -85,10 +85,15 @@ manually dispatch with `qa_enabled=true`. Default remains false. Credential
 preflight fails before scanning if the secret is missing. The API key is passed
 only to the QA step; provider errors and headers are never printed.
 
-The QA wrapper calls the official DeepSeek Chat Completions endpoint once with
+The QA wrapper calls the official DeepSeek Chat Completions endpoint with
 `deepseek-flash`, thinking disabled, maximum 8,192 output tokens, maximum 80,000
-input bytes and a 180-second socket timeout. The Actions step has a five-minute
-cap. There are no retries or model tools. It reads only `qa-review.md`; it cannot
+input bytes per request and a 180-second socket timeout. The default call budget
+is one. Set qa_max_calls explicitly to 2, 3 or 4 for a larger report: the same
+single Markdown is split only at complete root boundaries, with the fixed input
+header repeated in each request. Every root must be covered exactly once. If the
+whole report cannot fit within the budget, fail before any model request. One
+oversized root also fails rather than truncating evidence. The Actions QA step
+has a thirteen-minute cap; there are no retries or model tools. It reads only `qa-review.md`; it cannot
 browse source URLs, execute commands or modify adaptation code. This validates
 report usability, not the production adapter-qa review of a completed code diff.
 
@@ -104,3 +109,7 @@ model request. The original production workflow remains unchanged.
 
 API reference: <https://api-docs.deepseek.com/api/create-chat-completion/>.
 Network-free QA tests: `python -B tools/main2main_gray/test_qa.py`.
+
+Batch tests also verify complete root coverage, no request on insufficient budget,
+and aggregated usage. Attempt counts and partial results are persisted between
+requests; a failed batch never becomes a successful QA verdict.

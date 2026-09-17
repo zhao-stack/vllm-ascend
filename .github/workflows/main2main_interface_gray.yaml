@@ -20,6 +20,11 @@ on:
         description: Review Markdown with one bounded DeepSeek request (requires MAIN2MAIN_API_KEY)
         type: boolean
         default: false
+      qa_max_calls:
+        description: Maximum QA requests; split only at complete root boundaries
+        type: choice
+        options: ['1', '2', '3', '4']
+        default: '1'
       force_rescan:
         description: Bypass report reuse for this run
         type: boolean
@@ -169,12 +174,13 @@ jobs:
 
       - name: Read-only QA of the single Markdown
         if: ${{ inputs.qa_enabled && steps.range.outputs.has_changes == 'true' }}
-        timeout-minutes: 5
+        timeout-minutes: 13
         env:
+          QA_MAX_CALLS: ${{ inputs.qa_max_calls }}
           MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
         run: |
           python -B gray-code/tools/main2main_gray/qa.py \
-            --input output/qa-review.md --output output/qa
+            --input output/qa-review.md --output output/qa --max-calls "$QA_MAX_CALLS"
 
       - name: Publish run summary
         if: always()

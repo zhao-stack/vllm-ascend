@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One bounded, tool-free DeepSeek review of the single Markdown handoff."""
+"""Bounded, tool-free DeepSeek review of the single Markdown handoff."""
 
 from __future__ import annotations
 
@@ -63,6 +63,34 @@ def payload(markdown: str, ids: list[str]) -> dict:
     }
 
 
+def review_batches(markdown: str, max_calls: int) -> list[str]:
+    """Split only at root boundaries; preserve every section and repeat the input header."""
+    if max_calls not in (1, 2, 3, 4):
+        raise ValueError("QA call budget must be 1..4")
+    if len(markdown.encode("utf-8")) <= MAX_INPUT_BYTES:
+        return [markdown]
+    lines = markdown.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if root_ids(line)]
+    if not starts:
+        raise ValueError("Oversized input without root boundaries")
+    header = "".join(lines[: starts[0]])
+    batches = []
+    current = header
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(lines)
+        section = "".join(lines[start:end])
+        if len((header + section).encode("utf-8")) > MAX_INPUT_BYTES:
+            raise ValueError("A single root exceeds the input budget; no truncation allowed")
+        if len((current + section).encode("utf-8")) > MAX_INPUT_BYTES:
+            batches.append(current)
+            current = header
+        current += section
+    batches.append(current)
+    if len(batches) > max_calls:
+        raise ValueError("QA input exceeds the explicit call budget")
+    return batches
+
+
 def request_review(body: dict, key: str) -> dict:
     # Fixed provider host; no redirects, tools, retries or shell execution.
     connection = http.client.HTTPSConnection("api.deepseek.com", timeout=TIMEOUT_SECONDS)
@@ -110,33 +138,49 @@ def validate_response(response: dict, ids: list[str], markdown: str) -> list[dic
     return reviews
 
 
-def review(input_path: Path, output: Path, key: str, transport=request_review) -> int:
+def review(input_path: Path, output: Path, key: str, transport=request_review, max_calls: int = 1) -> int:
     status = {
         "qa": "pending",
         "model_calls": 0,
         "model": MODEL,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
         "scope": "supplied_markdown_only",
+        "max_calls": max_calls,
     }
     started = time.monotonic()
     try:
         if not key:
             raise ValueError("Missing MAIN2MAIN_API_KEY repository secret")
         raw = input_path.read_bytes()
-        if len(raw) > MAX_INPUT_BYTES:
-            raise ValueError("QA input exceeds 80000 bytes; do not truncate silently")
         markdown = raw.decode("utf-8")
         ids = root_ids(markdown)
+        batches = review_batches(markdown, max_calls)
         status.update(input_sha256=hashlib.sha256(raw).hexdigest(), input_bytes=len(raw), roots=len(ids))
         if not ids:
             status["qa"] = "skipped_no_candidates"
             (output / "qa-verdict.md").parent.mkdir(parents=True, exist_ok=True)
             (output / "qa-verdict.md").write_text("# QA\n\n没有候选根因，未调用模型。\n", encoding="utf-8")
             return 0
-        status["model_calls"] = 1  # Attempt count; a timeout must never look like zero cost.
-        response = transport(payload(markdown, ids), key)
-        status["usage"] = response.get("usage")
-        reviews = validate_response(response, ids, markdown)
+        reviews = []
+        status.update(batch_count=len(batches), batch_usage=[])
+        for batch in batches:
+            status["model_calls"] += 1  # Persist attempts before network I/O, including timeout/termination.
+            write_json(output / "qa-status.json", status)
+            batch_ids = root_ids(batch)
+            response = transport(payload(batch, batch_ids), key)
+            usage = response.get("usage")
+            status["batch_usage"].append(usage)
+            if all(isinstance(u, dict) for u in status["batch_usage"]):
+                status["usage"] = {
+                    name: sum(u[name] for u in status["batch_usage"])
+                    for name in ("prompt_tokens", "completion_tokens", "total_tokens")
+                    if all(isinstance(u.get(name), int) for u in status["batch_usage"])
+                }
+            else:
+                status["usage"] = None
+            reviews.extend(validate_response(response, batch_ids, batch))
+            write_json(output / "qa-partial-results.json", {"reviews": reviews, "complete": False})
+            write_json(output / "qa-status.json", status)
         if input_path.read_bytes() != raw:
             raise ValueError("QA input changed during review")
         status.update(qa="completed", counts={v: sum(r["verdict"] == v for r in reviews) for v in VERDICTS})
@@ -167,8 +211,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--max-calls", type=int, choices=(1, 2, 3, 4), default=1)
     args = parser.parse_args()
-    return review(args.input, args.output, os.environ.get("MAIN2MAIN_API_KEY", ""))
+    return review(args.input, args.output, os.environ.get("MAIN2MAIN_API_KEY", ""), max_calls=args.max_calls)
 
 
 if __name__ == "__main__":

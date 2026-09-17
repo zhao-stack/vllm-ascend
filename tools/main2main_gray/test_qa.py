@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qa import MAX_INPUT_BYTES, MAX_OUTPUT_TOKENS, review
+from qa import MAX_INPUT_BYTES, MAX_OUTPUT_TOKENS, review, review_batches, root_ids
 
 ROOT = "0123456789abcdef"
 URL = "https://github.com/vllm-project/vllm/blob/" + "a" * 40 + "/vllm/api.py#L1"
@@ -115,6 +115,54 @@ class QATests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.status()["model_calls"], 1)
         self.assertNotIn("sensitive", (self.output / "qa-status.json").read_text())
+
+    def test_batches_preserve_roots_and_enforce_total_budget(self):
+        text = "# Fixed input header\n\n" + "".join(
+            f"## {i:016x} — candidate\n" + "evidence " * 3500 + "\n" for i in range(5)
+        )
+        batches = review_batches(text, 3)
+        self.assertEqual(len(batches), 3)
+        self.assertEqual([root for batch in batches for root in root_ids(batch)], root_ids(text))
+        self.assertTrue(all(len(batch.encode()) <= MAX_INPUT_BYTES for batch in batches))
+        self.assertTrue(all(batch.startswith("# Fixed input header") for batch in batches))
+        with self.assertRaises(ValueError):
+            review_batches(text, 2)
+        self.source.write_bytes(text.encode())
+        calls = []
+
+        def transport(body, key):
+            calls.append(body)
+            ids = root_ids(body["messages"][1]["content"])
+            return {
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "reviews": [
+                                        {
+                                            "root_cause_id": root,
+                                            "verdict": "insufficient_evidence",
+                                            "reason": "Missing source",
+                                            "evidence": [],
+                                        }
+                                        for root in ids
+                                    ]
+                                }
+                            )
+                        },
+                    }
+                ],
+            }
+
+        self.assertEqual(review(self.source, self.output, "test-only", transport, max_calls=2), 1)
+        self.assertFalse(calls)
+        self.assertEqual(review(self.source, self.output, "test-only", transport, max_calls=3), 0)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(self.status()["usage"]["total_tokens"], 45)
+        self.assertEqual(self.status()["counts"]["insufficient_evidence"], 5)
 
 
 if __name__ == "__main__":
