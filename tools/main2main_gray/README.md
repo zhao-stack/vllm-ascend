@@ -1,12 +1,13 @@
 # Main2Main interface gray test
 
 The fork-only manual workflow resolves an upgrade range, runs the pinned complete
-source analyzer and publishes one `qa-review.md` for read-only QA. QA is disabled:
-there are no model calls, adaptation, NPU jobs, marker updates or upstream PRs.
+source analyzer and publishes one `qa-review.md` for read-only QA. QA is disabled
+by default and can be explicitly enabled as described below. This workflow does
+not perform adaptation, NPU jobs, marker updates or upstream PRs.
 
 ## Inputs and version ownership
 
-Run `Main2Main Interface Gray (CPU, QA off)` on branch
+Run `Main2Main Interface Gray (CPU, read-only QA)` on branch
 `codex/main2main-interface-gray` in `zhao-stack/vllm-ascend`.
 
 - `target_commit`: optional full vLLM SHA. Empty checks out main once and freezes HEAD.
@@ -51,7 +52,7 @@ confirm/reject/insufficient-evidence per root without adapting code.
 For rebased local Ascend commits, the Markdown includes source excerpts and commit
 identities instead of inaccessible GitHub links. Original reports and run metadata
 remain in the separate internal diagnostic artifact for auditing and cache checks.
-No `qa-input.json` is produced. QA has not actually run.
+No `qa-input.json` is produced. Only the optional QA step calls a model.
 
 ## Scan and cache
 
@@ -76,3 +77,30 @@ python -B tools/main2main_gray/test_run.py --engine-root /path/to/pinned-engine
 Tests cover actual contract changes, cache reuse/corruption/force, changed Ascend
 snapshots, dirty/invalid sources, marker-derived ranges, frozen target validation,
 empty/non-ancestor ranges, accumulated baseline selection and deterministic rebase.
+
+## Optional read-only QA
+
+Set the repository Actions secret `MAIN2MAIN_API_KEY` to a DeepSeek API key, then
+manually dispatch with `qa_enabled=true`. Default remains false. Credential
+preflight fails before scanning if the secret is missing. The API key is passed
+only to the QA step; provider errors and headers are never printed.
+
+The QA wrapper calls the official DeepSeek Chat Completions endpoint once with
+`deepseek-flash`, thinking disabled, maximum 8,192 output tokens, maximum 80,000
+input bytes and a 180-second socket timeout. The Actions step has a five-minute
+cap. There are no retries or model tools. It reads only `qa-review.md`; it cannot
+browse source URLs, execute commands or modify adaptation code. This validates
+report usability, not the production adapter-qa review of a completed code diff.
+
+Each Markdown root must appear exactly once in the model result with a verdict
+(confirm, reject or insufficient_evidence), reason and input source citations.
+Truncated output, missing roots and invented citation URLs fail validation.
+Execution success does not mean all candidates are confirmed or compatibility
+has passed. The independent `qa-status.json` records attempted call count, input
+hash, supplied usage and verdict counts. The scan's run-status remains the
+scan-stage record; the Actions summary adds the actual QA execution separately.
+`qa-verdict.md` is published as its own result artifact. No candidates means no
+model request. The original production workflow remains unchanged.
+
+API reference: <https://api-docs.deepseek.com/api/create-chat-completion/>.
+Network-free QA tests: `python -B tools/main2main_gray/test_qa.py`.

@@ -1,4 +1,4 @@
-name: Main2Main Interface Gray (CPU, QA off)
+name: Main2Main Interface Gray (CPU, read-only QA)
 run-name: Interface gray ${{ inputs.target_commit }} / cache ${{ inputs.cache_generation }}
 
 on:
@@ -16,6 +16,10 @@ on:
         description: Exact complete-engine commit in this fork
         required: true
         default: '0b2d7f1adb822977ac8e8466e3a101e928bd86ba'
+      qa_enabled:
+        description: Review Markdown with one bounded DeepSeek request (requires MAIN2MAIN_API_KEY)
+        type: boolean
+        default: false
       force_rescan:
         description: Bypass report reuse for this run
         type: boolean
@@ -61,6 +65,18 @@ jobs:
           ref: ${{ github.sha }}
           path: gray-code
           persist-credentials: false
+
+      - name: Check optional QA credential
+        if: inputs.qa_enabled
+        env:
+          MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
+        run: |
+          if [[ -z "$MAIN2MAIN_API_KEY" ]]; then
+            mkdir -p output/qa
+            printf '%s\n' '{"qa":"blocked_missing_credential","model_calls":0}' > output/qa/qa-status.json
+            echo '::error::Configure MAIN2MAIN_API_KEY in this fork; no model request was made.'
+            exit 1
+          fi
 
       - name: Checkout pinned complete engine
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -151,22 +167,52 @@ jobs:
           path: report-cache
           key: ${{ steps.inputs.outputs.cache_key }}-g${{ inputs.cache_generation }}
 
+      - name: Read-only QA of the single Markdown
+        if: ${{ inputs.qa_enabled && steps.range.outputs.has_changes == 'true' }}
+        timeout-minutes: 5
+        env:
+          MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
+        run: |
+          python -B gray-code/tools/main2main_gray/qa.py \
+            --input output/qa-review.md --output output/qa
+
       - name: Publish run summary
         if: always()
+        env:
+          QA_ENABLED: ${{ inputs.qa_enabled }}
         run: |
           if [[ -f output/summary.md ]]; then
-            cat output/summary.md >> "$GITHUB_STEP_SUMMARY"
+            if [[ "$QA_ENABLED" == 'true' ]]; then
+              sed '/^- QA:/d; /QA input:/d' output/summary.md >> "$GITHUB_STEP_SUMMARY"
+            else
+              cat output/summary.md >> "$GITHUB_STEP_SUMMARY"
+            fi
           else
-            echo 'Scan did not complete. QA is disabled. Inspect step logs and artifacts.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'Scan did not complete. Inspect step logs and artifacts.' >> "$GITHUB_STEP_SUMMARY"
             if [[ -f output/run-status.json ]]; then cat output/run-status.json; fi
+          fi
+          if [[ -f output/qa/qa-status.json ]]; then
+            echo '### Actual QA execution' >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat output/qa/qa-status.json >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload single Markdown for QA
-        if: success()
+        if: ${{ always() && hashFiles('output/qa-review.md') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: main2main-qa-review-${{ github.run_id }}-${{ github.run_attempt }}
           path: output/qa-review.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload QA verdict Markdown
+        if: ${{ always() && hashFiles('output/qa/qa-verdict.md') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: main2main-qa-verdict-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/qa/qa-verdict.md
           if-no-files-found: error
           retention-days: 14
 
