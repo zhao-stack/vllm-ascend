@@ -178,7 +178,22 @@ def review(input_path: Path, output: Path, key: str, transport=request_review, m
                 }
             else:
                 status["usage"] = None
-            reviews.extend(validate_response(response, batch_ids, batch))
+            try:
+                batch_reviews = validate_response(response, batch_ids, batch)
+            except (ValueError, KeyError, TypeError, IndexError):
+                # Only model-generated public-source analysis, never HTTP headers or credentials.
+                write_json(
+                    output / "qa-rejected-response.json",
+                    {
+                        "batch": status["model_calls"],
+                        "expected_roots": batch_ids,
+                        "choices": response.get("choices"),
+                        "accepted": False,
+                    },
+                )
+                status["failure_stage"] = "response_validation"
+                raise
+            reviews.extend(batch_reviews)
             write_json(output / "qa-partial-results.json", {"reviews": reviews, "complete": False})
             write_json(output / "qa-status.json", status)
         if input_path.read_bytes() != raw:
