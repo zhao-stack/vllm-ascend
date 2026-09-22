@@ -23,13 +23,15 @@ def main():
     allowed_reads = {"*": "deny"}
     for folder in (ascend, upstream, root / "flow-source", root / "report-input", output):
         allowed_reads[str(folder) + "/**"] = "allow"
+        allowed_reads[folder.name + "/**"] = "allow"
     config = {
         "$schema": "https://opencode.ai/config.json",
+        "lsp": False,
         "provider": {"deepseek": {"options": {"apiKey": "{env:MAIN2MAIN_API_KEY}"}, "models": {"deepseek-flash": {}}}},
         "permission": {
             "*": "deny",
             "read": allowed_reads,
-            "edit": {"*": "deny", str(review_path): "allow"},
+            "edit": {"*": "deny", str(review_path): "allow", "output/review.json": "allow"},
             "external_directory": {"*": "deny", str(root) + "/**": "allow"},
         },
     }

@@ -4,6 +4,10 @@ run-name: Interface gray ${{ inputs.target_commit }} / cache ${{ inputs.cache_ge
 on:
   workflow_dispatch:
     inputs:
+      resolver_smoke:
+        description: Test source resolution and failure/skip paths on CPU with no model calls
+        type: boolean
+        default: false
       adapter_smoke:
         description: Run original adapter-qa on a fixed historical diff and existing report; no adaptation
         type: boolean
@@ -47,7 +51,7 @@ concurrency:
 
 jobs:
   scan:
-    if: github.repository == 'zhao-stack/vllm-ascend' && !inputs.adapter_smoke
+    if: github.repository == 'zhao-stack/vllm-ascend' && !inputs.adapter_smoke && !inputs.resolver_smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     defaults:
@@ -297,5 +301,50 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: original-adapter-qa-${{ github.run_id }}
+          path: output/
+          retention-days: 14
+  resolver-smoke:
+    if: github.repository == 'zhao-stack/vllm-ascend' && inputs.resolver_smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: gray-code
+      - uses: actions/checkout@v4
+        with:
+          ref: 0b2d7f1adb822977ac8e8466e3a101e928bd86ba
+          persist-credentials: false
+          path: engine
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm-ascend
+          ref: 6556ad5af1baaf481e996fc2788e233ce672f98e
+          fetch-depth: 0
+          persist-credentials: false
+          path: ascend-source
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: 85c09e9885e346ea1612da30ebff5a75f67d2350
+          fetch-depth: 0
+          persist-credentials: false
+          path: vllm-source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Test skip failure cache and nontrivial rebase paths
+        run: |
+          mkdir -p output
+          python -B gray-code/tools/main2main_gray/test_run.py --engine-root engine 2>&1 | tee output/fixture-tests.log
+          python -B gray-code/tools/main2main_gray/test_qa.py 2>&1 | tee output/qa-tests.log
+      - name: Resolve isolated remote baseline and absent baseline
+        run: python -B gray-code/tools/main2main_gray/resolver_smoke.py
+      - name: Upload resolver evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolver-smoke-${{ github.run_id }}
           path: output/
           retention-days: 14

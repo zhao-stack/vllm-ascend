@@ -10,7 +10,9 @@ from pathlib import Path
 from run import clean_head, git, json_write, require_sha
 
 
-def resolve_range(up: Path, down: Path, target: str = "", baseline_url: str = "") -> dict:
+def resolve_range(
+    up: Path, down: Path, target: str = "", baseline_url: str = "", baseline_ref: str = "refs/heads/main2main_baseline"
+) -> dict:
     new = require_sha(git(up, "rev-parse", "HEAD"))
     source = require_sha(git(down, "rev-parse", "HEAD"))
     clean_head(up, new)
@@ -22,7 +24,9 @@ def resolve_range(up: Path, down: Path, target: str = "", baseline_url: str = ""
     fallback = None
     if baseline_url:
         # Read only the personal fork's state; no pushes and no production runner.
-        ref = "refs/heads/main2main_baseline"
+        ref = baseline_ref
+        if not ref.startswith("refs/heads/"):
+            raise ValueError("Baseline must be a branch ref")
         remote = git(down, "ls-remote", baseline_url, ref)
         if remote:
             baseline = require_sha(remote.split()[0])
