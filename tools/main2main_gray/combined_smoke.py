@@ -19,7 +19,7 @@ resolved = resolve_range(
 assert resolved["vllm_old_sha"] == "e5588e49bc2642670116664a7fc4096e27adb179"
 assert resolved["vllm_ascend_sha"] == "6556ad5af1baaf481e996fc2788e233ce672f98e"
 (out / "resolved-range.json").write_text(json.dumps(resolved), encoding="utf-8")
-runner = root / "gray-code/tools/main2main_gray/run.py"
+runner = root / "engine/tools/main2main_interface/run.py"
 subprocess.run(
     [
         sys.executable,
@@ -29,7 +29,7 @@ subprocess.run(
         "--engine-root",
         str(root / "engine"),
         "--engine-sha",
-        "0b2d7f1adb822977ac8e8466e3a101e928bd86ba",
+        "d1d7b77183c14007d185835a00b9d23c009d0134",
         "--vllm-root",
         str(root / "vllm-source"),
         "--old",

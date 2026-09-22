@@ -262,8 +262,8 @@ jobs:
           path: gray-code
       - uses: actions/checkout@v4
         with:
-          repository: vllm-ascend/main2main_flow
-          ref: 36d6159ed94e867d15151549390b881c0a080663
+          repository: zhao-stack/main2main_flow
+          ref: 930f7b4f8ec315d0300928a63707638086753374
           persist-credentials: false
           path: flow-source
       - uses: actions/checkout@v4
@@ -298,18 +298,18 @@ jobs:
         if: inputs.combined_smoke
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 0b2d7f1adb822977ac8e8466e3a101e928bd86ba
+          ref: d1d7b77183c14007d185835a00b9d23c009d0134
           persist-credentials: false
           path: engine
       - name: Resolve historical range and generate a fresh report
         if: inputs.combined_smoke
         run: python -B gray-code/tools/main2main_gray/combined_smoke.py
-      - name: Install pinned original QA and apply report handoff patch
+      - name: Install exact companion PR candidate
         run: |
-          git -C flow-source apply ../gray-code/tools/main2main_gray/adapter_report.patch
           pip install -e ./flow-source
           npm install -g opencode-ai@1.18.32
           opencode --version
+          (cd flow-source && python -B -m unittest discover -s tests -p test_interface_report.py -v)
       - name: Original adapter-qa read-only consumption test
         env:
           MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
@@ -380,3 +380,24 @@ jobs:
           name: resolver-smoke-${{ github.run_id }}
           path: output/
           retention-days: 14
+
+  formal-lint:
+    if: github.repository == 'zhao-stack/vllm-ascend' && inputs.combined_smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d1d7b77183c14007d185835a00b9d23c009d0134
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -B tools/main2main_interface/test_run.py --engine-root . -v
+      - run: pip install -r requirements-lint.txt
+      - run: bash format.sh ci
