@@ -19,6 +19,14 @@ def main():
     output.mkdir(exist_ok=True)
     report = root / "report-input" / "qa-review.md"
     report_hash = hashlib.sha256(report.read_bytes()).hexdigest()
+    handoff = root / "report-input/handoff.json"
+    if handoff.exists():
+        data = json.loads(handoff.read_text(encoding="utf-8"))
+        assert data["fresh_scan"] and data["report_sha256"] == report_hash
+        resolved = data["resolved_range"]
+        assert git(ascend, "rev-parse", "HEAD").decode().strip() == resolved["vllm_ascend_sha"]
+        assert git(upstream, "rev-parse", "HEAD").decode().strip() == resolved["vllm_new_sha"]
+        assert (ascend / ".github/vllm-main-verified.commit").read_text().strip() == resolved["vllm_old_sha"]
     review_path = output / "review.json"
     # Without a git checkout as cwd, OpenCode uses '/' as its global worktree.
     agent_cwd = root / "gray-code"
