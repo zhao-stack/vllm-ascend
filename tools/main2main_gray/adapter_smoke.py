@@ -26,6 +26,8 @@ def main():
     allowed_reads = {"*": "deny"}
     for folder in (ascend, upstream, root / "flow-source", root / "report-input", output):
         allowed_reads[str(folder) + "/**"] = "allow"
+        # CLI sessions can resolve to the global '/' worktree even after bootstrap.
+        allowed_reads[str(folder).lstrip("/") + "/**"] = "allow"
         allowed_reads[os.path.relpath(folder, agent_cwd).replace(os.sep, "/") + "/**"] = "allow"
     config = {
         "$schema": "https://opencode.ai/config.json",
@@ -34,7 +36,12 @@ def main():
         "permission": {
             "*": "deny",
             "read": allowed_reads,
-            "edit": {"*": "deny", str(review_path): "allow", "../output/review.json": "allow"},
+            "edit": {
+                "*": "deny",
+                str(review_path): "allow",
+                "../output/review.json": "allow",
+                str(review_path).lstrip("/"): "allow",
+            },
             "external_directory": {"*": "deny", str(root) + "/**": "allow"},
         },
     }
