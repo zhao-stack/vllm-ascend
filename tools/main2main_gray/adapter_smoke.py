@@ -20,10 +20,13 @@ def main():
     report = root / "report-input" / "qa-review.md"
     report_hash = hashlib.sha256(report.read_bytes()).hexdigest()
     review_path = output / "review.json"
+    # Without a git checkout as cwd, OpenCode uses '/' as its global worktree.
+    agent_cwd = root / "gray-code"
+    assert Path(git(agent_cwd, "rev-parse", "--show-toplevel").decode().strip()) == agent_cwd
     allowed_reads = {"*": "deny"}
     for folder in (ascend, upstream, root / "flow-source", root / "report-input", output):
         allowed_reads[str(folder) + "/**"] = "allow"
-        allowed_reads[folder.name + "/**"] = "allow"
+        allowed_reads[os.path.relpath(folder, agent_cwd).replace(os.sep, "/") + "/**"] = "allow"
     config = {
         "$schema": "https://opencode.ai/config.json",
         "lsp": False,
@@ -31,7 +34,7 @@ def main():
         "permission": {
             "*": "deny",
             "read": allowed_reads,
-            "edit": {"*": "deny", str(review_path): "allow", "output/review.json": "allow"},
+            "edit": {"*": "deny", str(review_path): "allow", "../output/review.json": "allow"},
             "external_directory": {"*": "deny", str(root) + "/**": "allow"},
         },
     }
@@ -41,6 +44,7 @@ def main():
     os.environ["MAIN2MAIN_ADAPTER_TIMEOUT_MINUTES"] = "8"
     os.environ["MAIN2MAIN_MODEL_REVIEW"] = "deepseek/deepseek-flash"
     os.environ["MAIN2MAIN_INTERFACE_REPORT"] = str(report)
+    os.chdir(agent_cwd)
     from main2main_flow.flow import Main2MainFlow
 
     flow = Main2MainFlow()
