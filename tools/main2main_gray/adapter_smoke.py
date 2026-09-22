@@ -45,6 +45,9 @@ def main():
     os.environ["MAIN2MAIN_MODEL_REVIEW"] = "deepseek/deepseek-flash"
     os.environ["MAIN2MAIN_INTERFACE_REPORT"] = str(report)
     os.chdir(agent_cwd)
+    from probe_permissions import probe
+
+    probe(config, report, review_path, output)
     from main2main_flow.flow import Main2MainFlow
 
     flow = Main2MainFlow()
@@ -53,7 +56,7 @@ def main():
         vllm_path=str(upstream),
         step_id="historical-pr12020",
         step_dir=str(output),
-        release_tag=(ascend / ".github/vllm-release-tag.commit").read_text().strip(),
+        release_tag=(ascend / ".github/vllm-release-tag.commit").read_text().strip().lstrip("v"),
     )
     # Real entrypoint, before replaying the historical diff: no diff means no model call.
     with patch("main2main_flow.flow.run_opencode_review") as transport:
