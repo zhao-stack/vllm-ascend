@@ -4,6 +4,10 @@ run-name: Interface gray ${{ inputs.target_commit }} / cache ${{ inputs.cache_ge
 on:
   workflow_dispatch:
     inputs:
+      adapter_smoke:
+        description: Run original adapter-qa on a fixed historical diff and existing report; no adaptation
+        type: boolean
+        default: false
       target_commit:
         description: Target vLLM full SHA; empty selects main once
         required: false
@@ -43,7 +47,7 @@ concurrency:
 
 jobs:
   scan:
-    if: github.repository == 'zhao-stack/vllm-ascend'
+    if: github.repository == 'zhao-stack/vllm-ascend' && !inputs.adapter_smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     defaults:
@@ -213,6 +217,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+
       - name: Upload QA verdict Markdown
         if: ${{ always() && hashFiles('output/qa/qa-verdict.md') != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -231,4 +236,66 @@ jobs:
             output/
             !output/qa-review.md
           if-no-files-found: warn
+          retention-days: 14
+  adapter-smoke:
+    if: github.repository == 'zhao-stack/vllm-ascend' && inputs.adapter_smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: gray-code
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-ascend/main2main_flow
+          ref: 36d6159ed94e867d15151549390b881c0a080663
+          persist-credentials: false
+          path: flow-source
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm-ascend
+          ref: 6556ad5af1baaf481e996fc2788e233ce672f98e
+          persist-credentials: false
+          path: ascend-source
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: 85c09e9885e346ea1612da30ebff5a75f67d2350
+          persist-credentials: false
+          path: vllm-source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Retrieve fixed historical report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 35225109799 --repo zhao-stack/vllm-ascend \
+            --name main2main-qa-review-35225109799-1 --dir report-input
+          echo '209d7cc6c6e1f636a18a4015fa891b104e8228029375c290aee2aa52afb2f381  report-input/qa-review.md' | sha256sum -c -
+      - name: Install pinned original QA and apply report handoff patch
+        run: |
+          git -C flow-source apply ../gray-code/tools/main2main_gray/adapter_report.patch
+          pip install -e ./flow-source
+          npm install -g opencode-ai@1.18.32
+          opencode --version
+      - name: Original adapter-qa read-only consumption test
+        env:
+          MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
+          SKIP_E2E_TEST: 'true'
+          PUSH_TO_GITHUB: 'false'
+        run: python -B gray-code/tools/main2main_gray/adapter_smoke.py
+      - name: Upload consumption evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-adapter-qa-${{ github.run_id }}
+          path: output/
           retention-days: 14
