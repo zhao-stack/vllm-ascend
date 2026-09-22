@@ -113,3 +113,39 @@ Network-free QA tests: `python -B tools/main2main_gray/test_qa.py`.
 Batch tests also verify complete root coverage, no request on insufficient budget,
 and aggregated usage. Attempt counts and partial results are persisted between
 requests; a failed batch never becomes a successful QA verdict.
+
+## Original adapter-qa consumption smoke (2026-09-22)
+
+Dispatch with `adapter_smoke=true` to reuse the verified PR12020 Markdown and
+review a single existing historical adaptation file through the actual
+`Main2MainFlow._run_adapter_qa` and OpenCode runner. This does not call kickoff,
+adaptation, pre-CI, NPU tests, push or PR creation. The original flow is pinned to
+`36d6159ed94e867d15151549390b881c0a080663`; `adapter_report.patch` is an explicit
+proposed handoff change applied to that checkout. It is not an upstream-merged
+feature. OpenCode is pinned to 1.18.32.
+
+The optional `MAIN2MAIN_INTERFACE_REPORT` path adds report-reading instructions to
+the original QA prompt. No diff retains the original skip behavior. Unset means
+the original prompt. Missing, unreadable, empty or over-1MB reports stop before a
+model request. The report describes the pre-adaptation baseline, while the QA
+reviews the existing adapted diff. Successful consumption requires a completed
+report read in the tool log and valid report root IDs with assessments in the
+review JSON; a model claim alone is insufficient. Review pass/fail is separate
+from successful report consumption.
+
+The smoke harness denies shell, web, subagents and all other tools; it permits
+reads of the supplied sources/report and writes only `output/review.json`.
+Absolute and worktree-relative path rules are both specified, and LSP is off.
+No model API key is written into the output configuration.
+
+Set `resolver_smoke=true` to run deterministic CPU integration tests and query
+an isolated fork branch `codex/main2main-baseline-gray`. That branch points to a
+fixed historical Ascend source. Actual remote fetch/selection is verified;
+nontrivial accumulated rebase and conflict fallback use disposable git fixtures
+on the online runner. The operational `main2main_baseline` is not changed. Both
+smoke inputs may be enabled in the same run; the full scan job is then skipped.
+
+This is handoff and boundary validation. Final upstream packaging still needs
+the maintained engine source and production workflow call site, followed by a
+smoke test of that exact integrated revision. Do not treat the temporary fork
+engine snapshot or this diagnostic job as a production rollout.

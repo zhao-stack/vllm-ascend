@@ -307,6 +307,9 @@ jobs:
     if: github.repository == 'zhao-stack/vllm-ascend' && inputs.resolver_smoke
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
