@@ -298,7 +298,7 @@ jobs:
         if: inputs.combined_smoke
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: d1d7b77183c14007d185835a00b9d23c009d0134
+          ref: b73ab761b0e265c9fc2ea2192c624a8c499ac25a
           persist-credentials: false
           path: engine
       - name: Resolve historical range and generate a fresh report
@@ -393,7 +393,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: d1d7b77183c14007d185835a00b9d23c009d0134
+          ref: b73ab761b0e265c9fc2ea2192c624a8c499ac25a
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:

@@ -29,7 +29,7 @@ subprocess.run(
         "--engine-root",
         str(root / "engine"),
         "--engine-sha",
-        "d1d7b77183c14007d185835a00b9d23c009d0134",
+        "b73ab761b0e265c9fc2ea2192c624a8c499ac25a",
         "--vllm-root",
         str(root / "vllm-source"),
         "--old",
