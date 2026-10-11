@@ -10,53 +10,53 @@ from vllm.config.attention import AttentionConfig
 from vllm.config.cache import CacheConfig
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 
+from vllm_ascend.attention.dsa_attn_kv_plan import is_a5_bf16_kv_enabled
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import get_hardware_profile
-from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.models.deepseek_v4.indexer import get_indexer_k_dtype
+from vllm_ascend.models.deepseek_v4.model import AscendDeepseekV4SWACache, VllmDeepseekV4SWACache
+from vllm_ascend.models.layer.attention.layer import DSAAttention
 
 
 @pytest.mark.parametrize("device_type", [AscendDeviceType.A2, AscendDeviceType.A3, AscendDeviceType.A5])
-@pytest.mark.parametrize("model_type", ["deepseek_v4", "deepseek_v3", "qwen3"])
-@pytest.mark.parametrize(
-    "main,index", [("auto", "auto"), ("auto", "fp8"), ("fp8", "auto"), ("bfloat16", "auto"), ("bfloat16", "fp8")]
-)
-def test_dsv4_kv_defaults_are_resolved_before_cache_consumers(device_type, model_type, main, index):
+@pytest.mark.parametrize("main", ["auto", "fp8", "bfloat16"])
+@pytest.mark.parametrize("compress_ratio", [4, 128])
+def test_dsv4_cache_specs_resolve_auto_without_changing_config(device_type, main, compress_ratio):
     config = SimpleNamespace(
-        device_config=SimpleNamespace(device_type="npu"),
-        model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type=model_type), dtype=torch.bfloat16),
-        cache_config=CacheConfig(cache_dtype=main),
-        attention_config=AttentionConfig(indexer_kv_dtype=index),
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        cache_config=CacheConfig(cache_dtype=main, block_size=128),
+        attention_config=AttentionConfig(),
     )
-    expected_main, expected_index = main, index
-    if device_type == AscendDeviceType.A5 and model_type == "deepseek_v4":
-        expected_main = "fp8" if main == "auto" else main
-        expected_index = "fp8"
+    is_a5 = device_type == AscendDeviceType.A5
+    expected = (
+        torch.float8_e4m3fn if is_a5 and main == "auto" else kv_cache_dtype_str_to_dtype(main, config.model_config)
+    )
+    profile = get_hardware_profile(device_type)
 
-    # Stop at the next real consumer: all worker/cache planning happens later.
-    class Resolved(Exception):
-        pass
-
-    def inspect_resolved(actual):
-        assert actual.cache_config.cache_dtype == expected_main
-        assert actual.attention_config.indexer_kv_dtype == expected_index
-        main_dtype = kv_cache_dtype_str_to_dtype(actual.cache_config.cache_dtype, actual.model_config)
-        index_dtype = kv_cache_dtype_str_to_dtype(actual.attention_config.indexer_kv_dtype, actual.model_config)
-        assert main_dtype == (torch.float8_e4m3fn if expected_main == "fp8" else torch.bfloat16)
-        assert index_dtype == (torch.float8_e4m3fn if expected_index == "fp8" else torch.bfloat16)
-        raise Resolved
+    # Only stub upstream layer registration; exercise the real dtype and specs.
+    def init_swa(self, head_dim, window_size, dtype, prefix, cache_config):
+        torch.nn.Module.__init__(self)
+        self.head_dim, self.window_size, self.cache_config = head_dim, window_size, cache_config
 
     with (
-        patch("vllm_ascend.platform.get_current_hardware_profile", return_value=get_hardware_profile(device_type)),
-        patch("vllm_ascend.platform._validate_model_runner_config"),
-        patch.object(NPUPlatform, "_validate_indexer_pp_config"),
-        patch("vllm_ascend.platform._validate_routing_replay_config"),
-        patch("vllm_ascend.platform._validate_pcp_dcp_config"),
-        patch("vllm_ascend.platform._validate_draft_decode_context_parallel_config"),
-        patch("vllm_ascend.platform._validate_parallel_config"),
-        patch("vllm_ascend.platform._validate_engram_config"),
-        patch("vllm_ascend.logger.configure_ascend_file_logging"),
-        patch("vllm_ascend.logger.configure_ascend_logging"),
-        patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization", side_effect=inspect_resolved),
-        pytest.raises(Resolved),
+        patch.object(VllmDeepseekV4SWACache, "__init__", init_swa),
+        patch("vllm_ascend.models.deepseek_v4.model.get_current_hardware_profile", return_value=profile),
+        patch("vllm_ascend.models.layer.attention.layer.get_current_hardware_profile", return_value=profile),
+        patch("vllm_ascend.models.deepseek_v4.indexer.get_current_hardware_profile", return_value=profile),
+        patch("vllm_ascend.attention.dsa_attn_kv_plan.get_current_hardware_profile", return_value=profile),
     ):
-        NPUPlatform.check_and_update_config(config)
+        swa = AscendDeepseekV4SWACache(
+            512, 128, kv_cache_dtype_str_to_dtype(main, config.model_config), "swa", config.cache_config
+        )
+        attn = DSAAttention.__new__(DSAAttention)
+        torch.nn.Module.__init__(attn)
+        attn.kv_cache_dtype, attn.head_size, attn.compress_ratio = main, 512, compress_ratio
+        swa_spec, compressed_spec = swa.get_kv_cache_spec(config), attn.get_kv_cache_spec(config)
+        assert swa.dtype == swa_spec.dtype == compressed_spec.dtype == expected
+        if is_a5:
+            assert swa_spec.head_size == compressed_spec.head_size == (512 if main == "bfloat16" else 640)
+            assert swa_spec.page_size_bytes == compressed_spec.page_size_bytes
+        assert is_a5_bf16_kv_enabled(config) == (is_a5 and main == "bfloat16")
+        assert get_indexer_k_dtype(config) == (torch.float8_e4m3fn if is_a5 else torch.int8)
+        assert config.cache_config.cache_dtype == main
+        assert config.attention_config.indexer_kv_dtype == "auto"
