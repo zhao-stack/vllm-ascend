@@ -504,6 +504,14 @@ class NPUPlatform(Platform):
         _validate_engram_config(vllm_config)
 
         # 3.Auto detect quantization method and verify cache dtype
+        if (
+            vllm_config.model_config.hf_text_config.model_type == "deepseek_v4"
+            and get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+        ):
+            # Resolve defaults before cache specs and KV execution plans diverge.
+            if vllm_config.cache_config.cache_dtype == "auto":
+                vllm_config.cache_config.cache_dtype = "fp8"
+            vllm_config.attention_config.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype("fp8")
         maybe_auto_detect_quantization(vllm_config)
         from vllm_ascend.quantization.methods.kv_cache.turboquant.config import validate_turboquant
 
