@@ -3,14 +3,31 @@
 ## Current flow-owned smoke
 
 The current manual workflow on `codex/main2main-interface-gray` pins flow PR #5
-at `d61b227672bbf43b8f84aea6e1ac75f27ea7bdab`. It calls the production
-`analyze_commit_and_plan_step()` with real detection and scanning, stopping at
-the planner boundary. It checks fresh scan, verified cache reuse and the real
-no-change path, then passes the state-bound Markdown to the original QA model.
-Only a separate review checkout replays one existing historical file. Model
-permissions allow source/report reads and writing review.json only. All jobs
-use hosted Ubuntu CPU runners; no initialization, adaptation, NPU tests or PR
-pushes execute. Acceptance JSON and reviewer events are uploaded as artifacts.
+at `bd626953ba6e15bf73971e9876f23e259d064146`. Production detection resolves the
+range, scans once, verifies cache reuse and exercises the no-change fast path.
+The planner is intercepted, so full kickoff, adaptation and hardware tests do
+not start.
+
+The second phase runs the real adapter prompt/runner with an explicit gray
+read-only override: it may read the report and exact upstream/downstream source,
+and write only the existing `step_summary.md` with per-root decisions. A local
+stub probes the read/write boundary before any real model call. The separate
+review checkout contains only one replayed historical file, locally committed
+to produce an EMPTY diff. This is intentionally a partial fixture, not the full
+historical adaptation. Nothing is pushed from this checkout.
+
+The original `_run_adapter_qa` then reads the same report and adapter summary in
+an independent session. QA can write only `review.json`. Acceptance requires
+complete root coverage, matching report/step/range identities, completed source
+and report read events for both agents, QA reading the adapter summary, and an
+independent QA confirmation of at least one adapter no-change decision despite
+the empty diff. A QA fail for a real risk in this fixture is recorded separately
+from successful chain execution. Source and report immutability are checked.
+
+All jobs use GitHub-hosted Ubuntu CPU runners. There are two real agent
+invocations (adapter confirmation + independent QA); neither may adapt business
+code, run tests or allocate NPU devices. Events, decisions and acceptance JSON
+are uploaded as artifacts. The fork's other workflows remain manually disabled.
 
 The remaining sections document earlier iterations of the gray harness.
 
