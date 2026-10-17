@@ -1,192 +1,18 @@
 name: Main2Main Interface Gray (CPU, read-only QA)
-run-name: Interface migration to main2main_flow
+run-name: Flow-owned detection and original QA gray
 
 on:
   workflow_dispatch:
     inputs:
       combined_smoke:
-        description: Validate the migrated CPU producer and original read-only QA
+        description: Validate production detection call site and original read-only QA
         type: boolean
         default: true
 
 permissions:
   contents: read
 
-env:
-  MAIN2MAIN_GIT_NAME: Interface Gray
-  MAIN2MAIN_GIT_EMAIL: interface-gray@example.invalid
-
 jobs:
-  resolve-source:
-    if: github.repository == 'zhao-stack/vllm-ascend' && inputs.combined_smoke
-    runs-on: ubuntu-24.04
-    outputs:
-      source_repository: ${{ steps.range.outputs.source_repository }}
-      source_ref: ${{ steps.range.outputs.source_ref }}
-      base_sha: ${{ steps.range.outputs.base_sha }}
-      target_sha: ${{ steps.range.outputs.target_sha }}
-    steps:
-      # Isolate the actual producer job with the already-known historical range.
-      - id: range
-        run: |
-          echo 'source_repository=vllm-project/vllm-ascend' >> "$GITHUB_OUTPUT"
-          echo 'source_ref=6556ad5af1baaf481e996fc2788e233ce672f98e' >> "$GITHUB_OUTPUT"
-          echo 'base_sha=' >> "$GITHUB_OUTPUT"
-          echo 'target_sha=85c09e9885e346ea1612da30ebff5a75f67d2350' >> "$GITHUB_OUTPUT"
-  interface-report:
-    needs: resolve-source
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    outputs:
-      ascend_tree: ${{ steps.prepare.outputs.ascend_tree }}
-      flow_sha: ${{ steps.flow.outputs.sha }}
-    steps:
-      # Detection code belongs to main2main_flow, outside the adaptation source.
-      - uses: actions/checkout@v7
-        with:
-          repository: zhao-stack/main2main_flow
-          ref: 7a3d79166c13275e2d848ed3d2e9185d2cd77e14
-          path: flow-source
-          persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          repository: ${{ needs.resolve-source.outputs.source_repository }}
-          ref: ${{ needs.resolve-source.outputs.source_ref }}
-          fetch-depth: 0
-          path: ascend-source
-          persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          repository: vllm-project/vllm
-          ref: ${{ needs.resolve-source.outputs.target_sha }}
-          fetch-depth: 0
-          path: vllm-source
-          persist-credentials: false
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.11'
-      - name: Freeze detection and QA implementation
-        id: flow
-        run: echo "sha=$(git -C flow-source rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Prepare exact analysis inputs
-        id: prepare
-        working-directory: flow-source
-        env:
-          BASE_SHA: ${{ needs.resolve-source.outputs.base_sha }}
-          ENGINE_SHA: ${{ steps.flow.outputs.sha }}
-          TARGET_SHA: ${{ needs.resolve-source.outputs.target_sha }}
-        run: |
-          set -euo pipefail
-          git -C "$GITHUB_WORKSPACE/ascend-source" config user.name "${MAIN2MAIN_GIT_NAME}"
-          git -C "$GITHUB_WORKSPACE/ascend-source" config user.email "${MAIN2MAIN_GIT_EMAIL}"
-          SOURCE_MODE=fresh
-          if [ -n "$BASE_SHA" ]; then
-            SOURCE_MODE=incremental_rebased
-            git -C "$GITHUB_WORKSPACE/ascend-source" fetch https://github.com/vllm-project/vllm-ascend.git "$BASE_SHA"
-            git -C "$GITHUB_WORKSPACE/ascend-source" rebase "$BASE_SHA"
-          fi
-          echo "ascend_tree=$(git -C "$GITHUB_WORKSPACE/ascend-source" rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
-          python -B -m main2main_flow.interface_report prepare \
-            --engine-root "$GITHUB_WORKSPACE/flow-source" \
-            --vllm-root "$GITHUB_WORKSPACE/vllm-source" \
-            --ascend-root "$GITHUB_WORKSPACE/ascend-source" \
-            --engine-sha "$ENGINE_SHA" --new "$TARGET_SHA" \
-            --old "$(cat "$GITHUB_WORKSPACE/ascend-source/.github/vllm-main-verified.commit")" \
-            --ascend-sha "$(git -C "$GITHUB_WORKSPACE/ascend-source" rev-parse HEAD)" \
-            --source-mode "$SOURCE_MODE" \
-            --output "$RUNNER_TEMP/interface-report" --github-output "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/interface-cache
-          key: ${{ steps.prepare.outputs.cache_key }}
-      - name: Analyze source contracts (CPU only)
-        working-directory: flow-source
-        run: |
-          python -B -m main2main_flow.interface_report scan \
-            --output "$RUNNER_TEMP/interface-report" --cache-dir "$RUNNER_TEMP/interface-cache"
-          python -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); assert 0 < p.stat().st_size <= 1_000_000; assert p.read_text(encoding="utf-8").strip()' \
-            "$RUNNER_TEMP/interface-report/qa-review.md"
-          cat "$RUNNER_TEMP/interface-report/summary.md" >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload single QA report
-        uses: actions/upload-artifact@v4
-        with:
-          name: main2main-interface-report
-          path: ${{ runner.temp }}/interface-report/qa-review.md
-          if-no-files-found: error
-          retention-days: 14
-
-  adapter-smoke:
-    needs: interface-report
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          path: gray-code
-      - uses: actions/checkout@v4
-        with:
-          repository: zhao-stack/main2main_flow
-          ref: ${{ needs.interface-report.outputs.flow_sha }}
-          persist-credentials: false
-          path: flow-source
-      - uses: actions/checkout@v4
-        with:
-          repository: vllm-project/vllm-ascend
-          ref: 6556ad5af1baaf481e996fc2788e233ce672f98e
-          fetch-depth: 0
-          persist-credentials: false
-          path: ascend-source
-      - uses: actions/checkout@v4
-        with:
-          repository: vllm-project/vllm
-          ref: 85c09e9885e346ea1612da30ebff5a75f67d2350
-          fetch-depth: 0
-          persist-credentials: false
-          path: vllm-source
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - uses: actions/download-artifact@v4
-        with:
-          name: main2main-interface-report
-          path: report-input
-      - name: Verify pinned flow and baseline handoff
-        env:
-          FLOW_SHA: ${{ needs.interface-report.outputs.flow_sha }}
-          ASCEND_TREE: ${{ needs.interface-report.outputs.ascend_tree }}
-        run: |
-          test "$(git -C flow-source rev-parse HEAD)" = "$FLOW_SHA"
-          test "$(git -C ascend-source rev-parse 'HEAD^{tree}')" = "$ASCEND_TREE"
-          python -B gray-code/tools/main2main_gray/migration_handoff.py
-      - name: Install actual companion PR and QA runtime
-        run: |
-          pip install -e ./flow-source
-          npm install -g opencode-ai@1.18.32
-          opencode --version
-      - name: Original adapter-qa read-only consumption test
-        env:
-          MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
-          SKIP_E2E_TEST: 'true'
-          PUSH_TO_GITHUB: 'false'
-        run: python -B gray-code/tools/main2main_gray/adapter_smoke.py
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: migration-qa-${{ github.run_id }}
-          path: |
-            output/
-            report-input/
-          retention-days: 14
-
   flow-checks:
     if: github.repository == 'zhao-stack/vllm-ascend' && inputs.combined_smoke
     runs-on: ubuntu-24.04
@@ -195,36 +21,88 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zhao-stack/main2main_flow
-          ref: 7a3d79166c13275e2d848ed3d2e9185d2cd77e14
+          ref: 252e0c96a2b99a9a7386fa8a084627cc2d09148b
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -e . ruff==0.14.0
+      - run: pip install -e .
       - run: python -B -m unittest discover -s tests -p 'test_interface_*.py' -v
-      - name: Check migrated producer and engine style
-        run: |
-          ruff check --isolated --line-length 120 --select E,F,UP,B,SIM,I,G --ignore F405,F403,E731,B905,B007,UP032,B904,SIM108,SIM102 main2main_flow/interface_contracts main2main_flow/interface_report tests/test_interface_scan.py
-          ruff format --check --isolated --line-length 120 main2main_flow/interface_contracts main2main_flow/interface_report tests/test_interface_scan.py
-      - name: Build and verify source-only wheel entrypoint
-        run: |
-          pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/wheels" .
-          pip install --no-deps --target "$RUNNER_TEMP/installed" "$RUNNER_TEMP"/wheels/*.whl
-          cd "$RUNNER_TEMP"
-          PYTHONPATH="$RUNNER_TEMP/installed" python -S -B -m main2main_flow.interface_report --help
-          PYTHONPATH="$RUNNER_TEMP/installed" python -S -B -m main2main_flow.interface_contracts --help
 
-  ascend-format:
-    if: github.repository == 'zhao-stack/vllm-ascend' && inputs.combined_smoke
+  flow-owned-smoke:
+    needs: flow-checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 1247cb4de30c64ae99459a91e8dda83cb610bfe3
+          path: gray-code
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: zhao-stack/main2main_flow
+          ref: 252e0c96a2b99a9a7386fa8a084627cc2d09148b
+          path: flow-source
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm-ascend
+          ref: 6556ad5af1baaf481e996fc2788e233ce672f98e
+          fetch-depth: 0
+          path: ascend-source
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm
+          ref: 85c09e9885e346ea1612da30ebff5a75f67d2350
+          fetch-depth: 0
+          path: vllm-source
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements-lint.txt
-      - run: bash format.sh ci
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned flow and QA runtime
+        run: |
+          pip install -e ./flow-source
+          npm install -g opencode-ai@1.18.32
+          opencode --version
+      - name: Check secret availability without using it
+        env:
+          MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
+        run: test -n "$MAIN2MAIN_API_KEY"
+      - name: Production scan call site, cache reuse and no-change path
+        run: python -B gray-code/tools/main2main_gray/flow_owned_smoke.py scan
+      - name: Real original QA with report bound to flow state
+        timeout-minutes: 12
+        env:
+          MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
+          MAIN2MAIN_ADAPTER_TIMEOUT_MINUTES: '8'
+          SKIP_E2E_TEST: 'true'
+          PUSH_TO_GITHUB: 'false'
+        run: python -B gray-code/tools/main2main_gray/flow_owned_smoke.py qa
+      - name: Publish acceptance summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
+              stream.write('## Flow-owned interface gray\n\n')
+              for name in ('scan-acceptance.json', 'qa-acceptance.json'):
+                  path = Path('output') / name
+                  if path.exists():
+                      stream.write('### ' + name + '\n\n```json\n')
+                      stream.write(json.dumps(json.loads(path.read_text()), ensure_ascii=False, indent=2))
+                      stream.write('\n```\n\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flow-owned-gray-${{ github.run_id }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14

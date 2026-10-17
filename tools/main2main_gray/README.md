@@ -1,5 +1,19 @@
 # Main2Main interface gray test
 
+## Current flow-owned smoke
+
+The current manual workflow on `codex/main2main-interface-gray` pins flow PR #5
+at `252e0c96a2b99a9a7386fa8a084627cc2d09148b`. It calls the production
+`analyze_commit_and_plan_step()` with real detection and scanning, stopping at
+the planner boundary. It checks fresh scan, verified cache reuse and the real
+no-change path, then passes the state-bound Markdown to the original QA model.
+Only a separate review checkout replays one existing historical file. Model
+permissions allow source/report reads and writing review.json only. All jobs
+use hosted Ubuntu CPU runners; no initialization, adaptation, NPU tests or PR
+pushes execute. Acceptance JSON and reviewer events are uploaded as artifacts.
+
+The remaining sections document earlier iterations of the gray harness.
+
 The fork-only manual workflow resolves an upgrade range, runs the pinned complete
 source analyzer and publishes one `qa-review.md` for read-only QA. QA is disabled
 by default and can be explicitly enabled as described below. This workflow does
