@@ -3,7 +3,7 @@
 ## Current flow-owned smoke
 
 The current manual workflow on `codex/main2main-interface-gray` pins flow PR #5
-at `252e0c96a2b99a9a7386fa8a084627cc2d09148b`. It calls the production
+at `d61b227672bbf43b8f84aea6e1ac75f27ea7bdab`. It calls the production
 `analyze_commit_and_plan_step()` with real detection and scanning, stopping at
 the planner boundary. It checks fresh scan, verified cache reuse and the real
 no-change path, then passes the state-bound Markdown to the original QA model.
