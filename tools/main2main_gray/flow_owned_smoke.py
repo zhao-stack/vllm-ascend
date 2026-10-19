@@ -17,7 +17,7 @@ from main2main_flow.interface_report.runtime import scan_for_flow
 from main2main_flow.scripts.agent import opencode_adapter
 from probe_permissions import probe
 
-FLOW_SHA = "bd626953ba6e15bf73971e9876f23e259d064146"
+FLOW_SHA = "ae112de441995cf8864c5575943f27b13f4ea333"
 OLD = "e5588e49bc2642670116664a7fc4096e27adb179"
 NEW = "85c09e9885e346ea1612da30ebff5a75f67d2350"
 ASCEND = "6556ad5af1baaf481e996fc2788e233ce672f98e"
