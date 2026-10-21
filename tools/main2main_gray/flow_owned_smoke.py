@@ -5,7 +5,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -17,7 +16,7 @@ from main2main_flow.interface_report.runtime import scan_for_flow
 from main2main_flow.scripts.agent import opencode_adapter
 from probe_permissions import probe
 
-FLOW_SHA = "367335ac60e0174cbc85e5305ea64ed3d87ec697"
+FLOW_SHA = "30153bc609566c7b62b4631b99ce7f19a5392158"
 OLD = "e5588e49bc2642670116664a7fc4096e27adb179"
 NEW = "85c09e9885e346ea1612da30ebff5a75f67d2350"
 ASCEND = "6556ad5af1baaf481e996fc2788e233ce672f98e"
@@ -305,7 +304,7 @@ def qa(root):
         review = json.loads(review_path.read_text())
         assert review["verdict"] in ("pass", "fail") and isinstance(review["issues"], list)
         usages = review.get("interface_report_usage", [])
-        roots = set(re.findall(r"^## ([0-9a-f]{16})", report.read_text(encoding="utf-8"), re.MULTILINE))
+        roots = set(contract.roots)
         assert {u["root_cause_id"] for u in usages} == roots
         assert not any(i.startswith("interface-handoff:") for i in issues), issues
         reads = completed_reads(qa_output / "opencode_qa_raw.jsonl")
