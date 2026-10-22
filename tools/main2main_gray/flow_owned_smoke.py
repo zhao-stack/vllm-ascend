@@ -16,7 +16,7 @@ from main2main_flow.interface_report.runtime import scan_for_flow
 from main2main_flow.scripts.agent import opencode_adapter
 from probe_permissions import probe
 
-FLOW_SHA = "9c170efa33fa7144e46d05b3402f1450ebd4fd22"
+FLOW_SHA = "de905b3c3a51270a1bc171c93a32209121b76b62"
 OLD = "e5588e49bc2642670116664a7fc4096e27adb179"
 NEW = "85c09e9885e346ea1612da30ebff5a75f67d2350"
 ASCEND = "6556ad5af1baaf481e996fc2788e233ce672f98e"
@@ -263,9 +263,13 @@ def qa(root):
             "judge this actual tree, not assumptions about the complete historical commit. "
             f"Write ONLY {summary_path}; do not write analysis.md or result.json. "
             "Include the required interface-assessment block for EVERY root. "
+            "Set the block's top-level review_mode to read_only_gray. "
             "For already compatible code use no_change with source proof. For a confirmed "
-            "need to adapt, use insufficient_evidence with a reason explicitly saying "
-            "adaptation is needed but intentionally not executed in this read-only gray. "
+            "current-step need to adapt, use decision needs_adaptation AND execution_status "
+            "not_executed_read_only, with source proof and a reason saying the repair was "
+            "intentionally not executed in this gray. Use insufficient_evidence ONLY when "
+            "source evidence cannot establish whether adaptation is needed; never use it "
+            "merely because gray disallows editing. Do not attach execution_status to other decisions. "
             "Do not claim adapted. No code edits are permitted. Use bounded targeted reads, "
             "then write the summary and finish."
         )
@@ -289,7 +293,7 @@ def qa(root):
         ):
             result = opencode_adapter.run_opencode_adapter(inputs)
         contract = load_report(str(report))
-        decisions = load_assessment(contract, adapter_output, "historical-pr12020", OLD, NEW)
+        decisions = load_assessment(contract, adapter_output, "historical-pr12020", OLD, NEW, read_only=True)
         assert result.is_noop and all(i["decision"] != "adapted" for i in decisions["items"])
         adapter_reads = completed_reads(adapter_output / "opencode_raw.jsonl")
         assert str(report) in adapter_reads
@@ -310,6 +314,7 @@ def qa(root):
             "historical-pr12020",
             str(qa_output),
             (qa_source / ".github/vllm-release-tag.commit").read_text().strip().lstrip("v"),
+            read_only_interface_review=True,
         )
         review = json.loads(review_path.read_text())
         assert review["verdict"] in ("pass", "fail") and isinstance(review["issues"], list)
@@ -328,6 +333,12 @@ def qa(root):
         assert any(u["root_cause_id"] in rejected and u["judgment"] == "agree" for u in usages), (
             "No independent QA confirmation of adapter's no-change assessment"
         )
+        # Check the known partial fixture, without rewriting either model output.
+        confirmed = {i["root_cause_id"] for i in decisions["items"] if i["decision"] == "needs_adaptation"}
+        assert confirmed == {"c21501bc8001ddbc", "26d25f2314a469e0"}
+        assert rejected == {"92bf640c5b408002", "476fd380d08398b6"}
+        assert all(u["judgment"] == "agree" for u in usages), usages
+        assert review["verdict"] == "fail" and review["issues"], review
         status.update(
             report_consumed=True,
             report_roots_used=usages,
@@ -336,6 +347,9 @@ def qa(root):
             session_id=session,
             real_qa_invocations=1,
             qa_reviewed_no_change_with_empty_diff=True,
+            gray_classification_separates_evidence_and_execution=True,
+            confirmed_unadapted_roots=sorted(confirmed),
+            qa_agrees_on_classification_but_fails_unfixed_code=True,
         )
     finally:
         status.update(

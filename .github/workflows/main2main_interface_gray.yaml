@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zhao-stack/main2main_flow
-          ref: 9c170efa33fa7144e46d05b3402f1450ebd4fd22
+          ref: de905b3c3a51270a1bc171c93a32209121b76b62
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zhao-stack/main2main_flow
-          ref: 9c170efa33fa7144e46d05b3402f1450ebd4fd22
+          ref: de905b3c3a51270a1bc171c93a32209121b76b62
           path: flow-source
           persist-credentials: false
       - uses: actions/checkout@v4
