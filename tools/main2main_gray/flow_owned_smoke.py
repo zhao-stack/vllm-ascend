@@ -16,7 +16,7 @@ from main2main_flow.interface_report.runtime import scan_for_flow
 from main2main_flow.scripts.agent import opencode_adapter
 from probe_permissions import probe
 
-FLOW_SHA = "da777021d3d89b09c51444d0ec9ca49fcd0287d2"
+FLOW_SHA = "4993fb980555e66381bd8ce5c177ad4a8f400527"
 OLD = "e5588e49bc2642670116664a7fc4096e27adb179"
 NEW = "85c09e9885e346ea1612da30ebff5a75f67d2350"
 ASCEND = "6556ad5af1baaf481e996fc2788e233ce672f98e"
@@ -94,6 +94,13 @@ def scan(root):
     os.environ["XDG_CACHE_HOME"] = str(cache_home)
     first, report, metadata = prepare_flow(root, output / "first")
     assert metadata["cache_status"] == "miss"
+    # Same-range regression: unchanged KV inherited reads must disappear,
+    # while the original argument/return candidates remain available to agents.
+    report_roots = set(load_report(str(report)).roots)
+    unchanged_state_roots = {"1d27fff1c9c82b36", "b8e28ded869fc714"}
+    argument_return_roots = {"92bf640c5b408002", "476fd380d08398b6", "c21501bc8001ddbc", "26d25f2314a469e0"}
+    assert not report_roots & unchanged_state_roots
+    assert argument_return_roots <= report_roots
     repeated, repeat_report, repeated_metadata = prepare_flow(root, output / "repeated")
     assert repeated_metadata["cache_status"] == "hit"
     assert metadata["cache_key"] == repeated_metadata["cache_key"]
@@ -134,6 +141,9 @@ def scan(root):
             "range": {"old": OLD, "new": NEW, "ascend": ASCEND},
             "automatic_range": True,
             "fresh_scan": True,
+            "unchanged_inherited_state_excluded": True,
+            "argument_return_candidates_retained": True,
+            "report_roots": sorted(report_roots),
             "cache_reuse": True,
             "no_change_skips_scan_and_model": True,
             "scan_calls_per_upgrade": 1,
