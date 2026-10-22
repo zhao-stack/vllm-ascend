@@ -16,7 +16,8 @@ from main2main_flow.interface_report.runtime import scan_for_flow
 from main2main_flow.scripts.agent import opencode_adapter
 from probe_permissions import probe
 
-FLOW_SHA = "de905b3c3a51270a1bc171c93a32209121b76b62"
+FLOW_SHA = "f6a258297fb2ddd93a74f242d523970e1c564738"
+SCAN_TIMEOUT_SECONDS = 2400
 OLD = "e5588e49bc2642670116664a7fc4096e27adb179"
 NEW = "85c09e9885e346ea1612da30ebff5a75f67d2350"
 ASCEND = "6556ad5af1baaf481e996fc2788e233ce672f98e"
@@ -157,6 +158,72 @@ def scan(root):
             "npu_tests_executed": False,
         },
     )
+
+
+def failure(root):
+    """Real pinned detect/snapshot path, injected engine timeout, no adaptation."""
+    assert git(root / "flow-source", "rev-parse", "HEAD") == FLOW_SHA
+    before = source_state(root)
+    assert all(not value["status"] for value in before.values())
+    acceptance = json.loads((root / "output/scan-acceptance.json").read_text())
+    existing_report = Path(acceptance["qa_report"])
+    workspace = root / "output/scan-failure"
+    workspace.mkdir()
+    scan_dir = workspace / "interface_scan"
+    scan_dir.mkdir()
+    stale = scan_dir / "qa-review.md"
+    stale.write_bytes(existing_report.read_bytes())
+    flow = Main2MainFlow(vllm_path=str(root / "vllm-source"),
+                         vllm_ascend_path=str(root / "ascend-source"))
+    flow.state.interface_report = str(existing_report)
+    flow.state.interface_report_sha256 = digest(existing_report)
+
+    def stop_plan(upstream, old, new, **kwargs):
+        assert (old, new) == (OLD, NEW)
+        raise StopBeforePlan
+
+    with (
+        patch.dict(os.environ, {"MAIN2MAIN_INTERFACE_REPORT": str(existing_report)}),
+        patch("main2main_flow.flow.WORKSPACE_DIR", workspace),
+        patch("main2main_flow.interface_report.runtime._scan_prepared",
+              side_effect=subprocess.TimeoutExpired("injected-gray-engine", SCAN_TIMEOUT_SECONDS)) as engine,
+        patch("main2main_flow.flow.run_plan", side_effect=stop_plan) as planner,
+        patch("main2main_flow.flow.run_opencode_adapter") as adapter,
+        patch("main2main_flow.flow.run_opencode_review") as qa_model,
+    ):
+        try:
+            flow.analyze_commit_and_plan_step()
+        except StopBeforePlan:
+            pass
+        else:
+            raise AssertionError("Failed scan did not continue to original planning")
+        engine.assert_called_once()
+        planner.assert_called_once()
+        adapter.assert_not_called()
+        qa_model.assert_not_called()
+        assert flow.state.base_commit == OLD and flow.state.target_commit == NEW
+        assert flow.state.interface_scan_failed
+        assert flow.state.interface_report == flow.state.interface_report_sha256 == ""
+        assert flow._interface_adapter_inputs({})["interface_report"] == ""
+        assert flow._interface_assessment("failure-only", workspace) == (None, None)
+    status = json.loads((scan_dir / "run-status.json").read_text())
+    assert status["scan"] == "failed"
+    assert status["adaptation"] == "continued_without_interface_report"
+    assert "TimeoutExpired" in status["error"]
+    assert not stale.exists()
+    assert digest(existing_report) == acceptance["report_sha256"]
+    assert source_state(root) == before
+    save(root / "output/scan-failure-acceptance.json", {
+        "passed": True, "flow_sha": FLOW_SHA, "range": acceptance["range"],
+        "fault": "engine_timeout_injected_after_real_snapshot_preparation",
+        "original_detect_used": True, "original_plan_reached": True,
+        "scan_failed_not_clean": True, "bound_report_cleared": True,
+        "environment_fallback_disabled": True, "stale_report_removed": True,
+        "failure_status": status, "successful_report_unchanged": True,
+        "sources_unchanged": True, "model_calls": 0,
+        "adaptation_executed": False, "npu_tests_executed": False,
+        "boundary": "stop_at_original_run_plan_before_adaptation",
+    })
 
 
 def read_only_config(root, report, review_path):
@@ -364,9 +431,9 @@ def qa(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("scan", "qa"))
+    parser.add_argument("phase", choices=("scan", "failure", "qa"))
     args = parser.parse_args()
-    (scan if args.phase == "scan" else qa)(Path.cwd().resolve())
+    {"scan": scan, "failure": failure, "qa": qa}[args.phase](Path.cwd().resolve())
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zhao-stack/main2main_flow
-          ref: de905b3c3a51270a1bc171c93a32209121b76b62
+          ref: f6a258297fb2ddd93a74f242d523970e1c564738
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zhao-stack/main2main_flow
-          ref: de905b3c3a51270a1bc171c93a32209121b76b62
+          ref: f6a258297fb2ddd93a74f242d523970e1c564738
           path: flow-source
           persist-credentials: false
       - uses: actions/checkout@v4
@@ -75,6 +75,8 @@ jobs:
         run: test -n "$MAIN2MAIN_API_KEY"
       - name: Production scan call site, cache reuse and no-change path
         run: python -B gray-code/tools/main2main_gray/flow_owned_smoke.py scan
+      - name: Scan timeout warns and continues to original planning
+        run: python -B gray-code/tools/main2main_gray/flow_owned_smoke.py failure
       - name: Read-only adapter then original QA including empty-diff decisions
         timeout-minutes: 24
         env:
@@ -92,7 +94,7 @@ jobs:
           from pathlib import Path
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write('## Flow-owned interface gray\n\n')
-              for name in ('scan-acceptance.json', 'qa-acceptance.json'):
+              for name in ('scan-acceptance.json', 'scan-failure-acceptance.json', 'qa-acceptance.json'):
                   path = Path('output') / name
                   if path.exists():
                       stream.write('### ' + name + '\n\n```json\n')
