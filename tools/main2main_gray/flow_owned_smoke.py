@@ -5,18 +5,20 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 from main2main_flow.flow import Main2MainFlow
-from main2main_flow.interface_report.handoff import load_assessment, load_report
+from main2main_flow.interface_report.handoff import load_assessment, load_report, warn_handoff
 from main2main_flow.interface_report.run import git
 from main2main_flow.interface_report.runtime import scan_for_flow
 from main2main_flow.scripts.agent import opencode_adapter
+from main2main_flow.scripts.agent.opencode_adapter import run_opencode_review
 from probe_permissions import probe
 
-FLOW_SHA = "f6a258297fb2ddd93a74f242d523970e1c564738"
+FLOW_SHA = "9398ca5f084659fd78a0f71c07813733980d2b88"
 SCAN_TIMEOUT_SECONDS = 2400
 OLD = "e5588e49bc2642670116664a7fc4096e27adb179"
 NEW = "85c09e9885e346ea1612da30ebff5a75f67d2350"
@@ -429,11 +431,103 @@ def qa(root):
     assert status["sources_unchanged"] and status["review_copy_unchanged"] and status["report_unchanged"]
 
 
+def advisory(root):
+    """A malformed summary still reaches real read-only QA with zero business diff."""
+    assert os.environ.get("MAIN2MAIN_API_KEY"), "Missing MAIN2MAIN_API_KEY"
+    output = root / "output"
+    acceptance = json.loads((output / "scan-acceptance.json").read_text())
+    assert acceptance["flow_sha"] == FLOW_SHA
+    assert git(root / "flow-source", "rev-parse", "HEAD") == FLOW_SHA
+    flow = Main2MainFlow(**acceptance["state"])
+    flow.state.steps = [dict(id="historical-pr12020", start_commit=OLD, end_commit=NEW)]
+    flow.state.total_steps = 1
+    report = Path(flow.state.interface_report)
+    before = source_state(root)
+    qa_source = root / "qa-ascend"
+    fixture_head = git(qa_source, "rev-parse", "HEAD")
+    assert not git(qa_source, "status", "--porcelain")
+    original_summary = output / "readonly-adapter/step_summary.md"
+    original_review = output / "original-qa/review.json"
+    original_hashes = [digest(original_summary), digest(original_review)]
+    qa_output = output / "advisory-qa"
+    qa_output.mkdir()
+    summary = qa_output / "step_summary.md"
+    text = original_summary.read_text()
+    blocks = re.findall(r"^```interface-assessment\s*\n(.*?)^```\s*$", text, re.MULTILINE | re.DOTALL)
+    assert len(blocks) == 1
+    parsed = json.loads(blocks[0])
+    assert len(parsed["items"]) == 4
+    # Inject a trailing comma only in the QA-input copy; retain human-readable decisions.
+    malformed = json.dumps(parsed, ensure_ascii=False, indent=2).rstrip()
+    malformed = malformed[:-1] + ",\n}"
+    summary.write_text(text.replace(blocks[0], malformed + "\n"))
+    summary_hash = digest(summary)
+    try:
+        load_assessment(load_report(str(report)), qa_output, "historical-pr12020", OLD, NEW, read_only=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Fault injection did not create an invalid summary")
+    review_path = qa_output / "review.json"
+    config_path = output / "advisory-opencode-config.json"
+    config = read_only_config(root, report, review_path)
+    save(config_path, config)
+    probe(config, report, review_path, qa_output)
+    os.environ.update(OPENCODE_CONFIG=str(config_path), MAIN2MAIN_MODEL_REVIEW="deepseek/deepseek-flash")
+    os.chdir(root / "gray-code")
+    warnings = []
+    def warning(detail):
+        warnings.append(detail)
+        warn_handoff(detail)
+
+    def review(prompt, **kwargs):
+        (qa_output / "input-prompt.txt").write_text(prompt)
+        assert str(report) in prompt and str(summary) in prompt
+        assert "adapter interface assessment missing or unreadable" in prompt
+        assert all(root_id in prompt for root_id in acceptance["report_roots"])
+        return run_opencode_review(prompt, **kwargs)
+
+    with (
+        patch("main2main_flow.flow.warn_handoff", side_effect=warning),
+        patch("main2main_flow.flow.run_opencode_review", side_effect=review) as reviewer,
+        patch.object(opencode_adapter, "run_opencode_adapter") as adapter,
+    ):
+        issues, _ = flow._run_adapter_qa(
+            str(qa_source), str(root / "vllm-source"), "historical-pr12020", str(qa_output),
+            (qa_source / ".github/vllm-release-tag.commit").read_text().strip().lstrip("v"),
+            read_only_interface_review=True,
+        )
+        reviewer.assert_called_once()
+        adapter.assert_not_called()
+    assert any("adapter interface assessment missing or unreadable" in w for w in warnings)
+    review_data = json.loads(review_path.read_text())
+    assert review_data["verdict"] == "fail" and review_data["issues"], review_data
+    assert {u["root_cause_id"] for u in review_data["interface_report_usage"]} == set(acceptance["report_roots"])
+    assert not any(i.startswith("interface-handoff:") for i in issues), issues
+    reads = completed_reads(qa_output / "opencode_qa_raw.jsonl")
+    assert str(report) in reads and str(summary) in reads
+    assert any(str(qa_source) in p for p in reads) and any(str(root / "vllm-source") in p for p in reads)
+    assert source_state(root) == before
+    assert git(qa_source, "rev-parse", "HEAD") == fixture_head and not git(qa_source, "status", "--porcelain")
+    assert digest(summary) == summary_hash and digest(report) == acceptance["report_sha256"]
+    assert [digest(original_summary), digest(original_review)] == original_hashes
+    save(output / "advisory-qa-acceptance.json", dict(
+        passed=True, flow_sha=FLOW_SHA, fault="trailing_comma_in_adapter_assessment_copy",
+        adapter_format_warning_observed=True, real_qa_invocations=1, adapter_fix_invocations=0,
+        report_and_summary_consumed=True, all_roots_sent_to_qa=True,
+        qa_reviewed_roots=review_data["interface_report_usage"],
+        qa_verdict=review_data["verdict"], qa_issues=review_data["issues"], qa_business_diff_bytes=0,
+        original_model_outputs_unchanged=True, sources_unchanged=True, review_copy_unchanged=True,
+        report_unchanged=True, malformed_summary_unchanged=True, adaptation_executed=False, npu_tests_executed=False,
+        warnings=warnings,
+    ))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("scan", "failure", "qa"))
+    parser.add_argument("phase", choices=("scan", "failure", "qa", "advisory"))
     args = parser.parse_args()
-    {"scan": scan, "failure": failure, "qa": qa}[args.phase](Path.cwd().resolve())
+    {"scan": scan, "failure": failure, "qa": qa, "advisory": advisory}[args.phase](Path.cwd().resolve())
 
 
 if __name__ == "__main__":

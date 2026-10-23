@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zhao-stack/main2main_flow
-          ref: f6a258297fb2ddd93a74f242d523970e1c564738
+          ref: 9398ca5f084659fd78a0f71c07813733980d2b88
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zhao-stack/main2main_flow
-          ref: f6a258297fb2ddd93a74f242d523970e1c564738
+          ref: 9398ca5f084659fd78a0f71c07813733980d2b88
           path: flow-source
           persist-credentials: false
       - uses: actions/checkout@v4
@@ -85,6 +85,14 @@ jobs:
           SKIP_E2E_TEST: 'true'
           PUSH_TO_GITHUB: 'false'
         run: python -B gray-code/tools/main2main_gray/flow_owned_smoke.py qa
+      - name: Malformed adapter summary warns and still reaches real read-only QA
+        timeout-minutes: 12
+        env:
+          MAIN2MAIN_API_KEY: ${{ secrets.MAIN2MAIN_API_KEY }}
+          MAIN2MAIN_ADAPTER_TIMEOUT_MINUTES: '8'
+          SKIP_E2E_TEST: 'true'
+          PUSH_TO_GITHUB: 'false'
+        run: python -B gray-code/tools/main2main_gray/flow_owned_smoke.py advisory
       - name: Publish acceptance summary
         if: always()
         run: |
@@ -94,7 +102,7 @@ jobs:
           from pathlib import Path
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as stream:
               stream.write('## Flow-owned interface gray\n\n')
-              for name in ('scan-acceptance.json', 'scan-failure-acceptance.json', 'qa-acceptance.json'):
+              for name in ('scan-acceptance.json', 'scan-failure-acceptance.json', 'qa-acceptance.json', 'advisory-qa-acceptance.json'):
                   path = Path('output') / name
                   if path.exists():
                       stream.write('### ' + name + '\n\n```json\n')
