@@ -11,7 +11,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
 )
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_manager import (
@@ -62,6 +62,8 @@ def _prefill_runner(
 ):
     runner = NPUModelRunner.__new__(NPUModelRunner)
     runner.debugger = None
+    runner.model_state = SimpleNamespace()
+    runner.prompt_logprobs_worker = None
     runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE if eager else CUDAGraphMode.FULL)
     extra = {} if ids is None else {"dspark_aux_hidden_state_layer_ids": ids}
     runner.vllm_config = SimpleNamespace(

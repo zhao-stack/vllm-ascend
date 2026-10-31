@@ -23,14 +23,16 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
     SlidingWindowMLASpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
-from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_circular_kv_cache_spec
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakeConnectorMetadata,
@@ -142,9 +144,10 @@ class MooncakeBaseConnectorWorker:
 
         self.max_device_id = self.tp_size * self.dp_size * self.pcp_size * self.pp_size
         self.side_channel_host = get_ip()
+        # Use the serving index, which survives dense-engine DP rank reset.
         self.side_channel_port = (
             self.kv_transfer_config.kv_port
-            + vllm_config.parallel_config.data_parallel_rank * self.tp_size * self.pp_size * self.pcp_size
+            + vllm_config.parallel_config.data_parallel_index * self.tp_size * self.pp_size * self.pcp_size
         )
         device_index = (self.pp_rank * self.pcp_size + self.pcp_rank) * self.tp_size + self.tp_rank
         self.handshake_port = self.side_channel_port + device_index
@@ -203,6 +206,7 @@ class MooncakeBaseConnectorWorker:
         views can share one allocation while their first blocks are many pages
         apart. A packed layout must place every view's first block inside one
         common page stride and use the same physical block count and stride.
+        Their contiguous block spans must cover that entire stride.
         """
         if not caches or len({tensor_storage_key(cache) for cache in caches}) != 1:
             return None
@@ -219,9 +223,22 @@ class MooncakeBaseConnectorWorker:
 
         page_base_addr = min(cache.data_ptr() for cache in caches)
         block_lens = [math.prod(cache.shape[1:]) * cache.element_size() for cache in caches]
-        if any(
-            cache.data_ptr() - page_base_addr + block_len > page_stride for cache, block_len in zip(caches, block_lens)
-        ):
+        # Storage capacity does not prove that this layer owns a whole page:
+        # its views may occupy only a subregion of a larger shared allocation.
+        # Merge only internally contiguous blocks whose union covers the full
+        # stride. Overlapping aliases are allowed, but holes and padding are not.
+        if any(block_len == 0 or not cache[0].is_contiguous() for cache, block_len in zip(caches, block_lens)):
+            return None
+        block_ranges = sorted(
+            (cache.data_ptr() - page_base_addr, cache.data_ptr() - page_base_addr + block_len)
+            for cache, block_len in zip(caches, block_lens)
+        )
+        covered_end = 0
+        for start, end in block_ranges:
+            if start > covered_end or end > page_stride:
+                return None
+            covered_end = max(covered_end, end)
+        if covered_end != page_stride:
             return None
 
         storage = caches[0].untyped_storage()
@@ -240,6 +257,32 @@ class MooncakeBaseConnectorWorker:
             tuple(selected_cache.shape[1:]),
             num_tensor_blocks // self.num_blocks,
         )
+
+    @staticmethod
+    def _get_transfer_block_shape(spec: KVCacheSpec, cache: torch.Tensor) -> tuple[int, ...]:
+        """Describe single-head NHD as byte-equivalent HND without changing the cache."""
+        shape = tuple(cache.shape[1:])
+        if (
+            not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+            or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec, AscendSFAIndexerCacheSpec))
+            or is_circular_kv_cache_spec(spec)
+        ):
+            return shape
+
+        heads = spec.num_kv_heads
+        if len(shape) != 3:
+            raise ValueError(f"MooncakeConnector expects a three-dimensional GQA KV block, got {shape}.")
+        if shape[0] == shape[1] == heads and heads > 1:
+            raise ValueError(f"MooncakeConnector cannot distinguish HND from NHD for {shape} with {heads} KV heads.")
+        if shape[0] == heads:
+            return shape  # HND
+        if shape[1] != heads:
+            raise ValueError(f"MooncakeConnector KV block shape {shape} does not match the spec's {heads} KV heads.")
+        if heads != 1:
+            raise ValueError("MooncakeConnector NHD requires exactly one KV head per TP rank.")
+        if not cache[0].is_contiguous():
+            raise ValueError("MooncakeConnector single-head NHD requires contiguous bytes within each KV block.")
+        return (1, shape[0], shape[2])  # [tokens, 1, dim] has the same bytes as [1, tokens, dim].
 
     def register_kv_caches(
         self,
@@ -322,7 +365,7 @@ class MooncakeBaseConnectorWorker:
                     for cache in caches:
                         tensor_num_blocks = cache.shape[0]
                         element_size = cache.element_size()
-                        block_shape = tuple(cache.shape[1:])
+                        block_shape = self._get_transfer_block_shape(spec, cache)
                         base_addrs.append(cache.data_ptr())
                         block_strides.append(cache.stride(0) * element_size)
                         block_lens.append(math.prod(block_shape) * element_size)

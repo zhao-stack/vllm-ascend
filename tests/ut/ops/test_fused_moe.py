@@ -18,7 +18,9 @@ from vllm.model_executor.layers.activation import SituAndMul
 from vllm_ascend.ascend_forward_context import MoECommType
 from vllm_ascend.device.hardware import AscendDeviceType
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_hardware_profile
+from vllm_ascend.distributed.eplb.eplb_state import AscendEplbLayerState
 from vllm_ascend.ops import register_custom_ops as custom_ops
+from vllm_ascend.ops.fused_moe import eplb as eplb_ops
 from vllm_ascend.ops.fused_moe import fused_moe as fused_moe_module
 from vllm_ascend.ops.fused_moe import routed_experts as routed_experts_module
 from vllm_ascend.ops.fused_moe import shared_experts as shared_experts_module
@@ -951,9 +953,11 @@ def test_hash_router_chunks_unaligned_input_ids_for_sequence_parallel(monkeypatc
 
 
 @pytest.mark.parametrize("return_with_event", [False, True])
-@pytest.mark.parametrize("v2_eplb", [False, True])
+@pytest.mark.parametrize("use_v2,v2_eplb", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("is_sequence_parallel", [False, True])
-def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_event, v2_eplb, is_sequence_parallel):
+def test_routed_experts_forward_impl_runs_current_flow(
+    monkeypatch, return_with_event, use_v2, v2_eplb, is_sequence_parallel
+):
     """Verify routed-expert forward preserves the current dispatch flow."""
     _disable_force_eplb(monkeypatch)
     routed_experts = AscendRoutedExperts.__new__(AscendRoutedExperts)
@@ -982,18 +986,15 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
     object.__setattr__(routed_experts, "quant_method", quant_method)
     topk_weights = torch.tensor([[0.25, 0.75], [0.6, 0.4]], dtype=torch.float32)
     topk_ids = torch.tensor([[0, 1], [1, 0]], dtype=torch.int64)
+    state = AscendEplbLayerState() if v2_eplb else None
+    if state is not None:
+        state.expert_load_view = expert_load
+        state.should_record_tensor = torch.tensor(False)
+        state.local_expert_count = 2
+        state.local_expert_start = 2
     routed_experts.router = SimpleNamespace(
         _select_experts=MagicMock(return_value=(topk_weights, topk_ids)),
-        eplb_state=(
-            SimpleNamespace(
-                expert_load_view=expert_load,
-                should_record_tensor=torch.tensor(False),
-                local_expert_count=2,
-                local_expert_start=2,
-            )
-            if v2_eplb
-            else None
-        ),
+        eplb_state=state,
     )
     routed_experts.top_k = 2
     routed_experts.renormalize = True
@@ -1016,7 +1017,7 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
     routed_experts.log2phy = None
     routed_experts.global_redundant_expert_num = 0
     routed_experts.n_shared_experts = 0
-    routed_experts._use_v2_model_runner = v2_eplb
+    routed_experts._use_v2_model_runner = use_v2
     routed_experts.dynamic_eplb = False
     routed_experts.return_with_event = return_with_event
     moe_comm_method = MagicMock()
@@ -1044,6 +1045,7 @@ def test_routed_experts_forward_impl_runs_current_flow(monkeypatch, return_with_
     monkeypatch.setattr(routed_experts_module, "get_moe_num_logical_experts", lambda *args, **kwargs: 3)
     monkeypatch.setattr(routed_experts_module, "get_ascend_config", lambda: SimpleNamespace(enable_force_eplb=False))
     record_expert_tokens = MagicMock()
+    monkeypatch.setattr(eplb_ops, "use_allgather_eplb", lambda enabled: False)
     monkeypatch.setattr(torch.ops.vllm, "ascend_eplb_record_expert_tokens", record_expert_tokens)
 
     result = routed_experts.forward_impl(
@@ -1193,6 +1195,125 @@ def test_shared_expert_mlp_path_preserves_quant_and_lora_semantics(
     monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: has_active_lora)
 
     assert shared_experts._select_mlp_path() is expected_path
+
+
+@pytest.mark.parametrize("has_expert_gate", [False, True])
+def test_mxfp_shared_expert_preserves_output_gate(monkeypatch, has_expert_gate):
+    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts.multistream_overlap = False
+    shared_experts.situ_activation = None
+    shared_experts.swiglu_limit = None
+    hidden_states = torch.tensor([[1.0, -1.0], [2.0, 1.0]])
+    down_output = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
+    gate_weight = torch.tensor([[1.0, 2.0]])
+    expert_gate = MagicMock(side_effect=lambda x: (F.linear(x, gate_weight), None))
+    shared_experts.layer = SimpleNamespace(down_proj=MagicMock(return_value=(down_output, None)))
+    if has_expert_gate:
+        shared_experts.layer.expert_gate = expert_gate
+    quantized_x = torch.ones(2, 2)
+    scale = torch.ones(2, 1)
+    monkeypatch.setattr(
+        shared_experts_module.torch.ops._C_ascend,
+        "npu_swiglu_group_quant",
+        MagicMock(return_value=(quantized_x, scale, None)),
+        raising=False,
+    )
+    submitted = SubmittedSharedExpertGateUp(
+        hidden_states=hidden_states,
+        gate_up=torch.ones(2, 4),
+        gate_up_input_scale=None,
+        local_dp_metadata=None,
+        path=SharedExpertMLPPath.A8_MXFP_FUSED,
+    )
+
+    result = shared_experts._run_a8_mxfp_mlp(submitted, RoutedMoEMilestones())
+
+    expected = down_output
+    if has_expert_gate:
+        expected = down_output * torch.sigmoid(F.linear(hidden_states, gate_weight))
+        expert_gate.assert_called_once_with(hidden_states)
+    else:
+        expert_gate.assert_not_called()
+    torch.testing.assert_close(result, expected)
+    shared_experts.layer.down_proj.assert_called_once_with((quantized_x, scale))
+
+
+@pytest.mark.parametrize("quant_type", [QuantType.W8A8, QuantType.W4A8])
+@pytest.mark.parametrize("gate_mode", ["absent", "none", "present"])
+@pytest.mark.parametrize("use_situ", [False, True])
+@pytest.mark.parametrize("multistream_overlap", [False, True])
+def test_int_shared_expert_preserves_output_gate(monkeypatch, quant_type, gate_mode, use_situ, multistream_overlap):
+    shared_experts = AscendSharedExperts.__new__(AscendSharedExperts)
+    shared_experts.multistream_overlap = multistream_overlap
+    shared_experts.situ_activation = SimpleNamespace(beta=4.0, linear_beta=25.0) if use_situ else None
+    shared_experts.swiglu_limit = 0.0
+    shared_experts.quant_type = quant_type
+    shared_experts.lora_context = None
+    hidden_states = torch.tensor([[1.0, -1.0], [2.0, 1.0]], dtype=torch.bfloat16)
+    down_output = torch.tensor([[2.0, 4.0], [6.0, 8.0]], dtype=hidden_states.dtype)
+    gate_weight = torch.tensor([[1.0, 2.0]], dtype=hidden_states.dtype)
+    expert_gate = MagicMock(side_effect=lambda x: (F.linear(x, gate_weight), None))
+    shared_experts.layer = SimpleNamespace(
+        gate_up_proj=SimpleNamespace(weight_scale=torch.ones(4), weight_scale_fp32=torch.ones(4)),
+        down_proj=SimpleNamespace(weight=torch.ones(2, 2, dtype=torch.int8), weight_scale=torch.ones(2)),
+    )
+    if gate_mode != "absent":
+        shared_experts.layer.expert_gate = expert_gate if gate_mode == "present" else None
+    quantized_x = torch.ones(2, 2, dtype=torch.int8)
+    scale = torch.ones(2)
+    activation = MagicMock(return_value=(quantized_x, scale))
+    down_matmul = MagicMock(return_value=down_output)
+    current_stream = MagicMock()
+    monkeypatch.setattr(shared_experts_module, "has_lora", lambda _: False)
+    monkeypatch.setattr(
+        shared_experts_module, "get_current_hardware_profile", lambda: SimpleNamespace(supports=lambda _: False)
+    )
+    monkeypatch.setattr(shared_experts_module.torch_npu, "npu_quant_matmul", down_matmul, raising=False)
+    monkeypatch.setattr(shared_experts_module.torch.npu, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(
+        shared_experts_module.torch.ops,
+        "_C_ascend",
+        SimpleNamespace(dequant_situ_quant=activation, npu_dequant_swiglu_quant=activation),
+    )
+    path = shared_experts._select_mlp_path()
+    assert path is SharedExpertMLPPath.A8_INT_FUSED
+    submitted = SubmittedSharedExpertGateUp(
+        hidden_states=hidden_states,
+        gate_up=torch.ones(2, 4, dtype=torch.int32),
+        gate_up_input_scale=torch.ones(2),
+        local_dp_metadata=None,
+        path=path,
+    )
+    milestones = RoutedMoEMilestones(
+        shared_activation_overlap_start=MagicMock(),
+        routed_combine_start=MagicMock(),
+    )
+
+    result = shared_experts._finish_shared_mlp(submitted, milestones)
+
+    expected = down_output
+    if gate_mode == "present":
+        expected = down_output * torch.sigmoid(F.linear(hidden_states, gate_weight))
+        expert_gate.assert_called_once_with(hidden_states)
+    else:
+        expert_gate.assert_not_called()
+        assert result is down_output
+    torch.testing.assert_close(result, expected)
+    activation.assert_called_once()
+    down_matmul.assert_called_once_with(
+        quantized_x,
+        shared_experts.layer.down_proj.weight,
+        shared_experts.layer.down_proj.weight_scale,
+        pertoken_scale=scale,
+        bias=None,
+        output_dtype=hidden_states.dtype,
+    )
+    expected_waits = (
+        [call(milestones.shared_activation_overlap_start), call(milestones.routed_combine_start)]
+        if multistream_overlap
+        else []
+    )
+    assert current_stream.wait_event.call_args_list == expected_waits
 
 
 def test_multistream_missing_required_milestone_fails_fast():
