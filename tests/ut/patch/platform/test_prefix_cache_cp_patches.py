@@ -53,6 +53,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_utils import (
     group_and_unify_kv_cache_specs,
 )
 from vllm_ascend.patch.platform.patch_mamba_manager import AscendMambaManager
+from vllm_ascend.utils import vllm_version_is
 
 # vLLM #60043 removed the leftover `mamba_cache_mode="all"` path and now asserts
 # that prefix caching requires `mamba_cache_mode="align"` in both supported lanes.
@@ -1675,11 +1676,17 @@ def test_ascend_mamba_manager_uses_logical_block_size_with_prefix_caching(dcp, p
 
 def test_ascend_mamba_cache_lookup_ignores_dcp_sharding() -> None:
     """Mamba states are replicated, unlike DCP-sharded attention KV cache."""
+    policy_kwargs = {"mamba_cache_mode": "none"} if vllm_version_is("0.33.0") else {}
     mamba_spec = MambaSpec(
         block_size=16,
         shapes=((1,),),
         dtypes=(torch.float32,),
-        mamba_cache_mode="none",
+        **policy_kwargs,
+    )
+    lookup_kwargs = (
+        {"kv_cache_spec": mamba_spec}
+        if vllm_version_is("0.33.0")
+        else {"block_size": mamba_spec.block_size, "manager_config": AscendMambaManager.config(mamba_cache_mode="none")}
     )
 
     # The patch module replaces vLLM's public MambaManager symbol with the
@@ -1696,7 +1703,7 @@ def test_ascend_mamba_cache_lookup_ignores_dcp_sharding() -> None:
             max_length=0,
             kv_cache_group_ids=[1],
             block_pool=MagicMock(),
-            kv_cache_spec=mamba_spec,
+            **lookup_kwargs,
             alignment_tokens=16,
             dcp_world_size=8,
             pcp_world_size=1,
@@ -1704,6 +1711,8 @@ def test_ascend_mamba_cache_lookup_ignores_dcp_sharding() -> None:
         )
 
     assert find_cache_hit.call_args.kwargs["dcp_world_size"] == 1
+    for name, value in lookup_kwargs.items():
+        assert find_cache_hit.call_args.kwargs[name] is value
 
 
 def test_swa_reachable_block_mask_sparse_with_lcm_alignment() -> None:

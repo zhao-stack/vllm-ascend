@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache layers and metadata helpers for the GLM-Next pooled indexer."""
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
@@ -19,6 +21,10 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
     AscendMLAAttentionSpec,
 )
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheGroup, ManagerConfig
 
 
 def is_glm5_next_cache_spec(spec: KVCacheSpec) -> bool:
@@ -194,9 +200,33 @@ class KpoolTailManager(FullAttentionManager):
 
     supports_fine_grained_hash_lookup: ClassVar[bool] = False
 
+    if not vllm_version_is("0.33.0"):
+        # #61452 moved ring ownership and admission out of the storage spec.
+        @classmethod
+        def prefix_cacheable(cls, config: ManagerConfig) -> bool:
+            return False
+
+        @classmethod
+        def max_admission_blocks(
+            cls, config: ManagerConfig, block_size: int, max_in_flight_tokens: int, max_model_len: int
+        ) -> int:
+            return 1
+
+        @classmethod
+        def max_allocated_blocks_per_request(
+            cls, config: ManagerConfig, block_size: int, dcp_sharded: bool, vllm_config: VllmConfig
+        ) -> int:
+            return 1
+
+        @classmethod
+        def max_num_blocks_per_req(
+            cls, config: ManagerConfig, block_size: int, dcp_sharded: bool, vllm_config: VllmConfig, max_len: int
+        ) -> int:
+            return 1
+
     def __init__(
         self,
-        kv_cache_spec: KVCacheSpec,
+        kv_cache_spec: KVCacheSpec | KVCacheGroup,
         block_pool: BlockPool,
         enable_caching: bool,
         kv_cache_group_id: int,
@@ -206,8 +236,11 @@ class KpoolTailManager(FullAttentionManager):
         # The global pool can cache other groups; this manager never does.
         # Disable it before entering the base constructor, independently of
         # coordinator-side filtering and the caller's global caching setting.
+        cache_kwargs = (
+            {"kv_cache_spec": kv_cache_spec} if vllm_version_is("0.33.0") else {"kv_cache_group": kv_cache_spec}
+        )
         super().__init__(
-            kv_cache_spec=kv_cache_spec,
+            **cache_kwargs,
             block_pool=block_pool,
             enable_caching=False,
             kv_cache_group_id=kv_cache_group_id,
@@ -215,20 +248,40 @@ class KpoolTailManager(FullAttentionManager):
             **kwargs,
         )
 
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
-        alignment_tokens: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        return tuple([] for _ in kv_cache_group_ids), 0
+    if vllm_version_is("0.33.0"):
+
+        @classmethod
+        def find_longest_cache_hit(
+            cls,
+            block_hashes: BlockHashList,
+            max_length: int,
+            kv_cache_group_ids: list[int],
+            block_pool: BlockPool,
+            kv_cache_spec: KVCacheSpec,
+            drop_eagle_block: bool,
+            alignment_tokens: int,
+            dcp_world_size: int = 1,
+            pcp_world_size: int = 1,
+        ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+            return tuple([] for _ in kv_cache_group_ids), 0
+
+    else:
+
+        @classmethod
+        def find_longest_cache_hit(
+            cls,
+            block_hashes: BlockHashList,
+            max_length: int,
+            kv_cache_group_ids: list[int],
+            block_pool: BlockPool,
+            block_size: int,
+            manager_config: ManagerConfig,
+            drop_eagle_block: bool,
+            alignment_tokens: int,
+            dcp_world_size: int = 1,
+            pcp_world_size: int = 1,
+        ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+            return tuple([] for _ in kv_cache_group_ids), 0
 
     def cache_blocks(
         self,

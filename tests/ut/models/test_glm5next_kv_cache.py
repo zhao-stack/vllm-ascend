@@ -11,7 +11,6 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.worker.utils import select_common_block_size
 
 from vllm_ascend.attention.attention_v1 import AscendCommonAttentionMetadata
@@ -36,6 +35,12 @@ from vllm_ascend.models.glm5next.kv_cache import (
     format_indexer_kpool_slot_mapping,
     get_kpool_tail_ring_capacity,
 )
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
 
 pytestmark = pytest.mark.usefixtures("keypool_kernels")
 
@@ -58,6 +63,12 @@ def keypool_kernels(monkeypatch):
 
 def _ratio_kwargs(ratio: int) -> dict[str, int]:
     return {"tokens_per_state": ratio}
+
+
+def _tail_manager_input(spec):
+    if vllm_version_is("0.33.0"):
+        return spec
+    return KVCacheGroup.from_layers({"tail": KpoolTailManager.layer_config(spec)})
 
 
 @pytest.mark.parametrize(("pool", "lookahead", "capacity"), [(4, 0, 4), (4, 3, 7), (16, 5, 21)])
@@ -104,9 +115,17 @@ def test_tail_uses_one_full_precision_page(capacity):
         AscendIndexerKPoolTailSpec.merge([spec, larger_ring])
     with pytest.raises(AssertionError):
         AscendIndexerKPoolTailSpec.merge([object()])
-    assert KVCacheSpecRegistry.get_manager_class(spec) is KpoolTailManager
-    assert spec.max_admission_blocks_per_request(16, 1024) == 1
-    assert spec.max_admission_blocks_per_request(8192, 131072) == 1
+    if vllm_version_is("0.33.0"):
+        assert KVCacheSpecRegistry.get_manager_class(spec) is KpoolTailManager
+        assert spec.max_admission_blocks_per_request(16, 1024) == 1
+        assert spec.max_admission_blocks_per_request(8192, 131072) == 1
+    else:
+        group = _tail_manager_input(spec)
+        assert group.manager_cls is KpoolTailManager
+        assert group.manager_cls.max_admission_blocks(group.manager_config, spec.block_size, 16, 1024) == 1
+        assert group.manager_cls.max_admission_blocks(group.manager_config, spec.block_size, 8192, 131072) == 1
+        assert group.uses_slot_mapping
+        assert not group.prefix_cacheable
     assert not spec.prefix_cacheable
     assert not is_prefix_cacheable(spec)
     assert spec.is_circular
@@ -158,7 +177,7 @@ def test_tail_manager_retains_one_private_block_until_free():
         dtype=torch.float32,
     )
     pool = BlockPool(12, True, 4)
-    manager = KpoolTailManager(spec, pool, True, 1, scheduler_block_size=16)
+    manager = KpoolTailManager(_tail_manager_input(spec), pool, True, 1, scheduler_block_size=16)
     initially_free = pool.get_num_free_blocks()
     assert manager.get_num_blocks_to_allocate("a", 1000, [], 0, 0, 1000, prefill_end=1000) == 1
     a = manager.allocate_new_blocks("a", 1000, 1000)
@@ -196,8 +215,10 @@ def test_tail_manager_prefix_hit_has_no_shared_blocks():
         dtype=torch.float32,
     )
     pool = BlockPool(8, True, 4)
-    manager = KpoolTailManager(spec, pool, True, 1, scheduler_block_size=16, needs_kv_cache_zeroing=True)
-    blocks, hit = manager.find_longest_cache_hit([], 4096, [1, 3], pool, spec, False, 16)
+    cache_input = _tail_manager_input(spec)
+    manager = KpoolTailManager(cache_input, pool, True, 1, scheduler_block_size=16, needs_kv_cache_zeroing=True)
+    lookup_policy = (spec,) if vllm_version_is("0.33.0") else (cache_input.block_size, cache_input.manager_config)
+    blocks, hit = manager.find_longest_cache_hit([], 4096, [1, 3], pool, *lookup_policy, False, 16)
     assert blocks == ([], []) and hit == 0
     manager.allocate_external_computed_blocks("hit", 1024, 0, record_for_zeroing=False)
     assert len(manager.req_to_blocks["hit"]) == 1
