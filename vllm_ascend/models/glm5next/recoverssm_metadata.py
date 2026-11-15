@@ -19,6 +19,7 @@ from vllm_ascend.ops.gdn_attn_builder import (
     _build_actual_seq_lengths,
     _build_non_spec_chunked_prefill_metadata,
 )
+from vllm_ascend.utils import vllm_version_is
 
 
 @contextmanager
@@ -53,11 +54,13 @@ class AscendKDARecoverSSMMetadataBuilder(KimiK3KDAMetadataBuilder):
             # MRV2's CUDA builder requires precomputed physical state IDs.
             # Reuse the device-independent path used by Ascend's GDN builder;
             # the upstream KDA fallback and multi-group helper require CUDA.
+            policy_kwargs = {} if vllm_version_is("0.33.0") else {"num_speculative_blocks": self.num_speculative_blocks}
             self.mamba_aligned_state_indices = mamba_get_block_table_tensor(
                 m.block_table_tensor[: m.num_reqs],
                 m.seq_lens[: m.num_reqs],
                 self.kv_cache_spec,
                 "align",
+                **policy_kwargs,
             )
         with _disable_upstream_graph_staging(self):
             metadata = super().build(common_prefix_len, m, num_accepted_tokens, num_decode_draft_tokens_cpu, fast_build)
