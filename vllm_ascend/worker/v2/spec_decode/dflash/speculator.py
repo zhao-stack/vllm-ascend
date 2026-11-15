@@ -236,13 +236,19 @@ class AscendDFlashSpeculator(LmheadTPDraftSamplingMixin, DFlashSpeculator):
         block_tables: Any,
         target_input_buffers: Any,
         target_attn_groups: Any,
+        kernel_block_sizes: list[int] | None = None,
     ) -> None:
+        kernel_kwargs = {}
+        if not vllm_version_is("0.33.0"):
+            assert kernel_block_sizes is not None, "Draft attention requires the target kernel block sizes"
+            kernel_kwargs = {"kernel_block_sizes": kernel_block_sizes}
         super().set_attn(
             model_state,
             kv_cache_config,
             block_tables,
             target_input_buffers,
             target_attn_groups,
+            **kernel_kwargs,
         )
         self._context_slot_mappings = torch.zeros(
             len(self.draft_kv_cache_group_ids),

@@ -635,12 +635,18 @@ def test_dflash_attention_uses_only_draft_layers_and_int32_slots(monkeypatch, ac
     backends = {name: object() for name in ("draft.0", "draft.1")}
     layers = {name: SimpleNamespace(get_attn_backend=lambda name=name: backends[name]) for name in backends}
     cache = SimpleNamespace(kv_cache_groups=[SimpleNamespace(layer_names=[name]) for name in backends])
-    monkeypatch.setattr(DFlashSpeculator, "set_attn", MagicMock())
+    parent_set_attn = MagicMock()
+    monkeypatch.setattr(DFlashSpeculator, "set_attn", parent_set_attn)
     monkeypatch.setattr(dflash_module, "get_layers_from_vllm_config", lambda *args: layers)
     # set_attn installs an upstream callback; restore it after this test.
     monkeypatch.setattr(dflash_module.dflash_speculator, "prepare_dflash_inputs", object())
 
-    speculator.set_attn(None, cache, None, None, None)
+    kernel_block_sizes = [16, 64]
+    kernel_kwargs = {} if dflash_module.vllm_version_is("0.33.0") else {"kernel_block_sizes": kernel_block_sizes}
+    speculator.set_attn(None, cache, None, None, None, **kernel_kwargs)
+    parent_set_attn.assert_called_once_with(None, cache, None, None, None, **kernel_kwargs)
+    if kernel_kwargs:
+        assert parent_set_attn.call_args.kwargs["kernel_block_sizes"] is kernel_block_sizes
 
     assert speculator.attn_backends == {
         name: backend for name, backend in backends.items() if active_layers is None or name in active_layers

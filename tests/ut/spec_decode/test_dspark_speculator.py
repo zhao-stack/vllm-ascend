@@ -25,6 +25,26 @@ from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
 _HIDDEN = 8
 
 
+def test_set_attn_preserves_target_kernel_block_sizes(monkeypatch):
+    spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
+    spec.attn_vllm_config = object()
+
+    class ParentBoundary(Exception):
+        pass
+
+    parent_set_attn = MagicMock(side_effect=ParentBoundary)
+    monkeypatch.setattr(DSparkSpeculator, "set_attn", parent_set_attn)
+    monkeypatch.setattr(dspark_module, "set_current_vllm_config", lambda *args: nullcontext())
+    inputs = (object(), object(), object(), object(), object())
+    kernel_block_sizes = [16, 64]
+    kernel_kwargs = {} if dspark_module.vllm_version_is("0.33.0") else {"kernel_block_sizes": kernel_block_sizes}
+    with pytest.raises(ParentBoundary):
+        spec.set_attn(*inputs, **kernel_kwargs)
+    parent_set_attn.assert_called_once_with(*inputs, **kernel_kwargs)
+    if kernel_kwargs:
+        assert parent_set_attn.call_args.kwargs["kernel_block_sizes"] is kernel_block_sizes
+
+
 def _spec(vllm_config, draft_hf_config) -> AscendDSparkSpeculator:
     spec = AscendDSparkSpeculator.__new__(AscendDSparkSpeculator)
     spec.vllm_config = vllm_config

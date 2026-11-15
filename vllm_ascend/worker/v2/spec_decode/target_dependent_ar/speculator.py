@@ -343,7 +343,12 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
         block_tables: BlockTables,
         target_input_buffers: InputBuffers,
         target_attn_groups: list[list[AttentionGroup]],
+        kernel_block_sizes: list[int] | None = None,
     ) -> None:
+        kernel_kwargs = {}
+        if not vllm_version_is("0.33.0"):
+            assert kernel_block_sizes is not None, "Draft attention requires the target kernel block sizes"
+            kernel_kwargs = {"kernel_block_sizes": kernel_block_sizes}
         # Initialize the draft attention backend with its PCP=1 config.
         with set_current_vllm_config(self.attn_vllm_config):
             super().set_attn(
@@ -352,6 +357,7 @@ class AscendTargetDependentARSpeculator(LmheadTPDraftSamplingMixin, TargetDepend
                 block_tables,
                 target_input_buffers,
                 target_attn_groups,
+                **kernel_kwargs,
             )
 
             # Use the first executable draft attention layer as the architecture

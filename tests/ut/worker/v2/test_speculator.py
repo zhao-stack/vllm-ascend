@@ -573,13 +573,19 @@ def test_set_attn_detects_architecture():
                 "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator.set_current_vllm_config",
                 return_value=nullcontext(),
             ),
-            patch.object(TargetDependentARSpeculator, "set_attn"),
+            patch.object(TargetDependentARSpeculator, "set_attn") as parent_set_attn,
             patch(
                 "vllm_ascend.worker.v2.spec_decode.target_dependent_ar.speculator._get_graph_update_backend",
                 return_value=backend,
             ),
         ):
-            speculator.set_attn(object(), object(), object(), object(), object())
+            inputs = [object() for _ in range(5)]
+            kernel_block_sizes = [16, 64]
+            kernel_kwargs = {} if vllm_version_is("0.33.0") else {"kernel_block_sizes": kernel_block_sizes}
+            speculator.set_attn(*inputs, **kernel_kwargs)
+            parent_set_attn.assert_called_once_with(*inputs, **kernel_kwargs)
+            if kernel_kwargs:
+                assert parent_set_attn.call_args.kwargs["kernel_block_sizes"] is kernel_block_sizes
         assert speculator.attn_backend is backend
         assert speculator.attn_architecture == expected
 
