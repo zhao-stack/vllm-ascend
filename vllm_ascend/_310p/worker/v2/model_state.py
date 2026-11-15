@@ -241,7 +241,8 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         """CPU computes slices; NPU only executes required state copies."""
         assert self._mamba_copy_funcs_by_group is not None
         forward_context = self.vllm_config.compilation_config.static_forward_context
-        for group_id in self._mamba_group_ids:
+        group_ids, _ = self._get_ascend_mamba_groups(kv_cache_config)
+        for group_id in group_ids:
             block_ids = block_tables_np[group_id][batch_idx]
             src_block = int(block_ids[src_column])
             dst_block = int(block_ids[dst_column])
@@ -407,7 +408,7 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         if num_reqs == 0:
             return
 
-        mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        _, mamba_block_size = self._get_ascend_mamba_groups(kv_cache_config)
         self._ensure_mamba_copy_funcs_cpu(kv_cache_config)
         block_tables_np = input_batch.block_tables_np
         if block_tables_np is None:
@@ -423,7 +424,7 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
             computed_after = int(input_batch.num_computed_tokens_np[batch_idx]) + int(
                 input_batch.query_start_loc_np[batch_idx + 1] - input_batch.query_start_loc_np[batch_idx]
             )
-            new_state_idx = (computed_after + mamba_spec.block_size - 1) // mamba_spec.block_size - 1
+            new_state_idx = (computed_after + mamba_block_size - 1) // mamba_block_size - 1
             self._mamba_state_idx_cpu[req_idx] = new_state_idx
             if old_state_idx >= 0 and old_state_idx != new_state_idx:
                 self._copy_mamba_state_from_cpu_plan(
@@ -480,7 +481,7 @@ class Ascend310PMambaHybridModelState(_Ascend310PModelStateMixin, AscendMambaHyb
         block_tables_np = self._current_mamba_block_tables_np
         if block_tables_np is None:
             return
-        block_size = self._mamba_spec.block_size
+        _, block_size = self._get_ascend_mamba_groups(self._current_mamba_kv_cache_config)
         idx_mapping_np = idx_mapping.numpy()
         for batch_idx, req_idx_value in enumerate(idx_mapping_np):
             req_idx = int(req_idx_value)

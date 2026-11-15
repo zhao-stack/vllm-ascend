@@ -748,7 +748,7 @@ def test_glm_kpool_pcp_advances_mamba_align_state_once_per_global_request(mock_k
         pcp_manager=pcp_manager,
         vllm_config=SimpleNamespace(model_config=SimpleNamespace(hf_text_config=SimpleNamespace(index_kpool=4))),
         _finish_previous_layerwise_mamba_copy=MagicMock(),
-        _get_mamba_group_info=MagicMock(return_value=([0], spec)),
+        _get_ascend_mamba_groups=MagicMock(return_value=([0], spec.block_size)),
         _ensure_align_ctx=MagicMock(return_value=MagicMock()),
         _prepare_layerwise_mamba_copy=MagicMock(return_value=True),
         _mamba_state_idx_gpu=torch.zeros(4, dtype=torch.int32),

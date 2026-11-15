@@ -35,7 +35,7 @@ def test_bulk_copy_reads_state_after_pre_forward(monkeypatch, sync_load):
         _mamba_src_off_gpu=None,
         num_accepted_tokens_gpu=None,
         _finish_previous_layerwise_mamba_copy=lambda: None,
-        _get_mamba_group_info=lambda cfg: (None, SimpleNamespace(block_size=384)),
+        _get_ascend_mamba_groups=lambda cfg: ([], 384),
         _ensure_align_ctx=lambda *args: SimpleNamespace(run_fused_precopy=copy),
         _prepare_layerwise_mamba_copy=lambda *args: False,
     )

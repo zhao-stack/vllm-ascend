@@ -95,16 +95,27 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         self._layer_state_ranges: dict[str, tuple[int, int]] | None = None
         self._pending_bulk_copy: tuple[MambaSpecDecodeGPUContext, int, torch.Tensor] | None = None
 
+    def _get_ascend_mamba_groups(self, kv_cache_config: KVCacheConfig) -> tuple[list[int], int]:
+        """Read state-copy groups and their logical block size from native policy."""
+        if vllm_version_is("0.33.0"):
+            group_ids, spec = super()._get_mamba_group_info(kv_cache_config)
+            return group_ids, spec.block_size
+        groups = get_mamba_groups(kv_cache_config)
+        group_ids = mamba_utils.get_mamba_group_ids(groups)
+        block_size, _ = mamba_utils.get_mamba_group_params(kv_cache_config, group_ids)
+        return group_ids, block_size
+
     def _get_layer_state_ranges(self, kv_cache_config: KVCacheConfig) -> dict[str, tuple[int, int]]:
         """Map every mamba layer name to its (start, end) range in the
         flattened (layer, state-type) metadata arrays of
         ``MambaSpecDecodeGPUContext`` (same iteration order as
         ``initialize_from_forward_context``)."""
         if self._layer_state_ranges is None:
-            assert self._mamba_spec is not None
+            group_ids, _ = self._get_ascend_mamba_groups(kv_cache_config)
+            assert group_ids
             ranges: dict[str, tuple[int, int]] = {}
             idx = 0
-            for mamba_group_id in self._mamba_group_ids:
+            for mamba_group_id in group_ids:
                 group = kv_cache_config.kv_cache_groups[mamba_group_id]
                 for layer_name in group.layer_names:
                     # Match the per-type rows populated by the existing copy context.
@@ -278,7 +289,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         if num_reqs == 0:
             return
         self._finish_previous_layerwise_mamba_copy()
-        mamba_group_ids, mamba_spec = self._get_mamba_group_info(kv_cache_config)
+        mamba_group_ids, mamba_block_size = self._get_ascend_mamba_groups(kv_cache_config)
         ctx = self._ensure_align_ctx(kv_cache_config, mamba_group_ids, block_tables)
 
         # The state-advance + pre-copy kernels run every step; they fast-exit
@@ -295,7 +306,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             self._mamba_src_off_gpu,
             num_reqs,
             BLOCK_SIZE=_PREPROCESS_BLOCK_SIZE,
-            MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            MAMBA_BLOCK_SIZE=mamba_block_size,
         )
         if self._prepare_layerwise_mamba_copy(ctx, num_reqs, input_batch.idx_mapping, kv_cache_config):
             # Per-layer copies are executed by the connector right after each
