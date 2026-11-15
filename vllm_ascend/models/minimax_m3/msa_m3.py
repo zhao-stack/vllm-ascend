@@ -35,6 +35,7 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
@@ -257,6 +258,11 @@ class AscendMiniMaxM3IndexerBackend(AttentionBackend):
 
 
 class AscendMiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig):
+            return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
     def __init__(
         self,
         head_dim: int,

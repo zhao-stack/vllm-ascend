@@ -38,6 +38,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v4.attention import DeepseekV4IndexerCache
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
@@ -50,6 +51,7 @@ from vllm_ascend.quantization.methods import (
 )
 from vllm_ascend.utils import (
     npu_stream_switch,
+    vllm_version_is,
 )
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 
@@ -127,6 +129,11 @@ def get_indexer_k_dtype(vllm_config: VllmConfig) -> torch.dtype:
 
 
 class AscendDeepseekV4IndexerCache(DeepseekV4IndexerCache):
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig):
+            return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
     def __init__(
         self,
         head_dim: int,

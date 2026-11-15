@@ -91,8 +91,9 @@ from vllm.model_executor.models.utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
 from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
@@ -207,6 +208,11 @@ def _scatter_index_cache(
 
 class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
     """Block-sparse attention with lightning indexer on Ascend."""
+
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig):
+            return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
 
     def __init__(
         self,
@@ -356,7 +362,13 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         return self.attn_backend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
-        return FullAttentionSpec(
+        if vllm_version_is("0.33.0"):
+            from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+            spec_type = FullAttentionSpec
+        else:
+            spec_type = AttentionSpec
+        return spec_type(
             block_size=vllm_config.cache_config.block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
