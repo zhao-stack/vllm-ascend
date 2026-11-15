@@ -6,8 +6,8 @@ if [ "${ENABLE_COVERAGE:-}" = "true" ]; then
   enable_coverage=true
 fi
 
-# Set to true temporarily to run all selected targets before reporting failure.
-continue_on_error=false
+# Temporary main2main diagnosis: run every target, then return the first failure.
+continue_on_error=true
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -185,10 +185,10 @@ run_pytest_target() {
   if [ "${enable_coverage}" = "true" ]; then
     setup_coverage "${target}"
     set +e
-    run_logged_command "${log_file}" python -m coverage run --rcfile="${project_root}/tests/coveragerc" -m pytest -sv --color=yes "${target}"
+    run_logged_command "${log_file}" python -m coverage run --rcfile="${project_root}/tests/coveragerc" -m pytest -sv --color=yes --continue-on-collection-errors "${target}"
   else
     set +e
-    run_logged_command "${log_file}" pytest -sv --color=yes "${target}"
+    run_logged_command "${log_file}" pytest -sv --color=yes --continue-on-collection-errors "${target}"
   fi
   local status=$?
   set -e
@@ -235,10 +235,10 @@ run_pytest_batch() {
     echo "DEBUG: Go to the [Coverage Branch] page."
     setup_coverage "cpu-ut"
     set +e
-    run_logged_command "${log_file}" python -m coverage run --rcfile="${project_root}/tests/coveragerc" -m pytest -sv --color=yes "${batch_targets[@]}"
+    run_logged_command "${log_file}" python -m coverage run --rcfile="${project_root}/tests/coveragerc" -m pytest -sv --color=yes --continue-on-collection-errors "${batch_targets[@]}"
   else
     set +e
-    run_logged_command "${log_file}" pytest -sv --color=yes "${batch_targets[@]}"
+    run_logged_command "${log_file}" pytest -sv --color=yes --continue-on-collection-errors "${batch_targets[@]}"
   fi
   local status=$?
   set -e

@@ -694,7 +694,7 @@ jobs:
       - cpu-ut
       - select-tests
       - prepare-csrc-cache
-    # Require both CPU UT versions before allocating NPU runners.
+    # Temporary main2main diagnosis: CPU failures must not hide independent NPU failures.
     # !cancelled() overrides transitive skip-propagation from recommend-tests
     # (skipped under ready-all or main2main) through select-tests, without
     # running after workflow cancel.
@@ -702,7 +702,8 @@ jobs:
       ${{
         !cancelled() &&
         needs.pre-commit.result == 'success' &&
-        needs.cpu-ut.result == 'success' &&
+        (needs.cpu-ut.result == 'success' ||
+          (contains(github.event.pull_request.labels.*.name, 'main2main') && needs.cpu-ut.result == 'failure')) &&
         needs.select-tests.result == 'success' &&
         needs.prepare-csrc-cache.result == 'success' &&
         (
