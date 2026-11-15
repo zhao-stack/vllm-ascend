@@ -133,6 +133,11 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
 
         return AscendIndexerKPoolBackend
 
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig):
+            return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
     def forward(self): ...
 
 
@@ -187,6 +192,11 @@ class Glm5NextTailCache(nn.Module, AttentionLayerBase):
         )
 
         return AscendIndexerKPoolTailBackend
+
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig):
+            return KpoolTailManager.layer_config(self.get_kv_cache_spec(vllm_config))
 
     def forward(self): ...
 

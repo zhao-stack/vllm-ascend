@@ -25,8 +25,8 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendMLAAttentionSpec,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
+    is_circular_kv_cache_spec,
     is_prefix_cacheable,
-    register_ascend_kv_cache_specs,
 )
 from vllm_ascend.models.glm5next.kv_cache import (
     Glm5NextIndexerCache,
@@ -38,7 +38,9 @@ from vllm_ascend.models.glm5next.kv_cache import (
 from vllm_ascend.utils import vllm_version_is
 
 if vllm_version_is("0.33.0"):
-    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+    from vllm.v1.core.single_type_kv_cache_manager import KVCacheSpecRegistry
+
+    from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
 else:
     from vllm.v1.kv_cache_interface import KVCacheGroup
 
@@ -81,7 +83,8 @@ def test_tail_ring_capacity_retains_speculative_lookahead(pool, lookahead, capac
 
 @pytest.mark.parametrize("capacity", [4, 9, 12])
 def test_tail_uses_one_full_precision_page(capacity):
-    register_ascend_kv_cache_specs()
+    if vllm_version_is("0.33.0"):
+        register_ascend_kv_cache_specs()
     spec = AscendIndexerKPoolTailSpec(
         block_size=4,
         ring_capacity=capacity,
@@ -105,20 +108,23 @@ def test_tail_uses_one_full_precision_page(capacity):
     assert padded_spec.real_page_size_bytes == padded_spec.unpadded_page_size_bytes == spec.page_size_bytes
     with pytest.raises(AssertionError):
         _ = replace(spec, page_size_padded=spec.page_size_bytes - 1).page_size_bytes
-    merged_spec = AscendIndexerKPoolTailSpec.merge([spec, replace(spec)])
-    assert merged_spec == spec and merged_spec is not spec
-    with pytest.raises(AssertionError):
-        AscendIndexerKPoolTailSpec.merge([spec, padded_spec])
     larger_ring = replace(spec, ring_capacity=capacity + 1)
-    assert not spec.is_uniform_with_collection({"larger_ring": larger_ring})
-    with pytest.raises(AssertionError):
-        AscendIndexerKPoolTailSpec.merge([spec, larger_ring])
-    with pytest.raises(AssertionError):
-        AscendIndexerKPoolTailSpec.merge([object()])
     if vllm_version_is("0.33.0"):
+        merged_spec = AscendIndexerKPoolTailSpec.merge([spec, replace(spec)])
+        assert merged_spec == spec and merged_spec is not spec
+        with pytest.raises(AssertionError):
+            AscendIndexerKPoolTailSpec.merge([spec, padded_spec])
+        assert not spec.is_uniform_with_collection({"larger_ring": larger_ring})
+        with pytest.raises(AssertionError):
+            AscendIndexerKPoolTailSpec.merge([spec, larger_ring])
+        with pytest.raises(AssertionError):
+            AscendIndexerKPoolTailSpec.merge([object()])
         assert KVCacheSpecRegistry.get_manager_class(spec) is KpoolTailManager
         assert spec.max_admission_blocks_per_request(16, 1024) == 1
         assert spec.max_admission_blocks_per_request(8192, 131072) == 1
+        assert not spec.prefix_cacheable
+        assert not is_prefix_cacheable(spec)
+        assert spec.is_circular
     else:
         group = _tail_manager_input(spec)
         assert group.manager_cls is KpoolTailManager
@@ -126,9 +132,14 @@ def test_tail_uses_one_full_precision_page(capacity):
         assert group.manager_cls.max_admission_blocks(group.manager_config, spec.block_size, 8192, 131072) == 1
         assert group.uses_slot_mapping
         assert not group.prefix_cacheable
-    assert not spec.prefix_cacheable
-    assert not is_prefix_cacheable(spec)
-    assert spec.is_circular
+        assert not is_prefix_cacheable(group)
+        assert is_circular_kv_cache_spec(spec)
+        # Native groups keep each layer's layout instead of merging specs.
+        layouts = {"tail": spec, "padded": padded_spec, "larger": larger_ring}
+        mixed = KVCacheGroup.from_layers({name: KpoolTailManager.layer_config(s) for name, s in layouts.items()})
+        assert mixed.kv_cache_specs == layouts
+        assert mixed.page_size_bytes == sum(s.page_size_bytes for s in layouts.values())
+        assert mixed.max_num_blocks_per_req(None, 8192) == 1
     context_parallel_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=1024),
         parallel_config=SimpleNamespace(
@@ -136,7 +147,10 @@ def test_tail_uses_one_full_precision_page(capacity):
             prefill_context_parallel_size=2,
         ),
     )
-    assert spec.max_memory_usage_bytes(context_parallel_config) == spec.page_size_bytes
+    if vllm_version_is("0.33.0"):
+        assert spec.max_memory_usage_bytes(context_parallel_config) == spec.page_size_bytes
+    else:
+        assert _tail_manager_input(spec).max_memory_usage_bytes(context_parallel_config) == spec.page_size_bytes
 
 
 @pytest.mark.parametrize(

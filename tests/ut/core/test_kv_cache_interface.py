@@ -8,19 +8,12 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
-
-# vLLM #61183 moved `is_kv_cache_spec_uniform` to `kv_cache_planning` on main;
-# the v0.33.0 lane still ships it in `kv_cache_utils`.
-from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
-from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, register_all_kvcache_specs
+from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
 from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
     HiddenStateCacheSpec,
-    UniformTypeKVCacheSpecs,
     compute_layout_strides,
 )
 from vllm.v1.kv_cache_layout import KVCacheLayout
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendCircularBufferSpec,
@@ -30,11 +23,36 @@ from vllm_ascend.core.kv_cache_interface import (
     declared_kwarg,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
-    register_ascend_kv_cache_specs,
     resolve_bounded_replay,
     supports_bounded_replay,
     supports_component_major_mla_pd,
 )
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
+    from vllm.v1.core.single_type_kv_cache_manager import KVCacheSpecRegistry, register_all_kvcache_specs
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+
+    from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
+else:
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
+
+def _main_layer_config(spec):
+    if isinstance(spec, AscendSlidingWindowMLASpec):
+        return SlidingWindowManager.layer_config(
+            spec,
+            sliding_window=spec.sliding_window,
+            bounded_replay=spec.bounded_replay,
+            extra_retained_tokens=spec.extra_retained_tokens,
+        )
+    return FullAttentionManager.layer_config(spec)
+
+
+def _main_group(specs):
+    return KVCacheGroup.from_layers({name: _main_layer_config(spec) for name, spec in specs.items()})
 
 
 def _mla_spec():
@@ -53,7 +71,14 @@ def test_mixed_mla_indexer_specs_are_not_uniform(indexer_first):
     specs = [("main", main_spec), ("indexer", indexer_spec)]
     if indexer_first:
         specs.reverse()
-    assert not is_kv_cache_spec_uniform(dict(specs))
+    if vllm_version_is("0.33.0"):
+        assert not is_kv_cache_spec_uniform(dict(specs))
+    else:
+        # #61452 groups compatible policies without merging distinct layouts.
+        group = _main_group(dict(specs))
+        assert group.kv_cache_specs == dict(specs)
+        assert len(group.distinct_specs) == 2
+        assert group.page_size_bytes == main_spec.page_size_bytes + indexer_spec.page_size_bytes
 
 
 @pytest.mark.parametrize("replicas", [1, 2, 8])
@@ -87,12 +112,26 @@ def test_indexer_layout_strides_cover_replicated_keys_and_scales(
 
 def test_matching_ascend_mla_specs_merge():
     spec = _mla_spec()
-    assert AscendMLAAttentionSpec.merge([spec, spec]) == spec
-    assert is_kv_cache_spec_uniform({"layer0": spec, "layer1": spec})
+    if vllm_version_is("0.33.0"):
+        assert AscendMLAAttentionSpec.merge([spec, spec]) == spec
+        assert is_kv_cache_spec_uniform({"layer0": spec, "layer1": spec})
+    else:
+        group = _main_group({"layer0": spec, "layer1": spec})
+        assert group.distinct_specs == (spec,)
+        assert group.kv_cache_specs == {"layer0": spec, "layer1": spec}
+        assert group.manager_cls is FullAttentionManager
 
 
 @pytest.mark.parametrize("draft_flags", [(False, False), (True, True), (False, True), (True, False)])
 def test_mla_merge_preserves_draft_only_ownership_without_changing_grouping(draft_flags):
+    if not vllm_version_is("0.33.0"):
+        configs = [replace(_main_layer_config(_mla_spec()), is_draft=flag) for flag in draft_flags]
+        assert configs[0] == configs[1]
+        assert [lc.is_draft for lc in configs] == list(draft_flags)
+        group = KVCacheGroup.from_layers(dict(zip(("layer0", "layer1"), configs)))
+        assert group.layer_names == ["layer0", "layer1"]
+        assert group.distinct_specs == (_mla_spec(),)
+        return
     specs = [replace(_mla_spec(), is_draft=is_draft) for is_draft in draft_flags]
 
     merged = AscendMLAAttentionSpec.merge(specs)
@@ -114,9 +153,14 @@ def test_ascend_spec_merge_preserves_dcp_layout(spec_type, dcp_sharded):
         dcp_sharded=dcp_sharded,
         **kwargs,
     )
-    assert spec_type.merge([spec, spec]).dcp_sharded is dcp_sharded
-    with pytest.raises(AssertionError):
-        spec_type.merge([spec, replace(spec, dcp_sharded=not dcp_sharded)])
+    if vllm_version_is("0.33.0"):
+        assert spec_type.merge([spec, spec]).dcp_sharded is dcp_sharded
+        with pytest.raises(AssertionError):
+            spec_type.merge([spec, replace(spec, dcp_sharded=not dcp_sharded)])
+    else:
+        assert _main_group({"a": spec, "b": spec}).dcp_sharded is dcp_sharded
+        with pytest.raises(AssertionError, match="manager policy and block size"):
+            _main_group({"a": spec, "b": replace(spec, dcp_sharded=not dcp_sharded)})
 
 
 @pytest.mark.parametrize("dcp_sharded,expected_blocks", [(True, 3), (False, 9)])
@@ -126,7 +170,11 @@ def test_ascend_mla_memory_uses_spec_dcp_layout(dcp_sharded, expected_blocks):
         model_config=SimpleNamespace(max_model_len=129),
         parallel_config=SimpleNamespace(decode_context_parallel_size=4),
     )
-    assert spec.max_memory_usage_bytes(config) == expected_blocks * spec.page_size_bytes
+    if vllm_version_is("0.33.0"):
+        assert spec.max_memory_usage_bytes(config) == expected_blocks * spec.page_size_bytes
+    else:
+        config.max_in_flight_tokens = 128
+        assert _main_group({"layer": spec}).max_memory_usage_bytes(config) == expected_blocks * spec.page_size_bytes
 
 
 def test_get_storage_block_size_and_dcp_memory():
@@ -136,14 +184,22 @@ def test_get_storage_block_size_and_dcp_memory():
     expected = spec.block_size // get_kv_cache_compression_ratio(spec)
     assert get_storage_block_size(spec) == expected
 
-    uniform = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"layer": spec})
-    assert get_storage_block_size(uniform) == expected
+    if vllm_version_is("0.33.0"):
+        uniform = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"layer": spec})
+        assert get_storage_block_size(uniform) == expected
+    else:
+        group = _main_group({"layer": spec})
+        assert get_storage_block_size(group.kv_cache_specs["layer"]) == expected
 
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=128),
         parallel_config=SimpleNamespace(decode_context_parallel_size=2),
     )
-    assert spec.max_memory_usage_bytes(vllm_config) > 0
+    if vllm_version_is("0.33.0"):
+        assert spec.max_memory_usage_bytes(vllm_config) > 0
+    else:
+        vllm_config.max_in_flight_tokens = 128
+        assert _main_group({"layer": spec}).max_memory_usage_bytes(vllm_config) > 0
 
 
 def test_get_storage_block_size_for_plain_mla_subclass():
@@ -172,14 +228,22 @@ def test_sliding_window_mla_storage_and_page_size():
 def test_circular_registry_preserves_spec_and_reports_recycled_pages(ascend, zeroing):
     from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
 
-    register_all_kvcache_specs(None)
-    register_ascend_kv_cache_specs()
-    spec_type = AscendCircularBufferSpec if ascend else CircularBufferSpec
+    if vllm_version_is("0.33.0"):
+        register_all_kvcache_specs(None)
+        register_ascend_kv_cache_specs()
+    native_spec_type = CircularBufferSpec if vllm_version_is("0.33.0") else AttentionSpec
+    spec_type = AscendCircularBufferSpec if ascend else native_spec_type
     spec = spec_type(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
-    merged = spec_type.merge([spec, spec])
-    assert type(merged) is spec_type
-    assert KVCacheSpecRegistry.get_uniform_type_base_spec(merged) is spec_type
-    manager_type = KVCacheSpecRegistry.get_manager_class(merged)
+    if vllm_version_is("0.33.0"):
+        merged = spec_type.merge([spec, spec])
+        assert type(merged) is spec_type
+        assert KVCacheSpecRegistry.get_uniform_type_base_spec(merged) is spec_type
+        manager_type = KVCacheSpecRegistry.get_manager_class(merged)
+    else:
+        manager_type = AscendCircularBufferManager if ascend else CircularBufferManager
+        merged = KVCacheGroup.from_layers({"state": manager_type.layer_config(spec)})
+        assert type(merged.kv_cache_specs["state"]) is spec_type
+        assert merged.manager_cls is manager_type
     assert manager_type is (AscendCircularBufferManager if ascend else CircularBufferManager)
     pool = BlockPool(4, False, 32)
     # Reuse physical IDs released by another cache group.
@@ -191,7 +255,10 @@ def test_circular_registry_preserves_spec_and_reports_recycled_pages(ascend, zer
     assert len(blocks) == 1 and blocks[0].block_id in old_ids
     assert manager.new_block_ids == ([blocks[0].block_id] if ascend and zeroing else [])
     assert manager.allocate_new_blocks("request", 2, 2) == []
-    assert not spec.prefix_cacheable and not spec.uses_slot_mapping
+    if vllm_version_is("0.33.0"):
+        assert not spec.prefix_cacheable and not spec.uses_slot_mapping
+    else:
+        assert not merged.prefix_cacheable and not merged.uses_slot_mapping
     manager.free("request")
     assert pool.get_num_free_blocks() == len(old_ids)
 
@@ -247,6 +314,17 @@ def test_sliding_window_mla_merge_carries_bounded_replay():
     layers asked to, and nothing would report it -- ``prefix_cacheable`` and
     ``prefix_replay_tokens`` are derived from the field, so the group would
     simply look like an ordinary sliding-window one."""
+    if not vllm_version_is("0.33.0"):
+        group = _main_group({"a": _swa_spec(bounded_replay=True), "b": _swa_spec(bounded_replay=True)})
+        assert group.manager_config.params.bounded_replay
+        assert not group.prefix_cacheable
+        assert group.prefix_replay_tokens == group.manager_config.params.sliding_window == 64
+        ordinary_group = _main_group({"a": _swa_spec(), "b": _swa_spec()})
+        assert not ordinary_group.manager_config.params.bounded_replay
+        assert ordinary_group.prefix_replay_tokens == 0
+        with pytest.raises(AssertionError, match="manager policy"):
+            _main_group({"a": _swa_spec(bounded_replay=True), "b": _swa_spec(bounded_replay=False)})
+        return
     merged = AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=True)])
     assert merged.bounded_replay
     assert not merged.prefix_cacheable
@@ -266,6 +344,13 @@ def test_sliding_window_mla_merge_carries_the_retained_token_count():
     to its default -- here the window would come out narrower than the layers
     asked for, and the blocks of the extra trailing tokens would be dropped
     even though they are what the next request's hit resumes from."""
+    if not vllm_version_is("0.33.0"):
+        group = _main_group({"a": _swa_spec(extra_retained_tokens=8), "b": _swa_spec(extra_retained_tokens=8)})
+        assert group.manager_config.params.extra_retained_tokens == 8
+        assert group.sliding_window_reach == 64 - 1 + 8
+        with pytest.raises(AssertionError, match="manager policy"):
+            _main_group({"a": _swa_spec(extra_retained_tokens=8), "b": _swa_spec(extra_retained_tokens=4)})
+        return
     if not declared_kwarg(AscendSlidingWindowMLASpec, "extra_retained_tokens", 8):
         pytest.skip("extra_retained_tokens is absent from this baseline's SlidingWindowSpec.")
 
