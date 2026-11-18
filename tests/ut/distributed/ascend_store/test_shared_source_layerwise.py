@@ -12,11 +12,18 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.utils import vllm_version_is
 
 # isort: split
 import numpy as np
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
 
 from tests.ut.distributed.ascend_store import test_pool_worker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
@@ -126,9 +133,14 @@ def make_shared_worker(test, *, bounded=False, draft=False, num_layers=12, sourc
         groups.append([f"model.layers.{layer}.attn.swa_cache" for layer in range(num_layers)])
     if draft:
         groups.append(["model.mtp.layers.0.attn.kv_cache"])
-    spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+    spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
     cache_config = SimpleNamespace(
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=group, kv_cache_spec=spec) for group in groups],
+        kv_cache_groups=[
+            KVCacheGroup(layer_names=group, kv_cache_spec=spec)
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(dict.fromkeys(group, FullAttentionManager.layer_config(spec)))
+            for group in groups
+        ],
         dspark_draft_layer_names=set(groups[-1]) if draft else set(),
         num_blocks=4,
         prefix_cache_retention_interval=0,
