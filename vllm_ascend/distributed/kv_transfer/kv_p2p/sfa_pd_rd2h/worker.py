@@ -66,6 +66,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     get_transfer_timeout_value,
     validate_register_region_count,
 )
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.dspark_utils import get_dspark_aux_layer_ids
 
 if TYPE_CHECKING:
@@ -631,9 +632,15 @@ class SFAPDRD2HProducerWorker:
         self.last_layer_idx = self.total_layers - 1
         self.engine = global_memfabric_te.get_transfer_engine(self.side_channel_host)
         self.te_rpc_port = self.engine.get_rpc_port()
-        self.kv_cache_specs = [group_spec.kv_cache_spec for group_spec in self.kv_cache_config.kv_cache_groups]
-        self.block_size = [spec.block_size for spec in self.kv_cache_specs]
-        self.num_kv_cache_groups = len(self.kv_cache_specs)
+        if vllm_version_is("0.33.0"):
+            self.kv_cache_specs = [group_spec.kv_cache_spec for group_spec in self.kv_cache_config.kv_cache_groups]
+
+        self.block_size = (
+            [spec.block_size for spec in self.kv_cache_specs]
+            if vllm_version_is("0.33.0")
+            else [group.block_size for group in self.kv_cache_config.kv_cache_groups]
+        )
+        self.num_kv_cache_groups = len(self.kv_cache_specs if vllm_version_is("0.33.0") else self.block_size)
         self.main_group_idx, self.indexer_group_idx = infer_sfa_component_group_ids(self.kv_cache_config)
         self.use_mla = self.vllm_config.model_config.use_mla
         self.layer_metadata: dict[str, LayerMetadata] = {}
@@ -935,7 +942,9 @@ class SFAPDRD2HProducerWorker:
         for group_id in expected_groups:
             if group_id >= len(request_blocks):
                 raise RuntimeError(f"P request is missing DSpark draft KV group {group_id}")
-            block_size = self.kv_cache_specs[group_id].block_size
+            block_size = (
+                self.kv_cache_specs[group_id].block_size if vllm_version_is("0.33.0") else self.block_size[group_id]
+            )
             required = (descriptor.prompt_tokens + block_size - 1) // block_size
             if tuple(source_blocks_by_group[group_id]) != tuple(request_blocks[group_id][:required]):
                 raise RuntimeError("P DSpark source blocks differ from scheduler-owned prompt blocks")

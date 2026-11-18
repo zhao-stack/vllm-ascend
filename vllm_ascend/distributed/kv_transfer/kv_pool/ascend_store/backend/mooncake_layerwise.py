@@ -11,10 +11,23 @@ from copy import copy
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import logger
-from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+from vllm.v1.kv_cache_interface import MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+
 
 from vllm_ascend.ascend_config import KVPPConfig
-from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     ReqMeta,
     block_hash_to_str,
@@ -137,19 +150,34 @@ def validate_dcp_groups(kv_cache_config: Any) -> None:
         return None
     group_block_sizes: list[int] = []
     for group in groups:
-        spec = group.kv_cache_spec
-        specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+        if vllm_version_is("0.33.0"):
+            spec = group.kv_cache_spec
+
+        specs = (
+            (spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,))
+            if vllm_version_is("0.33.0")
+            else group.kv_cache_specs.values()
+        )
         for sub_spec in specs:
-            if isinstance(sub_spec, SlidingWindowSpec):
+            if (
+                isinstance(sub_spec, SlidingWindowSpec)
+                if vllm_version_is("0.33.0")
+                else group.manager_cls is SlidingWindowManager
+            ):
                 raise ValueError("Mooncake layerwise DCP does not support sliding-window cache groups.")
-            if isinstance(sub_spec, MambaSpec) and getattr(sub_spec, "mamba_cache_mode", None) == "align":
+            if (
+                isinstance(sub_spec, MambaSpec) and getattr(sub_spec, "mamba_cache_mode", None) == "align"
+                if vllm_version_is("0.33.0")
+                else isinstance(sub_spec, MambaSpec)
+                and getattr(group.manager_config.params, "mamba_cache_mode", None) == "align"
+            ):
                 raise ValueError("Mooncake layerwise DCP does not support recurrent/align-state cache groups.")
             if not getattr(sub_spec, "dcp_sharded", False):
                 raise ValueError(
                     "Mooncake layerwise DCP requires every cache group to be DCP-sharded; "
                     f"found {type(sub_spec).__name__}."
                 )
-        if not is_prefix_cacheable(spec):
+        if not is_prefix_cacheable(spec) if vllm_version_is("0.33.0") else not group.prefix_cacheable:
             continue
         block_size_signature = group_block_size_signature(group)
         if len(block_size_signature) != 1:
@@ -177,9 +205,11 @@ def group_block_size_signature(group) -> tuple[int, ...]:
     shape to the set of block sizes it contains rather than reading a single
     representative (which depends on dict order).
     """
-    spec = group.kv_cache_spec
-    specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
-    return tuple(sorted({int(sub.block_size) for sub in specs}))
+    if vllm_version_is("0.33.0"):
+        spec = group.kv_cache_spec
+        specs = spec.kv_cache_specs.values() if isinstance(spec, UniformTypeKVCacheSpecs) else (spec,)
+
+    return tuple(sorted({int(sub.block_size) for sub in specs})) if vllm_version_is("0.33.0") else (group.block_size,)
 
 
 def hybrid_layout_id(kv_cache_config, tp_size: int = 1, *, namespace: str = "") -> str:

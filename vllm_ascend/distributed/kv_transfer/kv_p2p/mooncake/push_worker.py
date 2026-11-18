@@ -17,13 +17,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransfe
 from vllm.logger import logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.network_utils import make_zmq_path, make_zmq_socket
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    MambaSpec,
-    MLAAttentionSpec,
-    SlidingWindowMLASpec,
-    SlidingWindowSpec,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, SlidingWindowManager
+
+from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec, SlidingWindowSpec
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
 from zmq.constants import SocketOption, SocketType
 from zmq.error import Again, ZMQError
 from zmq.sugar.context import Context
@@ -467,7 +474,9 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
                 local_rank // ratio == remote_rank if local_size >= remote_size else remote_rank // ratio == local_rank
             )
             return (0, 0, 1) if matched else None
-        whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(spec)
+        whole = isinstance(
+            spec, (MLAAttentionSpec, SlidingWindowMLASpec) if vllm_version_is("0.33.0") else MLAAttentionSpec
+        ) or is_circular_kv_cache_spec(spec)
         if whole:
             # Registration exposes each KVPP target layer only on its persistent owner.
             # That owner supplies the full page to every destination holding the layer.
@@ -479,7 +488,11 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
             owner = (rank[2] * remote.pcp_size + rank[1]) % replicas
             local_group = (self.tp_rank * self.pcp_size + self.pcp_rank) // local_dcp_size
             return (0, 0, 1) if local_group == owner else None
-        if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec)):
+        if (
+            not isinstance(spec, (AttentionSpec, SlidingWindowSpec))
+            if vllm_version_is("0.33.0")
+            else not isinstance(spec, AttentionSpec)
+        ):
             raise ValueError(f"Unsupported Push cache spec: {type(spec).__name__}")
         if local_dcp_size > 1 or remote_dcp_size > 1:
             raise ValueError(f"Push DCP does not support cache spec {type(spec).__name__}")
@@ -521,11 +534,16 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
         local_index = self._layer_indices[layer_name]
         remote_index = pp.layer_names.index(layer_name)
         spec = self.kv_cache_specs[self.layer_name_to_spec_index[layer_name]]
+        if not vllm_version_is("0.33.0"):
+            group = self.kv_cache_config.kv_cache_groups[self.layer_name_to_group_index[layer_name]]
+            is_circular = issubclass(group.manager_cls, CircularBufferManager)
+            is_windowed = issubclass(group.manager_cls, SlidingWindowManager)
+
         final = available >= meta.num_prompt_tokens
         final_only = (
             isinstance(spec, MambaSpec)
-            or is_circular_kv_cache_spec(spec)
-            or getattr(spec, "sliding_window", None) is not None
+            or (is_circular_kv_cache_spec(spec) if vllm_version_is("0.33.0") else is_circular)
+            or (getattr(spec, "sliding_window", None) is not None if vllm_version_is("0.33.0") else is_windowed)
         )
         if final_only and not final:
             return None
@@ -533,77 +551,155 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
         remote_blocks = params["block_ids"][pp.group_indices[remote_index]]
         local_ids: list[int]
         remote_ids: list[int]
-        if isinstance(spec, MambaSpec):
-            local_ids = [local_blocks[-1]]
-            remote_ids = [remote_blocks[-1]]
-            if not local_ids[0] or not remote_ids[0]:
-                raise ValueError("Required Mamba state block is not resident")
-        elif is_circular_kv_cache_spec(spec):
-            if len(local_blocks) != 1 or len(remote_blocks) != 1:
-                raise ValueError("Circular Push requires one state block per request")
-            local_scale = self.transfer_metadata.block_size_scales[local_index][0]
-            remote_scale = pp.block_size_scales[remote_index][0]
-            if local_scale != remote_scale:
-                raise ValueError("Circular Push requires equal P/D physical block counts")
-            local_ids = [local_blocks[0] * local_scale + i for i in range(local_scale)]
-            remote_ids = [remote_blocks[0] * remote_scale + i for i in range(remote_scale)]
-        else:
-            local_scale = self.transfer_metadata.block_size_scales[local_index][0]
-            remote_scale = pp.block_size_scales[remote_index][0]
-            block_size = self.transfer_metadata.layer_block_sizes[local_index] // local_scale
-            if block_size != pp.layer_block_sizes[remote_index] // remote_scale:
-                raise ValueError("Push requires equal P/D kernel block sizes")
-            local_dcp_size, remote_dcp_size = self._get_layer_dcp_sizes(
-                layer_name, remote, tuple(params["consumer_rank"])
-            )
-            local_dcp_rank = self.dcp_rank if local_dcp_size > 1 else 0
-            # Pull uses the same TP-major/PCP-minor ordering: DCP=PCP
-            # shards within each TP rank; DCP=TP*PCP spans all workers.
-            remote_rank = params["consumer_rank"][2] * remote.pcp_size + params["consumer_rank"][1]
-            remote_dcp_rank = remote_rank % remote_dcp_size
-            local_interleave = self.transfer_metadata.cp_kv_cache_interleave_size
-            remote_interleave = pp.cp_kv_cache_interleave_size
-            for side, size, interleave, page_size in (
-                ("P", local_dcp_size, local_interleave, self.transfer_metadata.layer_block_sizes[local_index]),
-                ("D", remote_dcp_size, remote_interleave, pp.layer_block_sizes[remote_index]),
-            ):
-                if size > 1 and (interleave <= 0 or interleave % block_size or page_size % interleave):
-                    raise ValueError(f"Push DCP interleave must align to kernel blocks and divide the {side} page size")
-            if not final:
-                end = end // block_size * block_size
-            if end <= start:
-                return None
-            if final_only:
-                # Window tables retain logical positions, including null slots.
-                start = max(start, end - getattr(spec, "num_retained_tokens", spec.sliding_window - 1) - 1)
-            first, last = start // block_size, (end + block_size - 1) // block_size
-            local_ids, remote_ids = [], []
-            for index in range(first, last):
-                local_kernel_index = remote_kernel_index = index
-                # Intersect both peers' ownership within this layer's ready
-                # range. Their interleaves and logical page sizes may differ.
-                if local_dcp_size > 1:
-                    stripe, offset = divmod(index * block_size, local_interleave)
-                    if stripe % local_dcp_size != local_dcp_rank:
-                        continue
-                    local_kernel_index = (stripe // local_dcp_size * local_interleave + offset) // block_size
-                if remote_dcp_size > 1:
-                    stripe, offset = divmod(index * block_size, remote_interleave)
-                    if stripe % remote_dcp_size != remote_dcp_rank:
-                        continue
-                    remote_kernel_index = (stripe // remote_dcp_size * remote_interleave + offset) // block_size
-                if local_kernel_index // local_scale >= len(local_blocks) or remote_kernel_index // remote_scale >= len(
-                    remote_blocks
+        if vllm_version_is("0.33.0"):
+            if isinstance(spec, MambaSpec):
+                local_ids = [local_blocks[-1]]
+                remote_ids = [remote_blocks[-1]]
+                if not local_ids[0] or not remote_ids[0]:
+                    raise ValueError("Required Mamba state block is not resident")
+            elif is_circular_kv_cache_spec(spec):
+                if len(local_blocks) != 1 or len(remote_blocks) != 1:
+                    raise ValueError("Circular Push requires one state block per request")
+                local_scale = self.transfer_metadata.block_size_scales[local_index][0]
+                remote_scale = pp.block_size_scales[remote_index][0]
+                if local_scale != remote_scale:
+                    raise ValueError("Circular Push requires equal P/D physical block counts")
+                local_ids = [local_blocks[0] * local_scale + i for i in range(local_scale)]
+                remote_ids = [remote_blocks[0] * remote_scale + i for i in range(remote_scale)]
+            else:
+                local_scale = self.transfer_metadata.block_size_scales[local_index][0]
+                remote_scale = pp.block_size_scales[remote_index][0]
+                block_size = self.transfer_metadata.layer_block_sizes[local_index] // local_scale
+                if block_size != pp.layer_block_sizes[remote_index] // remote_scale:
+                    raise ValueError("Push requires equal P/D kernel block sizes")
+                local_dcp_size, remote_dcp_size = self._get_layer_dcp_sizes(
+                    layer_name, remote, tuple(params["consumer_rank"])
+                )
+                local_dcp_rank = self.dcp_rank if local_dcp_size > 1 else 0
+                # Pull uses the same TP-major/PCP-minor ordering: DCP=PCP
+                # shards within each TP rank; DCP=TP*PCP spans all workers.
+                remote_rank = params["consumer_rank"][2] * remote.pcp_size + params["consumer_rank"][1]
+                remote_dcp_rank = remote_rank % remote_dcp_size
+                local_interleave = self.transfer_metadata.cp_kv_cache_interleave_size
+                remote_interleave = pp.cp_kv_cache_interleave_size
+                for side, size, interleave, page_size in (
+                    ("P", local_dcp_size, local_interleave, self.transfer_metadata.layer_block_sizes[local_index]),
+                    ("D", remote_dcp_size, remote_interleave, pp.layer_block_sizes[remote_index]),
                 ):
-                    raise ValueError("Push block tables do not cover the ready token range")
-                local_block = local_blocks[local_kernel_index // local_scale]
-                remote_block = remote_blocks[remote_kernel_index // remote_scale]
-                if final_only and remote_block == 0:
-                    continue
-                if local_block == 0 or remote_block == 0:
-                    raise ValueError("Required Push block is not resident")
-                local_ids.append(local_block * local_scale + local_kernel_index % local_scale)
-                remote_ids.append(remote_block * remote_scale + remote_kernel_index % remote_scale)
+                    if size > 1 and (interleave <= 0 or interleave % block_size or page_size % interleave):
+                        raise ValueError(
+                            f"Push DCP interleave must align to kernel blocks and divide the {side} page size"
+                        )
+                if not final:
+                    end = end // block_size * block_size
+                if end <= start:
+                    return None
+                if final_only:
+                    # Window tables retain logical positions, including null slots.
+                    start = max(start, end - getattr(spec, "num_retained_tokens", spec.sliding_window - 1) - 1)
+                first, last = start // block_size, (end + block_size - 1) // block_size
+                local_ids, remote_ids = [], []
+                for index in range(first, last):
+                    local_kernel_index = remote_kernel_index = index
+                    # Intersect both peers' ownership within this layer's ready
+                    # range. Their interleaves and logical page sizes may differ.
+                    if local_dcp_size > 1:
+                        stripe, offset = divmod(index * block_size, local_interleave)
+                        if stripe % local_dcp_size != local_dcp_rank:
+                            continue
+                        local_kernel_index = (stripe // local_dcp_size * local_interleave + offset) // block_size
+                    if remote_dcp_size > 1:
+                        stripe, offset = divmod(index * block_size, remote_interleave)
+                        if stripe % remote_dcp_size != remote_dcp_rank:
+                            continue
+                        remote_kernel_index = (stripe // remote_dcp_size * remote_interleave + offset) // block_size
+                    if local_kernel_index // local_scale >= len(
+                        local_blocks
+                    ) or remote_kernel_index // remote_scale >= len(remote_blocks):
+                        raise ValueError("Push block tables do not cover the ready token range")
+                    local_block = local_blocks[local_kernel_index // local_scale]
+                    remote_block = remote_blocks[remote_kernel_index // remote_scale]
+                    if final_only and remote_block == 0:
+                        continue
+                    if local_block == 0 or remote_block == 0:
+                        raise ValueError("Required Push block is not resident")
+                    local_ids.append(local_block * local_scale + local_kernel_index % local_scale)
+                    remote_ids.append(remote_block * remote_scale + remote_kernel_index % remote_scale)
+        else:
+            if isinstance(spec, MambaSpec):
+                local_ids = [local_blocks[-1]]
+                remote_ids = [remote_blocks[-1]]
+                if not local_ids[0] or not remote_ids[0]:
+                    raise ValueError("Required Mamba state block is not resident")
+            elif is_circular:
+                if len(local_blocks) != 1 or len(remote_blocks) != 1:
+                    raise ValueError("Circular Push requires one state block per request")
+                local_scale = self.transfer_metadata.block_size_scales[local_index][0]
+                remote_scale = pp.block_size_scales[remote_index][0]
+                if local_scale != remote_scale:
+                    raise ValueError("Circular Push requires equal P/D physical block counts")
+                local_ids = [local_blocks[0] * local_scale + i for i in range(local_scale)]
+                remote_ids = [remote_blocks[0] * remote_scale + i for i in range(remote_scale)]
+            else:
+                local_scale = self.transfer_metadata.block_size_scales[local_index][0]
+                remote_scale = pp.block_size_scales[remote_index][0]
+                block_size = self.transfer_metadata.layer_block_sizes[local_index] // local_scale
+                if block_size != pp.layer_block_sizes[remote_index] // remote_scale:
+                    raise ValueError("Push requires equal P/D kernel block sizes")
+                local_dcp_size, remote_dcp_size = self._get_layer_dcp_sizes(
+                    layer_name, remote, tuple(params["consumer_rank"])
+                )
+                local_dcp_rank = self.dcp_rank if local_dcp_size > 1 else 0
+                # Pull uses the same TP-major/PCP-minor ordering: DCP=PCP
+                # shards within each TP rank; DCP=TP*PCP spans all workers.
+                remote_rank = params["consumer_rank"][2] * remote.pcp_size + params["consumer_rank"][1]
+                remote_dcp_rank = remote_rank % remote_dcp_size
+                local_interleave = self.transfer_metadata.cp_kv_cache_interleave_size
+                remote_interleave = pp.cp_kv_cache_interleave_size
+                for side, size, interleave, page_size in (
+                    ("P", local_dcp_size, local_interleave, self.transfer_metadata.layer_block_sizes[local_index]),
+                    ("D", remote_dcp_size, remote_interleave, pp.layer_block_sizes[remote_index]),
+                ):
+                    if size > 1 and (interleave <= 0 or interleave % block_size or page_size % interleave):
+                        raise ValueError(
+                            f"Push DCP interleave must align to kernel blocks and divide the {side} page size"
+                        )
+                if not final:
+                    end = end // block_size * block_size
+                if end <= start:
+                    return None
+                if final_only:
+                    # Window tables retain logical positions, including null slots.
+                    start = max(start, end - group.sliding_window_reach - 2)
+                first, last = start // block_size, (end + block_size - 1) // block_size
+                local_ids, remote_ids = [], []
+                for index in range(first, last):
+                    local_kernel_index = remote_kernel_index = index
+                    # Intersect both peers' ownership within this layer's ready
+                    # range. Their interleaves and logical page sizes may differ.
+                    if local_dcp_size > 1:
+                        stripe, offset = divmod(index * block_size, local_interleave)
+                        if stripe % local_dcp_size != local_dcp_rank:
+                            continue
+                        local_kernel_index = (stripe // local_dcp_size * local_interleave + offset) // block_size
+                    if remote_dcp_size > 1:
+                        stripe, offset = divmod(index * block_size, remote_interleave)
+                        if stripe % remote_dcp_size != remote_dcp_rank:
+                            continue
+                        remote_kernel_index = (stripe // remote_dcp_size * remote_interleave + offset) // block_size
+                    if local_kernel_index // local_scale >= len(
+                        local_blocks
+                    ) or remote_kernel_index // remote_scale >= len(remote_blocks):
+                        raise ValueError("Push block tables do not cover the ready token range")
+                    local_block = local_blocks[local_kernel_index // local_scale]
+                    remote_block = remote_blocks[remote_kernel_index // remote_scale]
+                    if final_only and remote_block == 0:
+                        continue
+                    if local_block == 0 or remote_block == 0:
+                        raise ValueError("Required Push block is not resident")
+                    local_ids.append(local_block * local_scale + local_kernel_index % local_scale)
+                    remote_ids.append(remote_block * remote_scale + remote_kernel_index % remote_scale)
+
         # An empty DCP stripe still advances this destination's processed range.
         # Keep its event/future so completion follows the same WRITE ordering.
         return LayerTransferRequest(request_id, tuple(local_ids), tuple(remote_ids), start, end), event
@@ -615,67 +711,145 @@ class MooncakePushConnectorWorker(MooncakeBaseConnectorWorker):
         src_list: list[int] = []
         dst_list: list[int] = []
         length_list: list[int] = []
-        try:
-            local_index = self._layer_indices[batch.layer_name]
-            remote = batch.remote_metadata
-            pp = remote.metadata_by_pp_rank[batch.remote_rank[0]]
-            remote_index = pp.layer_names.index(batch.layer_name)
-            worker = pp.metadata_by_pcp_rank[batch.remote_rank[1]].metadata_by_tp_rank[batch.remote_rank[2]]
-            spec = self.kv_cache_specs[self.layer_name_to_spec_index[batch.layer_name]]
-            if isinstance(spec, MambaSpec):
-                self._append_mamba_transfer_addresses(
-                    spec,
-                    batch.remote_rank[1],
-                    batch.remote_rank[2],
-                    remote.tp_size,
-                    {
-                        (local_index, remote_index): [
-                            (req.request_id, list(req.local_block_ids), list(req.remote_block_ids))
-                            for req in batch.requests
-                        ]
-                    },
-                    pp,
-                    src_list,
-                    dst_list,
-                    length_list,
-                )
-            else:
-                partition = self._get_transfer_partition(batch.layer_name, remote, batch.remote_rank)
-                assert partition is not None
-                local_offset, remote_offset, heads = partition
-                whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(spec)
-                local = self.transfer_metadata
-                for cache_index, (local_addr, remote_addr) in enumerate(
-                    zip(local.kv_caches_base_addr[local_index], worker.kv_caches_base_addr[remote_index], strict=True)
-                ):
-                    local_len = local.block_lens[local_index][cache_index]
-                    remote_len = pp.block_lens[remote_index][cache_index]
-                    if not whole:
-                        local_len //= local.block_shapes[local_index][cache_index][0]
-                        remote_len //= pp.block_shapes[remote_index][cache_index][0]
-                    if local_len != remote_len:
-                        raise ValueError("P/D cache slice lengths differ")
-                    for req in batch.requests:
-                        for local_block, remote_block in zip(req.local_block_ids, req.remote_block_ids, strict=True):
-                            src_list.append(
-                                local_addr
-                                + local_block * local.block_strides[local_index][cache_index]
-                                + local_offset * local_len
-                            )
-                            dst_list.append(
-                                remote_addr
-                                + remote_block * pp.block_strides[remote_index][cache_index]
-                                + remote_offset * remote_len
-                            )
-                            length_list.append(local_len * heads)
-            batch.event.synchronize()
-            if src_list:
-                session = f"{worker.local_ip}:{worker.te_rpc_port}"
-                ret = self.engine.batch_transfer_sync_write(session, src_list, dst_list, length_list)
-                if ret < 0:
-                    return f"Mooncake WRITE failed: session={session}, ret={ret}"
-        except Exception as exc:
-            return str(exc) or type(exc).__name__
+        if vllm_version_is("0.33.0"):
+            try:
+                local_index = self._layer_indices[batch.layer_name]
+                remote = batch.remote_metadata
+                pp = remote.metadata_by_pp_rank[batch.remote_rank[0]]
+                remote_index = pp.layer_names.index(batch.layer_name)
+                worker = pp.metadata_by_pcp_rank[batch.remote_rank[1]].metadata_by_tp_rank[batch.remote_rank[2]]
+                spec = self.kv_cache_specs[self.layer_name_to_spec_index[batch.layer_name]]
+                if isinstance(spec, MambaSpec):
+                    self._append_mamba_transfer_addresses(
+                        spec,
+                        batch.remote_rank[1],
+                        batch.remote_rank[2],
+                        remote.tp_size,
+                        {
+                            (local_index, remote_index): [
+                                (req.request_id, list(req.local_block_ids), list(req.remote_block_ids))
+                                for req in batch.requests
+                            ]
+                        },
+                        pp,
+                        src_list,
+                        dst_list,
+                        length_list,
+                    )
+                else:
+                    partition = self._get_transfer_partition(batch.layer_name, remote, batch.remote_rank)
+                    assert partition is not None
+                    local_offset, remote_offset, heads = partition
+                    whole = isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec)) or is_circular_kv_cache_spec(
+                        spec
+                    )
+                    local = self.transfer_metadata
+                    for cache_index, (local_addr, remote_addr) in enumerate(
+                        zip(
+                            local.kv_caches_base_addr[local_index],
+                            worker.kv_caches_base_addr[remote_index],
+                            strict=True,
+                        )
+                    ):
+                        local_len = local.block_lens[local_index][cache_index]
+                        remote_len = pp.block_lens[remote_index][cache_index]
+                        if not whole:
+                            local_len //= local.block_shapes[local_index][cache_index][0]
+                            remote_len //= pp.block_shapes[remote_index][cache_index][0]
+                        if local_len != remote_len:
+                            raise ValueError("P/D cache slice lengths differ")
+                        for req in batch.requests:
+                            for local_block, remote_block in zip(
+                                req.local_block_ids, req.remote_block_ids, strict=True
+                            ):
+                                src_list.append(
+                                    local_addr
+                                    + local_block * local.block_strides[local_index][cache_index]
+                                    + local_offset * local_len
+                                )
+                                dst_list.append(
+                                    remote_addr
+                                    + remote_block * pp.block_strides[remote_index][cache_index]
+                                    + remote_offset * remote_len
+                                )
+                                length_list.append(local_len * heads)
+                batch.event.synchronize()
+                if src_list:
+                    session = f"{worker.local_ip}:{worker.te_rpc_port}"
+                    ret = self.engine.batch_transfer_sync_write(session, src_list, dst_list, length_list)
+                    if ret < 0:
+                        return f"Mooncake WRITE failed: session={session}, ret={ret}"
+            except Exception as exc:
+                return str(exc) or type(exc).__name__
+        else:
+            try:
+                local_index = self._layer_indices[batch.layer_name]
+                remote = batch.remote_metadata
+                pp = remote.metadata_by_pp_rank[batch.remote_rank[0]]
+                remote_index = pp.layer_names.index(batch.layer_name)
+                worker = pp.metadata_by_pcp_rank[batch.remote_rank[1]].metadata_by_tp_rank[batch.remote_rank[2]]
+                spec = self.kv_cache_specs[self.layer_name_to_spec_index[batch.layer_name]]
+                if isinstance(spec, MambaSpec):
+                    self._append_mamba_transfer_addresses(
+                        spec,
+                        batch.remote_rank[1],
+                        batch.remote_rank[2],
+                        remote.tp_size,
+                        {
+                            (local_index, remote_index): [
+                                (req.request_id, list(req.local_block_ids), list(req.remote_block_ids))
+                                for req in batch.requests
+                            ]
+                        },
+                        pp,
+                        src_list,
+                        dst_list,
+                        length_list,
+                    )
+                else:
+                    partition = self._get_transfer_partition(batch.layer_name, remote, batch.remote_rank)
+                    assert partition is not None
+                    local_offset, remote_offset, heads = partition
+                    whole = isinstance(spec, MLAAttentionSpec) or is_circular_kv_cache_spec(spec)
+                    local = self.transfer_metadata
+                    for cache_index, (local_addr, remote_addr) in enumerate(
+                        zip(
+                            local.kv_caches_base_addr[local_index],
+                            worker.kv_caches_base_addr[remote_index],
+                            strict=True,
+                        )
+                    ):
+                        local_len = local.block_lens[local_index][cache_index]
+                        remote_len = pp.block_lens[remote_index][cache_index]
+                        if not whole:
+                            local_len //= local.block_shapes[local_index][cache_index][0]
+                            remote_len //= pp.block_shapes[remote_index][cache_index][0]
+                        if local_len != remote_len:
+                            raise ValueError("P/D cache slice lengths differ")
+                        for req in batch.requests:
+                            for local_block, remote_block in zip(
+                                req.local_block_ids, req.remote_block_ids, strict=True
+                            ):
+                                src_list.append(
+                                    local_addr
+                                    + local_block * local.block_strides[local_index][cache_index]
+                                    + local_offset * local_len
+                                )
+                                dst_list.append(
+                                    remote_addr
+                                    + remote_block * pp.block_strides[remote_index][cache_index]
+                                    + remote_offset * remote_len
+                                )
+                                length_list.append(local_len * heads)
+                batch.event.synchronize()
+                if src_list:
+                    session = f"{worker.local_ip}:{worker.te_rpc_port}"
+                    ret = self.engine.batch_transfer_sync_write(session, src_list, dst_list, length_list)
+                    if ret < 0:
+                        return f"Mooncake WRITE failed: session={session}, ret={ret}"
+            except Exception as exc:
+                return str(exc) or type(exc).__name__
+
         return None
 
     def _process_sending_requests(self, wait: bool = False, *, layer_hook: bool = False, force: bool = False) -> None:

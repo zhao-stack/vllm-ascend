@@ -9,7 +9,20 @@ import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.request import RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
@@ -109,9 +122,20 @@ def test_kv_zeroing_preserves_only_async_loaded_groups(scheduler_cls, loaded_gro
         num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                [f"layer-{index}"],
-                FullAttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=dtype),
+            KVCacheGroup(
+                [f"layer-{index}"], AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=dtype)
+            )
+            for index, dtype in enumerate([torch.float16, torch.float32])
+        ]
+        if vllm_version_is("0.33.0")
+        else [
+            KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    [f"layer-{index}"],
+                    FullAttentionManager.layer_config(
+                        AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=dtype)
+                    ),
+                )
             )
             for index, dtype in enumerate([torch.float16, torch.float32])
         ],

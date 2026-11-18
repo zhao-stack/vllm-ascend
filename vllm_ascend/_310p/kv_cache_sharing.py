@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
 
 def get_310p_shared_cache_slots(kv_cache_groups, layout) -> dict[str, int]:
@@ -19,22 +24,39 @@ def get_310p_shared_cache_slots(kv_cache_groups, layout) -> dict[str, int]:
             return {}
         has_attention = False
         has_mamba = False
-        for slot, layer_name in enumerate(group.layer_names):
-            group_spec = group.kv_cache_spec
-            spec = (
-                group_spec.kv_cache_specs[layer_name] if isinstance(group_spec, UniformTypeKVCacheSpecs) else group_spec
-            )
-            page_sizes.add(spec.page_size_bytes)
-            if isinstance(spec, AttentionSpec):
-                has_attention = True
-            elif isinstance(spec, MambaSpec):
-                has_mamba = True
-                if mamba_spec is not None and spec != mamba_spec:
+        if vllm_version_is("0.33.0"):
+            for slot, layer_name in enumerate(group.layer_names):
+                group_spec = group.kv_cache_spec
+                spec = (
+                    group_spec.kv_cache_specs[layer_name]
+                    if isinstance(group_spec, UniformTypeKVCacheSpecs)
+                    else group_spec
+                )
+                page_sizes.add(spec.page_size_bytes)
+                if isinstance(spec, AttentionSpec):
+                    has_attention = True
+                elif isinstance(spec, MambaSpec):
+                    has_mamba = True
+                    if mamba_spec is not None and spec != mamba_spec:
+                        return {}
+                    mamba_spec = spec
+                    shared_slots[layer_name] = slot
+                else:
                     return {}
-                mamba_spec = spec
-                shared_slots[layer_name] = slot
-            else:
-                return {}
+        else:
+            for slot, (layer_name, spec) in enumerate(group.kv_cache_specs.items()):
+                page_sizes.add(spec.page_size_bytes)
+                if isinstance(spec, AttentionSpec):
+                    has_attention = True
+                elif isinstance(spec, MambaSpec):
+                    has_mamba = True
+                    if mamba_spec is not None and spec != mamba_spec:
+                        return {}
+                    mamba_spec = spec
+                    shared_slots[layer_name] = slot
+                else:
+                    return {}
+
         if has_attention and has_mamba:
             return {}
         attention_group_count += has_attention

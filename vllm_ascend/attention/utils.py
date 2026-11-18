@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import enum
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -18,25 +20,19 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import MLAAttentionImpl
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    CrossAttentionSpec,
-    FullAttentionSpec,
-    KVCacheSpec,
-    MLAAttentionSpec,
-    SlidingWindowMLASpec,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MLAAttentionSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import CrossAttentionSpec, SlidingWindowMLASpec
+
 
 from vllm_ascend.core.kv_cache_interface import get_kv_cache_compression_ratio, supports_component_major_mla_pd
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.device.utils import FIA_TND_LARGE_HEAD_FALLBACK_HEAD_SIZE
 from vllm_ascend.ops.triton.attention_update import prepare_attention_update
-from vllm_ascend.utils import (
-    _is_glm_model,
-    get_ascend_config,
-    is_pd_decode_recompute_scheduler_enabled,
-    vllm_version_is,
-)
+from vllm_ascend.utils import _is_glm_model, get_ascend_config, is_pd_decode_recompute_scheduler_enabled
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
@@ -61,8 +57,11 @@ def supports_strided_mla_cache(
     Attention post-load hooks see upstream MLA specs before the runners add
     Ascend layout metadata, so inspect the geometry and layer markers directly.
     """
-    if not isinstance(attn_module, MLAAttention) or not isinstance(
-        kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+    if (
+        not isinstance(attn_module, MLAAttention)
+        or not isinstance(kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+        if vllm_version_is("0.33.0")
+        else not isinstance(attn_module, MLAAttention) or not isinstance(kv_cache_spec, MLAAttentionSpec)
     ):
         return False
     if (
@@ -283,7 +282,7 @@ def using_paged_attention(runtime_shape: int | None, vllm_config: VllmConfig, he
     return bool(pa_shape_list) if runtime_shape is None else runtime_shape in pa_shape_list
 
 
-def requires_contiguous_pa_kv_cache(layer, vllm_config: VllmConfig, spec: FullAttentionSpec) -> bool:
+def requires_contiguous_pa_kv_cache(layer, vllm_config: VllmConfig, spec: AttentionSpec) -> bool:
     """Require contiguous K/V only for unpadded ordinary Attention layers eligible for PA."""
     # Import lazily to avoid a circular dependency with attention_v1.
     from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
@@ -308,7 +307,7 @@ def is_pcp_enabled():
     return parallel_config.prefill_context_parallel_size > 1
 
 
-def uses_pcp_sharded_layout(common_attn_metadata: "AscendCommonAttentionMetadata", use_pcp: bool) -> bool:
+def uses_pcp_sharded_layout(common_attn_metadata: AscendCommonAttentionMetadata, use_pcp: bool) -> bool:
     """Return whether this step should use the PCP-sharded layout.
 
     Under PCP, metadata built without a PCP context (e.g. a replicated draft
@@ -396,11 +395,11 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
 
     # Global PCP view of the current target step and this cache group's index
     # into its per-group tensors. ``None`` when the step is not PCP-partitioned.
-    pcp_context: "AscendPCPAttentionContext | None" = None
+    pcp_context: AscendPCPAttentionContext | None = None
     pcp_cache_group_idx: int | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
-    def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
+    def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> AscendCommonAttentionMetadata:
         # This only use to eagle now. It will be use to enforce_eager in future.
         # Helper to slice optional per-request tensors to ``num_actual_reqs``.
         def _slice_reqs(x):
@@ -690,7 +689,7 @@ def enabling_mlapo(vllm_config: VllmConfig) -> bool:
     return bool(config_val and is_decode_instance)
 
 
-def _select_seq_lens(
+def _release__select_seq_lens(
     common_attn_metadata: AscendCommonAttentionMetadata,
     kv_cache_spec: AttentionSpec | None,
     speculative_config: SpeculativeConfig | None,
@@ -731,6 +730,53 @@ def _select_seq_lens(
         if parallel_drafting and not (speculative_config.use_dspark() and _is_glm_model(model_config)):
             seq_lens = common_attn_metadata.seq_lens
     return seq_lens
+
+
+def _select_seq_lens(
+    common_attn_metadata: AscendCommonAttentionMetadata,
+    is_cross_attention: bool,
+    speculative_config: SpeculativeConfig | None,
+    vllm_config: VllmConfig,
+) -> torch.Tensor:
+    """Choose the seq_lens tensor carried by the built attention metadata.
+
+    Defaults to the CPU mirror: ``_seq_lens_cpu`` is always available and
+    updated during draft iterations, while ``seq_lens_cpu`` is None in async
+    spec decode mode. Cross-attention and generic parallel drafting override
+    this with the NPU ``seq_lens``; the one exception is DSpark on the GLM5.2
+    family, whose CPU mirror carries the same post-rejection-sampling lengths
+    across draft iterations, so building from it skips the NPU->CPU sync at
+    ``seq_lens.tolist()`` in the metadata build.
+    """
+    # Prefer _seq_lens_cpu (always available, updated during draft
+    # iterations) over seq_lens_cpu (None in async spec decode mode).
+    model_config = vllm_config.model_config
+    num_reqs = common_attn_metadata.num_reqs
+    if common_attn_metadata._seq_lens_cpu is not None:
+        seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
+    elif common_attn_metadata.seq_lens_cpu is not None:
+        seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
+    else:
+        seq_lens = common_attn_metadata.seq_lens[:num_reqs].to("cpu")
+
+    if is_cross_attention:
+        seq_lens = common_attn_metadata.seq_lens
+    if speculative_config is not None:
+        # vLLM #63373 moved this capability off the deprecated legacy field.
+        parallel_drafting = (
+            speculative_config.parallel_drafting
+            if vllm_version_is("0.33.0")
+            else speculative_config.speculator_config.parallel_drafting
+        )
+        # PARD / DFlash (and DSpark on other models) keep the NPU seq_lens;
+        # only DSpark on the GLM5.2 family keeps the CPU mirror above.
+        if parallel_drafting and not (speculative_config.use_dspark() and _is_glm_model(model_config)):
+            seq_lens = common_attn_metadata.seq_lens
+    return seq_lens
+
+
+if vllm_version_is("0.33.0"):
+    _select_seq_lens = _release__select_seq_lens  # type: ignore[assignment, misc]
 
 
 def merge_prefill_chunks(

@@ -1,20 +1,28 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
 from vllm.config import AttentionConfig, CUDAGraphMode, KVTransferConfig
 from vllm.sequence import IntermediateTensors
-from vllm.v1.kv_cache_interface import (
-    KVCacheGroupSpec,
-    MambaSpec,
-    MLAAttentionSpec,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+
+from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from tests.ut.base import TestBase
-from vllm_ascend.utils import vllm_version_is
 
 
 @pytest.mark.parametrize("enforce_eager", [False, True])
@@ -306,7 +314,7 @@ class TestNPUWorkerV2(TestBase):
             worker._pp_send_work = []
 
             pooling_output = ModelRunnerOutput(
-                req_ids=[], **({"req_id_to_index": {}} if vllm_version_is("0.33.0") else {})
+                req_ids=[], **(cast(dict[str, Any], {"req_id_to_index": {}} if vllm_version_is("0.33.0") else {}))
             )
             worker.model_runner.execute_model.return_value = None
             worker.model_runner.pool.return_value = pooling_output
@@ -339,14 +347,14 @@ def test_mrv2_block_outermost_hybrid_budget_respects_shared_backing(with_kv_tran
         dtypes=(torch.float32,),
     )
     groups = [
-        KVCacheGroupSpec(
-            layer_names=["compressed_attn"],
-            kv_cache_spec=compressed_spec,
+        KVCacheGroup(layer_names=["compressed_attn"], kv_cache_spec=compressed_spec)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers(
+            dict.fromkeys(["compressed_attn"], FullAttentionManager.layer_config(compressed_spec))
         ),
-        KVCacheGroupSpec(
-            layer_names=["linear_attn"],
-            kv_cache_spec=mamba_spec,
-        ),
+        KVCacheGroup(layer_names=["linear_attn"], kv_cache_spec=mamba_spec)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers({"linear_attn": MambaManager.layer_config(mamba_spec)}),
     ]
     worker = NPUWorker.__new__(NPUWorker)
     worker.use_v2_model_runner = True

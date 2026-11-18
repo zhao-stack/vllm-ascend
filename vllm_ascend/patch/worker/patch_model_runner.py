@@ -244,4 +244,5 @@ upstream.copy_kv_cache_blocks_inplace = copy_kv_cache_blocks_inplace
 
 upstream.dispatch_cg_and_sync_dp = dispatch_cg_and_sync_dp
 
-upstream.GPUModelRunner.initialize_kv_cache = initialize_kv_cache
+if vllm_version_is("0.33.0"):
+    upstream.GPUModelRunner.initialize_kv_cache = initialize_kv_cache

@@ -5,7 +5,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.layerwise_cache_layout import (
@@ -44,7 +56,12 @@ def test_layerwise_plan_shares_each_physical_slot(reuse, indexer_c8):
             for names, spec in ((main_names, main_spec), (indexer_names, indexer_spec))
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=names, kv_cache_spec=spec)
+            KVCacheGroup(layer_names=names, kv_cache_spec=spec)
+            for names, spec in ((main_names, main_spec), (indexer_names, indexer_spec))
+        ]
+        if vllm_version_is("0.33.0")
+        else [
+            KVCacheGroup.from_layers(dict.fromkeys(names, FullAttentionManager.layer_config(spec)))
             for names, spec in ((main_names, main_spec), (indexer_names, indexer_spec))
         ],
     )

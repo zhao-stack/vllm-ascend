@@ -14,7 +14,20 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.pool_worker import (
     LayerwiseKVPoolWorker,
@@ -41,12 +54,15 @@ def _make_pp_layer_count_worker(pp_rank, pp_size=2, initial_num_layers=4, use_la
         for group_id in range(num_groups)
     ]
     worker = LayerwiseKVPoolWorker.__new__(LayerwiseKVPoolWorker)
-    attention_spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+    attention_spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
     worker.kv_cache_config = KVCacheConfig(
         num_blocks=2,
         kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(layer_names=names, kv_cache_spec=attention_spec) for names in group_layer_names
+        kv_cache_groups=[KVCacheGroup(layer_names=names, kv_cache_spec=attention_spec) for names in group_layer_names]
+        if vllm_version_is("0.33.0")
+        else [
+            KVCacheGroup.from_layers(dict.fromkeys(names, FullAttentionManager.layer_config(attention_spec)))
+            for names in group_layer_names
         ],
     )
     worker.hf_config = SimpleNamespace(num_hidden_layers=8)

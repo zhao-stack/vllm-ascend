@@ -29,6 +29,7 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.models.deepseek_v41.decoder_replay_state import DecoderReplayInputs, DecoderReplayState
+from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
 from vllm_ascend.worker.v2.input_batch import AscendInputBatch
 from vllm_ascend.worker.v2.model_states.default import AscendModelState, ReplayAttnMetadata
@@ -148,14 +149,25 @@ class EngramModelState(AscendModelState):
         # this step is only known here; engram overlap dispatch keys off it.
         self._cg_mode = cudagraph_mode
         if self._replay_groups is None:
-            from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
+            if vllm_version_is("0.33.0"):
+                from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 
-            specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
-            windows = [int(getattr(spec, "prefix_replay_tokens", getattr(spec, "sliding_window", 0))) for spec in specs]
+                specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
+                windows = [
+                    int(getattr(spec, "prefix_replay_tokens", getattr(spec, "sliding_window", 0))) for spec in specs
+                ]
+            else:
+                groups = kv_cache_config.kv_cache_groups
+
             self._replay_groups = (
-                max(windows, default=0),
+                max(
+                    windows if vllm_version_is("0.33.0") else (group.prefix_replay_tokens for group in groups),
+                    default=0,
+                ),
                 torch.tensor(
-                    [i for i, spec in enumerate(specs) if is_prefix_cacheable(spec)],
+                    [i for i, spec in enumerate(specs) if is_prefix_cacheable(spec)]
+                    if vllm_version_is("0.33.0")
+                    else [i for i, group in enumerate(groups) if group.prefix_cacheable],
                     dtype=torch.int32,
                     device=self.device,
                 ),

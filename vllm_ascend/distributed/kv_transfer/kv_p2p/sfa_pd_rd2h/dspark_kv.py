@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.utils import vllm_version_is
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -104,11 +105,19 @@ class DraftKVCacheMetadata:
 def build_draft_kv_metadata(kv_cache_config: Any, kv_caches: Mapping[str, Any]) -> dict[str, DraftKVCacheMetadata]:
     """Use loader-owned names; never infer draft ownership from layer numbers."""
     names = tuple(getattr(kv_cache_config, "dspark_draft_layer_names", ()))
-    groups = {
-        name: (group_id, group.kv_cache_spec.block_size)
-        for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-        for name in group.layer_names
-    }
+    groups = (
+        {
+            name: (group_id, group.kv_cache_spec.block_size)
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
+        if vllm_version_is("0.33.0")
+        else {
+            name: (group_id, group.block_size)
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for name in group.layer_names
+        }
+    )
     result = {}
     for name in names:
         if name not in kv_caches or name not in groups:

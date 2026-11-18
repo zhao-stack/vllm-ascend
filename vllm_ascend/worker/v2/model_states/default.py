@@ -29,7 +29,13 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_dp_group
 from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
@@ -37,6 +43,10 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import get_ascend_config
+
+if not vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h import get_prebound_copy_sfa_slots
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.copy_sfa_topk_slots import CopySfaRequestStates
 from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.request_identity import RequestIdentityRegistry
@@ -167,7 +177,11 @@ class AscendModelState(DefaultModelState):
         self._decoder_replay_builders.clear()
         for group_id, groups in enumerate(attn_groups):
             for group in groups:
-                if not isinstance(group.kv_cache_spec, CircularBufferSpec):
+                if (
+                    not isinstance(group.kv_cache_spec, CircularBufferSpec)
+                    if vllm_version_is("0.33.0")
+                    else not is_circular_kv_cache_spec(group.kv_cache_spec)
+                ):
                     builder_cls = group.backend.get_builder_cls()
                     if issubclass(builder_cls, AscendDSAV41MetadataBuilder):
                         builder = builder_cls(group.kv_cache_spec, group.layer_names, self.vllm_config, self.device)

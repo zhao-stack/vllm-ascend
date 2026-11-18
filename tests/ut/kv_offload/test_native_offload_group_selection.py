@@ -17,12 +17,20 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
     get_offloading_group_ids,
 )
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupRole,
-    KVCacheGroupSpec,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupRole
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.kv_offload.base import CanonicalKVCaches
 
 import vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.native.offloading_connector as connector_mod
@@ -38,8 +46,8 @@ HEAD_SIZE = 3
 DTYPE = torch.bfloat16
 
 
-def _attention_spec() -> FullAttentionSpec:
-    return FullAttentionSpec(
+def _attention_spec() -> AttentionSpec:
+    return AttentionSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=1,
         head_size=HEAD_SIZE,
@@ -53,17 +61,25 @@ def _group(
     enable_kv_transfer: bool = True,
     spec: object | None = None,
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT,
-) -> KVCacheGroupSpec:
-    return KVCacheGroupSpec(
-        layer_names=[layer_name],
-        kv_cache_spec=_attention_spec() if spec is None else spec,
-        enable_kv_transfer=enable_kv_transfer,
-        role=role,
+) -> KVCacheGroup:
+    return (
+        KVCacheGroup(
+            layer_names=[layer_name],
+            kv_cache_spec=_attention_spec() if spec is None else spec,
+            enable_kv_transfer=enable_kv_transfer,
+            role=role,
+        )
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers(
+            dict.fromkeys([layer_name], FullAttentionManager.layer_config(_attention_spec() if spec is None else spec)),
+            enable_kv_transfer=enable_kv_transfer,
+            role=role,
+        )
     )
 
 
 def _config(
-    groups: list[KVCacheGroupSpec],
+    groups: list[KVCacheGroup],
     *,
     hisparse_host_num_blocks: int | None = None,
 ) -> KVCacheConfig:
@@ -140,7 +156,13 @@ def test_hisparse_bf16_offloading_preserves_shared_slab_stride(
         head_size=HEAD_SIZE,
         dtype=DTYPE,
     )
-    group = KVCacheGroupSpec(names, spec, role=KVCacheGroupRole.HISPARSE_INDEXER)
+    group = (
+        KVCacheGroup(names, spec, role=KVCacheGroupRole.HISPARSE_INDEXER)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers(
+            dict.fromkeys(names, FullAttentionManager.layer_config(spec)), role=KVCacheGroupRole.HISPARSE_INDEXER
+        )
+    )
     worker, captured = _prepare_worker(monkeypatch, _config([group], hisparse_host_num_blocks=8))
     forward_context = {name: SimpleNamespace() for name in names}
     worker.vllm_config = SimpleNamespace(compilation_config=SimpleNamespace(static_forward_context=forward_context))

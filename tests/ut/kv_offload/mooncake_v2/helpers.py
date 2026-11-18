@@ -2,22 +2,25 @@
 """Shared builders for refactored Mooncake connector tests."""
 
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import torch
-from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
-    KVCacheTensor,
-    MambaSpec,
-    SlidingWindowSpec,
-)
+from vllm.v1.kv_cache_interface import KVCacheTensor, MambaSpec
 
-from vllm_ascend.core.kv_cache_interface import (
-    AscendIndexerKPoolTailSpec,
-    AscendSFAIndexerCacheSpec,
-)
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, SlidingWindowSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, AscendSFAIndexerCacheSpec
+
+if not vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import AscendCircularBufferSpec
+
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.metadata import (
     MooncakePCPTransferMetadata,
     MooncakePPTransferMetadata,
@@ -33,24 +36,36 @@ def make_kv_cache_tensor(
     return KVCacheTensor(size=size, layers=layers, layer_stride=layer_stride, block_stride=block_stride, offset=offset)
 
 
-def make_full_spec(block_size: int = 16, num_kv_heads: int = 1) -> FullAttentionSpec:
-    return FullAttentionSpec(
+def make_full_spec(block_size: int = 16, num_kv_heads: int = 1) -> AttentionSpec:
+    return AttentionSpec(
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=8,
         head_size_v=8,
         dtype=torch.float16,
+        **cast(dict[str, Any], {} if vllm_version_is("0.33.0") else {"dcp_sharded": True}),
     )
 
 
-def make_sliding_spec(block_size: int = 16) -> SlidingWindowSpec:
-    return SlidingWindowSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=8,
-        dtype=torch.float16,
-        sliding_window=64,
-        dcp_sharded=False,
+def make_sliding_spec(block_size: int = 16) -> AttentionSpec:
+    return (
+        SlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            **cast(dict[str, Any], {"sliding_window": 64}),
+            dcp_sharded=False,
+        )
+        if vllm_version_is("0.33.0")
+        else AttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float16,
+            **cast(dict[str, Any], {}),
+            dcp_sharded=False,
+        )
     )
 
 
@@ -62,14 +77,26 @@ def make_mamba_spec(block_size: int = 16) -> MambaSpec:
     )
 
 
-def make_circular_spec(block_size: int = 16) -> CircularBufferSpec:
-    return CircularBufferSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=8,
-        head_size_v=0,
-        dtype=torch.float32,
-    )
+if vllm_version_is("0.33.0"):
+
+    def make_circular_spec(block_size: int = 16) -> CircularBufferSpec:
+        return CircularBufferSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            head_size_v=0,
+            dtype=torch.float32,
+        )
+else:
+
+    def make_circular_spec(block_size: int = 16) -> AscendCircularBufferSpec:
+        return AscendCircularBufferSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=8,
+            head_size_v=0,
+            dtype=torch.float32,
+        )
 
 
 def make_kpool_tail_spec(block_size: int = 16) -> AscendIndexerKPoolTailSpec:
@@ -79,7 +106,7 @@ def make_kpool_tail_spec(block_size: int = 16) -> AscendIndexerKPoolTailSpec:
         num_kv_heads=1,
         head_size=8,
         dtype=torch.float32,
-        sliding_window=8,
+        **cast(dict[str, Any], {"sliding_window": 8} if vllm_version_is("0.33.0") else {}),
         compress_ratio=8,
     )
 

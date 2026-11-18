@@ -8,13 +8,17 @@ from vllm.logger import logger
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    MambaSpec,
-    RSWASpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager, RSWAManager, SlidingWindowManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import MambaSpec, RSWASpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
@@ -103,21 +107,30 @@ class BaseKVPoolScheduler(ABC):
         self.use_eagle = use_eagle_fn() is True if callable(use_eagle_fn) else False
         self.original_block_size = infer_group_block_sizes(vllm_config.cache_config.block_size, kv_cache_groups)
         self.cacheable_group_ids = infer_cacheable_group_ids(kv_cache_groups)
-        self.swa_group_ids = {
-            group_id
-            for group_id in self.cacheable_group_ids
-            if kv_cache_groups is not None
-            and (
-                isinstance(kv_cache_groups[group_id].kv_cache_spec, (SlidingWindowSpec, RSWASpec))
-                or (
-                    isinstance(kv_cache_groups[group_id].kv_cache_spec, UniformTypeKVCacheSpecs)
-                    and any(
-                        isinstance(spec, (SlidingWindowSpec, RSWASpec))
-                        for spec in kv_cache_groups[group_id].kv_cache_spec.kv_cache_specs.values()
+        self.swa_group_ids = (
+            {
+                group_id
+                for group_id in self.cacheable_group_ids
+                if kv_cache_groups is not None
+                and (
+                    isinstance(kv_cache_groups[group_id].kv_cache_spec, (SlidingWindowSpec, RSWASpec))
+                    or (
+                        isinstance(kv_cache_groups[group_id].kv_cache_spec, UniformTypeKVCacheSpecs)
+                        and any(
+                            isinstance(spec, (SlidingWindowSpec, RSWASpec))
+                            for spec in kv_cache_groups[group_id].kv_cache_spec.kv_cache_specs.values()
+                        )
                     )
                 )
-            )
-        }
+            }
+            if vllm_version_is("0.33.0")
+            else {
+                group_id
+                for group_id in self.cacheable_group_ids
+                if kv_cache_groups is not None
+                and issubclass(kv_cache_groups[group_id].manager_cls, (SlidingWindowManager, RSWAManager))
+            }
+        )
         cacheable_block_sizes = [self.original_block_size[i] for i in self.cacheable_group_ids]
         self.grouped_block_size = [block_size * self.dcp_size for block_size in self.original_block_size]
         requested_hash_block_size = vllm_config.cache_config.prefix_match_unit
@@ -231,17 +244,49 @@ class BaseKVPoolScheduler(ABC):
 
         num_speculative_blocks_by_group: dict[int, int] = {}
         for group_id, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
-            if not isinstance(kv_cache_spec, MambaSpec):
-                continue
-            if getattr(kv_cache_spec, "mamba_cache_mode", None) != "align":
-                raise NotImplementedError(
-                    "AscendStore hybrid linear-attention support currently requires mamba_cache_mode='align'."
-                )
-            if self.use_hybrid:
-                num_speculative_blocks_by_group[group_id] = kv_cache_spec.num_speculative_blocks
+            if vllm_version_is("0.33.0"):
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+            else:
+                params = kv_cache_group.manager_config.params
+
+            if (
+                isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
+                if vllm_version_is("0.33.0")
+                else not isinstance(params, MambaManager.Params)
+            ):
+                if vllm_version_is("0.33.0"):
+                    kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
+                else:
+                    continue
+
+            if (
+                not isinstance(kv_cache_spec, MambaSpec)
+                if vllm_version_is("0.33.0")
+                else params.mamba_cache_mode != "align"
+            ):
+                if vllm_version_is("0.33.0"):
+                    continue
+                else:
+                    raise NotImplementedError(
+                        "AscendStore hybrid linear-attention support currently requires mamba_cache_mode='align'."
+                    )
+
+            if (
+                getattr(kv_cache_spec, "mamba_cache_mode", None) != "align"
+                if vllm_version_is("0.33.0")
+                else self.use_hybrid
+            ):
+                if vllm_version_is("0.33.0"):
+                    raise NotImplementedError(
+                        "AscendStore hybrid linear-attention support currently requires mamba_cache_mode='align'."
+                    )
+                else:
+                    num_speculative_blocks_by_group[group_id] = params.num_speculative_blocks
+
+            if vllm_version_is("0.33.0"):
+                if self.use_hybrid:
+                    num_speculative_blocks_by_group[group_id] = kv_cache_spec.num_speculative_blocks
+
         return num_speculative_blocks_by_group
 
     def get_num_new_matched_tokens(

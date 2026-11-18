@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -11,7 +12,12 @@ import torch
 import torch_npu
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SparseCacheRole
+from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
+from vllm_ascend.utils import vllm_version_is
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, FullAttentionSpec as AttentionSpec
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, AttentionSpec as FullAttentionSpec
 
 from vllm_ascend.attention import indexer as indexer_module
 from vllm_ascend.attention.indexer import (
@@ -32,7 +38,7 @@ def _make_builder(
     num_speculative_tokens: int | None = None,
     physical_block_size: int = 128,
 ) -> AscendSFAIndexerMetadataBuilder:
-    kv_cache_spec = FullAttentionSpec(
+    kv_cache_spec = AttentionSpec(
         block_size=physical_block_size,
         num_kv_heads=1,
         head_size=160,

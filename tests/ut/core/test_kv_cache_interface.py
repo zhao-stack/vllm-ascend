@@ -9,32 +9,47 @@ import pytest
 import torch
 from vllm.v1.core.block_pool import BlockPool
 
-# vLLM #61183 moved `is_kv_cache_spec_uniform` to `kv_cache_planning` on main;
-# the v0.33.0 lane still ships it in `kv_cache_utils`.
-from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
-from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    HiddenStateCacheSpec,
-    UniformTypeKVCacheSpecs,
-    compute_layout_strides,
-)
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    # vLLM #61183 moved `is_kv_cache_spec_uniform` to `kv_cache_planning` on main;
+    # the v0.33.0 lane still ships it in `kv_cache_utils`.
+    from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
+
+from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+
+from vllm.v1.kv_cache_interface import HiddenStateCacheSpec, compute_layout_strides
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.kv_cache_layout import KVCacheLayout
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendCircularBufferSpec,
     AscendMLAAttentionSpec,
     AscendSFAIndexerCacheSpec,
-    AscendSlidingWindowMLASpec,
-    declared_kwarg,
     get_kv_cache_compression_ratio,
     get_storage_block_size,
-    register_ascend_kv_cache_specs,
     resolve_bounded_replay,
     supports_bounded_replay,
     supports_component_major_mla_pd,
 )
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import (
+        AscendSlidingWindowMLASpec,
+        declared_kwarg,
+        register_ascend_kv_cache_specs,
+    )
 
 
 def _mla_spec():
@@ -46,14 +61,16 @@ def _mla_spec():
     )
 
 
-@pytest.mark.parametrize("indexer_first", [False, True])
-def test_mixed_mla_indexer_specs_are_not_uniform(indexer_first):
-    main_spec = _mla_spec()
-    indexer_spec = AscendSFAIndexerCacheSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
-    specs = [("main", main_spec), ("indexer", indexer_spec)]
-    if indexer_first:
-        specs.reverse()
-    assert not is_kv_cache_spec_uniform(dict(specs))
+if vllm_version_is("0.33.0"):
+
+    @pytest.mark.parametrize("indexer_first", [False, True])
+    def test_mixed_mla_indexer_specs_are_not_uniform(indexer_first):
+        main_spec = _mla_spec()
+        indexer_spec = AscendSFAIndexerCacheSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+        specs = [("main", main_spec), ("indexer", indexer_spec)]
+        if indexer_first:
+            specs.reverse()
+        assert not is_kv_cache_spec_uniform(dict(specs))
 
 
 @pytest.mark.parametrize("replicas", [1, 2, 8])
@@ -85,38 +102,40 @@ def test_indexer_layout_strides_cover_replicated_keys_and_scales(
     assert spec.unpadded_page_size_bytes == spec.page_size_bytes
 
 
-def test_matching_ascend_mla_specs_merge():
-    spec = _mla_spec()
-    assert AscendMLAAttentionSpec.merge([spec, spec]) == spec
-    assert is_kv_cache_spec_uniform({"layer0": spec, "layer1": spec})
+if vllm_version_is("0.33.0"):
 
+    def test_matching_ascend_mla_specs_merge():
+        spec = _mla_spec()
+        assert AscendMLAAttentionSpec.merge([spec, spec]) == spec
+        assert is_kv_cache_spec_uniform({"layer0": spec, "layer1": spec})
 
-@pytest.mark.parametrize("draft_flags", [(False, False), (True, True), (False, True), (True, False)])
-def test_mla_merge_preserves_draft_only_ownership_without_changing_grouping(draft_flags):
-    specs = [replace(_mla_spec(), is_draft=is_draft) for is_draft in draft_flags]
+    @pytest.mark.parametrize("draft_flags", [(False, False), (True, True), (False, True), (True, False)])
+    def test_mla_merge_preserves_draft_only_ownership_without_changing_grouping(draft_flags):
+        specs = [replace(_mla_spec(), is_draft=is_draft) for is_draft in draft_flags]
 
-    merged = AscendMLAAttentionSpec.merge(specs)
+        merged = AscendMLAAttentionSpec.merge(specs)
 
-    assert merged.is_draft is all(draft_flags)
-    assert specs[0] == specs[1]
-    assert is_kv_cache_spec_uniform(dict(zip(("layer0", "layer1"), specs)))
+        assert merged.is_draft is all(draft_flags)
+        assert specs[0] == specs[1]
+        assert is_kv_cache_spec_uniform(dict(zip(("layer0", "layer1"), specs)))
 
-
-@pytest.mark.parametrize("dcp_sharded", [True, False])
-@pytest.mark.parametrize("spec_type", [AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec, AscendSlidingWindowMLASpec])
-def test_ascend_spec_merge_preserves_dcp_layout(spec_type, dcp_sharded):
-    kwargs = {"sliding_window": 128} if spec_type is AscendSlidingWindowMLASpec else {}
-    spec = spec_type(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-        dcp_sharded=dcp_sharded,
-        **kwargs,
+    @pytest.mark.parametrize("dcp_sharded", [True, False])
+    @pytest.mark.parametrize(
+        "spec_type", [AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec, AscendSlidingWindowMLASpec]
     )
-    assert spec_type.merge([spec, spec]).dcp_sharded is dcp_sharded
-    with pytest.raises(AssertionError):
-        spec_type.merge([spec, replace(spec, dcp_sharded=not dcp_sharded)])
+    def test_ascend_spec_merge_preserves_dcp_layout(spec_type, dcp_sharded):
+        kwargs = {"sliding_window": 128} if spec_type is AscendSlidingWindowMLASpec else {}
+        spec = spec_type(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            dcp_sharded=dcp_sharded,
+            **kwargs,
+        )
+        assert spec_type.merge([spec, spec]).dcp_sharded is dcp_sharded
+        with pytest.raises(AssertionError):
+            spec_type.merge([spec, replace(spec, dcp_sharded=not dcp_sharded)])
 
 
 @pytest.mark.parametrize("dcp_sharded,expected_blocks", [(True, 3), (False, 9)])
@@ -135,9 +154,9 @@ def test_get_storage_block_size_and_dcp_memory():
     # None. Ascend derives physical rows from block_size / compression ratio.
     expected = spec.block_size // get_kv_cache_compression_ratio(spec)
     assert get_storage_block_size(spec) == expected
-
-    uniform = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"layer": spec})
-    assert get_storage_block_size(uniform) == expected
+    if vllm_version_is("0.33.0"):
+        uniform = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs={"layer": spec})
+        assert get_storage_block_size(uniform) == expected
 
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(max_model_len=128),
@@ -155,45 +174,70 @@ def test_get_storage_block_size_for_plain_mla_subclass():
     assert get_storage_block_size(spec) == expected
 
 
-def test_sliding_window_mla_storage_and_page_size():
-    spec = AscendSlidingWindowMLASpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-        sliding_window=64,
-    )
-    assert spec.storage_block_size == 16
-    assert spec.real_page_size_bytes == 16 * 128 * 2
+if vllm_version_is("0.33.0"):
 
+    def test_sliding_window_mla_storage_and_page_size():
+        spec = AscendSlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=64,
+        )
+        assert spec.storage_block_size == 16
+        assert spec.real_page_size_bytes == 16 * 128 * 2
 
-@pytest.mark.parametrize("ascend", [False, True])
-@pytest.mark.parametrize("zeroing", [False, True])
-def test_circular_registry_preserves_spec_and_reports_recycled_pages(ascend, zeroing):
-    from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
+    @pytest.mark.parametrize("ascend", [False, True])
+    @pytest.mark.parametrize("zeroing", [False, True])
+    def test_circular_registry_preserves_spec_and_reports_recycled_pages(ascend, zeroing):
+        from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
 
-    register_all_kvcache_specs(None)
-    register_ascend_kv_cache_specs()
-    spec_type = AscendCircularBufferSpec if ascend else CircularBufferSpec
-    spec = spec_type(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
-    merged = spec_type.merge([spec, spec])
-    assert type(merged) is spec_type
-    assert KVCacheSpecRegistry.get_uniform_type_base_spec(merged) is spec_type
-    manager_type = KVCacheSpecRegistry.get_manager_class(merged)
-    assert manager_type is (AscendCircularBufferManager if ascend else CircularBufferManager)
-    pool = BlockPool(4, False, 32)
-    # Reuse physical IDs released by another cache group.
-    old_blocks = pool.get_new_blocks(pool.get_num_free_blocks())
-    old_ids = {block.block_id for block in old_blocks}
-    pool.free_blocks(old_blocks)
-    manager = manager_type(merged, pool, False, 0, scheduler_block_size=32, needs_kv_cache_zeroing=zeroing)
-    blocks = manager.allocate_new_blocks("request", 1, 1)
-    assert len(blocks) == 1 and blocks[0].block_id in old_ids
-    assert manager.new_block_ids == ([blocks[0].block_id] if ascend and zeroing else [])
-    assert manager.allocate_new_blocks("request", 2, 2) == []
-    assert not spec.prefix_cacheable and not spec.uses_slot_mapping
-    manager.free("request")
-    assert pool.get_num_free_blocks() == len(old_ids)
+        register_all_kvcache_specs(None)
+        register_ascend_kv_cache_specs()
+        spec_type = AscendCircularBufferSpec if ascend else CircularBufferSpec
+        spec = spec_type(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
+        merged = spec_type.merge([spec, spec])
+        assert type(merged) is spec_type
+        assert KVCacheSpecRegistry.get_uniform_type_base_spec(merged) is spec_type
+        manager_type = KVCacheSpecRegistry.get_manager_class(merged)
+        assert manager_type is (AscendCircularBufferManager if ascend else CircularBufferManager)
+        pool = BlockPool(4, False, 32)
+        # Reuse physical IDs released by another cache group.
+        old_blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+        old_ids = {block.block_id for block in old_blocks}
+        pool.free_blocks(old_blocks)
+        manager = manager_type(merged, pool, False, 0, scheduler_block_size=32, needs_kv_cache_zeroing=zeroing)
+        blocks = manager.allocate_new_blocks("request", 1, 1)
+        assert len(blocks) == 1 and blocks[0].block_id in old_ids
+        assert manager.new_block_ids == ([blocks[0].block_id] if ascend and zeroing else [])
+        assert manager.allocate_new_blocks("request", 2, 2) == []
+        assert not spec.prefix_cacheable and not spec.uses_slot_mapping
+        manager.free("request")
+        assert pool.get_num_free_blocks() == len(old_ids)
+else:
+
+    @pytest.mark.parametrize("ascend", [False, True])
+    @pytest.mark.parametrize("zeroing", [False, True])
+    def test_circular_group_preserves_spec_and_reports_recycled_pages(ascend, zeroing):
+        from vllm_ascend.core.single_type_kv_cache_manager import AscendCircularBufferManager
+
+        spec_type = AscendCircularBufferSpec if ascend else AttentionSpec
+        spec = spec_type(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
+        manager_type = AscendCircularBufferManager if ascend else CircularBufferManager
+        group = KVCacheGroup.from_layers({"ring": manager_type.layer_config(spec)})
+        pool = BlockPool(4, False, 32)
+        # Reuse physical IDs released by another cache group.
+        old_blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+        old_ids = {block.block_id for block in old_blocks}
+        pool.free_blocks(old_blocks)
+        manager = manager_type(group, pool, False, 0, scheduler_block_size=32, needs_kv_cache_zeroing=zeroing)
+        blocks = manager.allocate_new_blocks("request", 1, 1)
+        assert len(blocks) == 1 and blocks[0].block_id in old_ids
+        assert manager.new_block_ids == ([blocks[0].block_id] if ascend and zeroing else [])
+        assert manager.allocate_new_blocks("request", 2, 2) == []
+        assert not group.prefix_cacheable and not group.uses_slot_mapping
+        manager.free("request")
+        assert pool.get_num_free_blocks() == len(old_ids)
 
 
 def test_component_major_mla_pd_gate():
@@ -226,87 +270,82 @@ def test_component_major_mla_pd_gate():
     assert not supports_component_major_mla_pd(config)
 
 
-# --- the fields a hand-rebuilt spec has to carry -----------------------------
+if vllm_version_is("0.33.0"):
+    # --- the fields a hand-rebuilt spec has to carry -----------------------------
 
+    def _swa_spec(**overrides):
+        return AscendSlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=128,
+            dtype=torch.bfloat16,
+            sliding_window=64,
+            **overrides,
+        )
 
-def _swa_spec(**overrides):
-    return AscendSlidingWindowMLASpec(
-        block_size=16,
-        num_kv_heads=1,
-        head_size=128,
-        dtype=torch.bfloat16,
-        sliding_window=64,
-        **overrides,
-    )
+    def test_sliding_window_mla_merge_carries_bounded_replay():
+        """The Ascend override rebuilds the merged spec instead of calling the
+        parent's ``merge``, so upstream's field has to be carried across by hand:
+        dropping it would leave a multi-layer group replaying nothing while its
+        layers asked to, and nothing would report it -- ``prefix_cacheable`` and
+        ``prefix_replay_tokens`` are derived from the field, so the group would
+        simply look like an ordinary sliding-window one."""
+        merged = AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=True)])
+        assert merged.bounded_replay
+        assert not merged.prefix_cacheable
+        assert merged.prefix_replay_tokens == merged.sliding_window == 64
 
+        ordinary = AscendSlidingWindowMLASpec.merge([_swa_spec(), _swa_spec()])
+        assert not ordinary.bounded_replay
+        assert ordinary.prefix_replay_tokens == 0
 
-def test_sliding_window_mla_merge_carries_bounded_replay():
-    """The Ascend override rebuilds the merged spec instead of calling the
-    parent's ``merge``, so upstream's field has to be carried across by hand:
-    dropping it would leave a multi-layer group replaying nothing while its
-    layers asked to, and nothing would report it -- ``prefix_cacheable`` and
-    ``prefix_replay_tokens`` are derived from the field, so the group would
-    simply look like an ordinary sliding-window one."""
-    merged = AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=True)])
-    assert merged.bounded_replay
-    assert not merged.prefix_cacheable
-    assert merged.prefix_replay_tokens == merged.sliding_window == 64
+        with pytest.raises(AssertionError, match="replay policy"):
+            AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=False)])
 
-    ordinary = AscendSlidingWindowMLASpec.merge([_swa_spec(), _swa_spec()])
-    assert not ordinary.bounded_replay
-    assert ordinary.prefix_replay_tokens == 0
+    def test_sliding_window_mla_merge_carries_the_retained_token_count():
+        """The same failure mode as the replay flag, one field over: this override
+        rebuilds the merged spec by hand, so anything it forgets is silently reset
+        to its default -- here the window would come out narrower than the layers
+        asked for, and the blocks of the extra trailing tokens would be dropped
+        even though they are what the next request's hit resumes from."""
+        if not declared_kwarg(AscendSlidingWindowMLASpec, "extra_retained_tokens", 8):
+            pytest.skip("extra_retained_tokens is absent from this baseline's SlidingWindowSpec.")
 
-    with pytest.raises(AssertionError, match="replay policy"):
-        AscendSlidingWindowMLASpec.merge([_swa_spec(bounded_replay=True), _swa_spec(bounded_replay=False)])
+        merged = AscendSlidingWindowMLASpec.merge(
+            [_swa_spec(extra_retained_tokens=8), _swa_spec(extra_retained_tokens=8)]
+        )
 
+        assert merged.extra_retained_tokens == 8
 
-def test_sliding_window_mla_merge_carries_the_retained_token_count():
-    """The same failure mode as the replay flag, one field over: this override
-    rebuilds the merged spec by hand, so anything it forgets is silently reset
-    to its default -- here the window would come out narrower than the layers
-    asked for, and the blocks of the extra trailing tokens would be dropped
-    even though they are what the next request's hit resumes from."""
-    if not declared_kwarg(AscendSlidingWindowMLASpec, "extra_retained_tokens", 8):
-        pytest.skip("extra_retained_tokens is absent from this baseline's SlidingWindowSpec.")
+        with pytest.raises(AssertionError, match="retained token count"):
+            AscendSlidingWindowMLASpec.merge([_swa_spec(extra_retained_tokens=8), _swa_spec(extra_retained_tokens=4)])
 
-    merged = AscendSlidingWindowMLASpec.merge([_swa_spec(extra_retained_tokens=8), _swa_spec(extra_retained_tokens=8)])
+    # --- the field a pinned baseline may not have yet ----------------------------
 
-    assert merged.extra_retained_tokens == 8
+    class _WithoutTheField:
+        def __init__(self, head_dim: int = 1):
+            self.head_dim = head_dim
 
-    with pytest.raises(AssertionError, match="retained token count"):
-        AscendSlidingWindowMLASpec.merge([_swa_spec(extra_retained_tokens=8), _swa_spec(extra_retained_tokens=4)])
+    class _WithTheField:
+        def __init__(self, head_dim: int = 1, bounded_replay: bool = False):
+            self.head_dim = head_dim
+            self.bounded_replay = bounded_replay
 
+    def test_the_kwarg_is_spelled_out_only_for_a_constructor_that_takes_it():
+        """Naming it unconditionally is a ``TypeError`` on a baseline pinned before
+        #56227, not a harmless extra, so the probe has to be the constructor's
+        parameters rather than the caller's intent."""
+        assert declared_kwarg(_WithoutTheField, "bounded_replay", True) == {}
+        assert declared_kwarg(_WithTheField, "bounded_replay", True) == {"bounded_replay": True}
+        assert declared_kwarg(_WithTheField, "bounded_replay", False) == {"bounded_replay": False}
 
-# --- the field a pinned baseline may not have yet ----------------------------
+    def test_the_swa_spec_accepts_whatever_the_probe_returns():
+        """Whatever the pinned vLLM takes, this is the call the merge path makes."""
+        replaying = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", True))
+        plain = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", False))
 
-
-class _WithoutTheField:
-    def __init__(self, head_dim: int = 1):
-        self.head_dim = head_dim
-
-
-class _WithTheField:
-    def __init__(self, head_dim: int = 1, bounded_replay: bool = False):
-        self.head_dim = head_dim
-        self.bounded_replay = bounded_replay
-
-
-def test_the_kwarg_is_spelled_out_only_for_a_constructor_that_takes_it():
-    """Naming it unconditionally is a ``TypeError`` on a baseline pinned before
-    #56227, not a harmless extra, so the probe has to be the constructor's
-    parameters rather than the caller's intent."""
-    assert declared_kwarg(_WithoutTheField, "bounded_replay", True) == {}
-    assert declared_kwarg(_WithTheField, "bounded_replay", True) == {"bounded_replay": True}
-    assert declared_kwarg(_WithTheField, "bounded_replay", False) == {"bounded_replay": False}
-
-
-def test_the_swa_spec_accepts_whatever_the_probe_returns():
-    """Whatever the pinned vLLM takes, this is the call the merge path makes."""
-    replaying = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", True))
-    plain = _swa_spec(**declared_kwarg(AscendSlidingWindowMLASpec, "bounded_replay", False))
-
-    assert replaying.bounded_replay
-    assert not plain.bounded_replay
+        assert replaying.bounded_replay
+        assert not plain.bounded_replay
 
 
 # --- which layers may declare a replay window --------------------------------

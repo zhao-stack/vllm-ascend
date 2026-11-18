@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -15,7 +15,19 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
     MambaSpecDecodeGPUContext,
@@ -160,12 +172,18 @@ def _make_kv_cache_config(cfg: _TestConfig, layer_names: list[str]) -> KVCacheCo
         block_size=cfg.block_size,
         shapes=((cfg.conv_width, cfg.conv_inner_dim), (cfg.temporal_state_dim,)),
         dtypes=(cfg.dtype, cfg.dtype),
-        mamba_cache_mode="all",
+        **cast(dict[str, Any], {"mamba_cache_mode": "all"} if vllm_version_is("0.33.0") else {}),
     )
     return KVCacheConfig(
         num_blocks=cfg.num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=mamba_spec)],
+        kv_cache_groups=[
+            KVCacheGroup(layer_names=layer_names, kv_cache_spec=mamba_spec)
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(
+                dict.fromkeys(layer_names, MambaManager.layer_config(mamba_spec, mamba_cache_mode="all"))
+            )
+        ],
     )
 
 

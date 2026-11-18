@@ -11,19 +11,25 @@ from vllm.config import AttentionConfig
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.selector import AttentionSelectorConfig
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend
 from vllm_ascend.attention.fa_v1 import AscendFlashAttentionBackend, AscendFlashAttentionImpl
 from vllm_ascend.models.minimax_m3 import msa_m3
-from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2 import attn_utils
 
 
 @pytest.mark.parametrize("head_size", [64, 72, 128, 192, 256])
 @pytest.mark.parametrize("padding", [None, 64, 1048576])
 def test_flash_attn_physical_cache_budget(head_size, padding):
-    original = FullAttentionSpec(
+    original = AttentionSpec(
         block_size=128, num_kv_heads=8, head_size=head_size, dtype=torch.bfloat16, page_size_padded=padding
     )
     physical = AscendFlashAttentionBackend.customize_spec(original)

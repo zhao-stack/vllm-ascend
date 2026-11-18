@@ -11,7 +11,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
     OffloadingConnector,
 )
 from vllm.utils.math_utils import round_up
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.kv_offload.base import CanonicalKVCaches, OffloadingWorker
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -232,7 +245,7 @@ def test_ascend_connector_worker_accepts_separate_kv_tensors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer_name = "model.layers.0.self_attn"
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=2,
         num_kv_heads=1,
         head_size=3,
@@ -240,9 +253,12 @@ def test_ascend_connector_worker_accepts_separate_kv_tensors(
     )
     kv_cache_config = SimpleNamespace(
         num_blocks=4,
-        kv_cache_groups=[KVCacheGroupSpec([layer_name], spec)],
+        kv_cache_groups=[
+            KVCacheGroup([layer_name], spec)
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(dict.fromkeys([layer_name], FullAttentionManager.layer_config(spec)))
+        ],
         kv_cache_tensors=[],
-        # The connector offloads the groups vLLM selects, not all of them.
         prefix_cacheable_group_ids=(0,),
         hisparse_host_num_blocks=None,
     )

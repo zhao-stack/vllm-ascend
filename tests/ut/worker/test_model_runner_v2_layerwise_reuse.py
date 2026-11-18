@@ -3,13 +3,21 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheTensor,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.worker.v2 import attn_utils
@@ -19,7 +27,7 @@ from vllm_ascend.worker.v2 import attn_utils
 @pytest.mark.parametrize("zero_stride", [False, True])
 @pytest.mark.parametrize("cache_kind", ["full", "sfa_c8", "indexer", "indexer_scale", "indexer_mixed"])
 def test_real_allocator_aliases_only_planned_slots(monkeypatch, reuse_enabled, zero_stride, cache_kind):
-    spec = FullAttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16)
+    spec = AttentionSpec(block_size=2, num_kv_heads=1, head_size=4, dtype=torch.float16)
     if cache_kind == "sfa_c8":
         spec = AscendMLAAttentionSpec(
             block_size=2,
@@ -70,9 +78,10 @@ def test_real_allocator_aliases_only_planned_slots(monkeypatch, reuse_enabled, z
             )
         ],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                layer_names=names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
+            KVCacheGroup(layer_names=names, kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs))
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(
+                {name: FullAttentionManager.layer_config(spec) for name, spec in specs.items()}
             )
         ],
     )

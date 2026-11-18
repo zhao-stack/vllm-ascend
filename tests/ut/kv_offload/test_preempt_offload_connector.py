@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import sys
 import types
 from contextlib import nullcontext
@@ -11,14 +13,21 @@ import pytest
 import torch
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    MambaSpec,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.outputs import KVConnectorOutput
 
 from tests.ut.core.test_dyntra_lb_scheduler import make_dyntra_test_config
@@ -58,6 +67,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.preempt_offload.work
     MambaConvCacheBinding,
     PreemptOffloadWorker,
 )
+
+if not vllm_version_is("0.33.0"):
+    from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager  # noqa: E402
+
 
 for _module_name, _module in _saved_modules.items():
     sys.modules[_module_name] = _module
@@ -1154,7 +1167,7 @@ def test_worker_keeps_mamba_views_separate_from_attention(reverse, attention_sca
 @pytest.mark.parametrize("glm_tail", [False, True])
 @pytest.mark.parametrize("uniform", [False, True])
 @pytest.mark.parametrize("load_start", [0, 48])
-def test_preempt_offload_ring_uses_single_private_block(glm_tail, uniform, load_start):
+def _release_test_preempt_offload_ring_uses_single_private_block(glm_tail, uniform, load_start):
     if glm_tail:
         spec = AscendIndexerKPoolTailSpec(
             block_size=4,
@@ -1203,6 +1216,61 @@ def test_preempt_offload_ring_uses_single_private_block(glm_tail, uniform, load_
     )
     assert state.load_transfer_meta == TransferMeta([30], [101])
     scheduler._gpu_block_pool.touch.assert_called_once_with(["gpu30"])
+
+
+@pytest.mark.parametrize("glm_tail", [False, True])
+@pytest.mark.parametrize("load_start", [0, 48])
+def test_preempt_offload_ring_uses_single_private_block(glm_tail, load_start):
+    if glm_tail:
+        spec = AscendIndexerKPoolTailSpec(
+            block_size=4,
+            ring_capacity=16,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.float32,
+            compress_ratio=4,
+        )
+    else:
+        spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
+    manager = KpoolTailManager if glm_tail else CircularBufferManager
+    group = KVCacheGroup.from_layers({"ring": manager.layer_config(spec)})
+    config = SimpleNamespace(kv_cache_groups=[group])
+    scheduler = PreemptOffloadScheduler.__new__(PreemptOffloadScheduler)
+    scheduler.dcp_world_size = 1
+    scheduler.cpu_kv_cache_config = config
+    scheduler._group_is_sliding_window = scheduler._get_group_is_sliding_window(config)
+    scheduler._group_is_mamba = [False]
+    scheduler.enable_offload_prefix_caching = True
+    scheduler._pending_hash_blocks = {}
+    scheduler._preempted_req_states = {}
+    scheduler._gpu_block_pool = SimpleNamespace(
+        blocks={20: SimpleNamespace(block_id=20, block_hash="unused-ring-hash"), 30: "gpu30"},
+        touch=MagicMock(),
+    )
+    scheduler.cpu_block_pool = SimpleNamespace(
+        get_num_free_blocks=MagicMock(return_value=8),
+        get_new_blocks=MagicMock(return_value=[SimpleNamespace(block_id=101, _block_hash=None)]),
+        cached_block_hash_to_block=SimpleNamespace(get_one_block=MagicMock()),
+    )
+    assert scheduler._create_preempt_state("req", ([20],), 64)
+    state = scheduler._preempted_req_states["req"]
+    assert state.cpu_block_ids == ([101],)
+    assert state.store_transfer_meta == TransferMeta([20], [101])
+    scheduler.cpu_block_pool.get_new_blocks.assert_called_once_with(1)
+    scheduler.cpu_block_pool.cached_block_hash_to_block.get_one_block.assert_not_called()
+    state.ready = True
+    state.load_start_tokens = load_start
+    assert scheduler._prepare_preempt_load_after_alloc(
+        SimpleNamespace(request_id="req"),
+        ([30],),
+        num_external_tokens=64 - load_start,
+    )
+    assert state.load_transfer_meta == TransferMeta([30], [101])
+    scheduler._gpu_block_pool.touch.assert_called_once_with(["gpu30"])
+
+
+if vllm_version_is("0.33.0"):
+    test_preempt_offload_ring_uses_single_private_block = _release_test_preempt_offload_ring_uses_single_private_block  # type: ignore[assignment, misc]
 
 
 @pytest.mark.parametrize("difference", [None, "shape", "stride", "dtype", "scale", "pointer", "role"])
@@ -1316,15 +1384,19 @@ def test_pcp_offload_local_round_trip_waits_for_all_workers(pcp, tp, pp, dcp, sh
         num_blocks=8,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
+            KVCacheGroup(
                 ["layer"],
-                FullAttentionSpec(
-                    block_size=384,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype=torch.float16,
-                    dcp_sharded=sharded,
-                ),
+                AttentionSpec(block_size=384, num_kv_heads=1, head_size=1, dtype=torch.float16, dcp_sharded=sharded),
+            )
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(
+                {
+                    "layer": FullAttentionManager.layer_config(
+                        AttentionSpec(
+                            block_size=384, num_kv_heads=1, head_size=1, dtype=torch.float16, dcp_sharded=sharded
+                        )
+                    )
+                }
             )
         ],
     )

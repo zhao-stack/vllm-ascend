@@ -23,15 +23,16 @@ from vllm.distributed.parallel_state import (
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheSpec,
-    MambaSpec,
-    MLAAttentionSpec,
-    SlidingWindowMLASpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec, MLAAttentionSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec, is_circular_kv_cache_spec
@@ -391,14 +392,20 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
         self.layer_name_to_spec_index: dict[str, int] = {}
 
         for group_index, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            group_spec = group.kv_cache_spec
+            if vllm_version_is("0.33.0"):
+                group_spec = group.kv_cache_spec
+
             group_spec_indices: list[int] = []
 
             for layer_name in group.layer_names:
-                if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                    layer_spec = group_spec.kv_cache_specs[layer_name]
+                if vllm_version_is("0.33.0"):
+                    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                        layer_spec = group_spec.kv_cache_specs[layer_name]
+                    else:
+                        layer_spec = group_spec
                 else:
-                    layer_spec = group_spec
+                    layer_spec = group.kv_cache_specs[layer_name]
+
                 spec_index = next(
                     (index for index in group_spec_indices if self.kv_cache_specs[index] == layer_spec),
                     -1,
@@ -478,8 +485,12 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
         """Describe single-head NHD as byte-equivalent HND without changing the cache."""
         shape = tuple(cache.shape[1:])
         if (
-            not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec))
+            not isinstance(spec, (AttentionSpec, SlidingWindowSpec))
             or isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec, AscendSFAIndexerCacheSpec))
+            or is_circular_kv_cache_spec(spec)
+            if vllm_version_is("0.33.0")
+            else not isinstance(spec, AttentionSpec)
+            or isinstance(spec, (MLAAttentionSpec, AscendSFAIndexerCacheSpec))
             or is_circular_kv_cache_spec(spec)
         ):
             return shape
@@ -554,7 +565,10 @@ class MooncakeBaseConnectorWorker(MooncakeTransferAddressMixin):
                 caches = as_kv_cache_tensors(cache_or_caches)
                 shared_page_metadata = (
                     self._get_shared_page_metadata(caches)
-                    if isinstance(spec, (MLAAttentionSpec, SlidingWindowMLASpec))
+                    if isinstance(
+                        spec,
+                        (MLAAttentionSpec, SlidingWindowMLASpec) if vllm_version_is("0.33.0") else MLAAttentionSpec,
+                    )
                     else None
                 )
                 if shared_page_metadata is not None and _is_component_major_mla_binding(spec, caches):

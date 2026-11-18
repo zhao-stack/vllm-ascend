@@ -6,6 +6,7 @@ import ctypes
 import time
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -17,20 +18,37 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import (
-    CircularBufferSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+else:
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        CircularBufferManager,
+        FullAttentionManager,
+        SlidingWindowManager,
+    )
+
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec, UniformTypeKVCacheSpecs
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
 from tests.ut.kv_offload.utils import assert_scheduler_empty, create_model_runner_output, create_vllm_config
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec, is_prefix_cacheable
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec, is_prefix_cacheable
+
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import pool_worker
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import backend_map
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
@@ -110,21 +128,41 @@ def cache_layout(request, speculative_method):
             dtype=torch.bfloat16,
         ),
     }
-    ring = CircularBufferSpec(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
-    swa = AscendSlidingWindowMLASpec(
-        block_size=128,
-        num_kv_heads=1,
-        head_size=8,
-        dtype=torch.bfloat16,
-        sliding_window=128,
+    ring = (
+        CircularBufferSpec(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
+        if vllm_version_is("0.33.0")
+        else AttentionSpec(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
+    )
+    swa = (
+        AscendSlidingWindowMLASpec(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.bfloat16,
+            **cast(dict[str, Any], {"sliding_window": 128}),
+        )
+        if vllm_version_is("0.33.0")
+        else AscendMLAAttentionSpec(
+            block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16, **cast(dict[str, Any], {})
+        )
     )
     plan = KVCacheConfig(
         num_blocks=128,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(list(specs), UniformTypeKVCacheSpecs(block_size=128, kv_cache_specs=specs)),
-            KVCacheGroupSpec(["model.layers.0.state_cache"], ring),
-            KVCacheGroupSpec(["model.layers.0.swa_cache"], swa),
+            KVCacheGroup(list(specs), UniformTypeKVCacheSpecs(block_size=128, kv_cache_specs=specs))
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(
+                {name: FullAttentionManager.layer_config(spec) for name, spec in specs.items()}
+            ),
+            KVCacheGroup(["model.layers.0.state_cache"], ring)
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers({"model.layers.0.state_cache": CircularBufferManager.layer_config(ring)}),
+            KVCacheGroup(["model.layers.0.swa_cache"], swa)
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(
+                {"model.layers.0.swa_cache": SlidingWindowManager.layer_config(swa, sliding_window=128)}
+            ),
         ],
     )
 
@@ -132,27 +170,45 @@ def cache_layout(request, speculative_method):
         plan.kv_cache_groups.pop(1)
     if request.param == "full-attention":
         plan.kv_cache_groups.pop()
-        plan.kv_cache_groups[0].kv_cache_spec = FullAttentionSpec(
-            block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
-        )
+        if vllm_version_is("0.33.0"):
+            plan.kv_cache_groups[0].kv_cache_spec = AttentionSpec(
+                block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16
+            )
+        else:
+            dense = AttentionSpec(block_size=128, num_kv_heads=1, head_size=8, dtype=torch.bfloat16)
+            plan.kv_cache_groups[0].kv_cache_specs = dict.fromkeys(specs, dense)
+
     if speculative_method:
         draft_names = [f"mtp.{i}.self_attn" for i in range(3 if speculative_method == "dspark" else 1)]
         if request.param == "full-attention":
-            plan.kv_cache_groups[0].layer_names.extend(draft_names)
+            if vllm_version_is("0.33.0"):
+                plan.kv_cache_groups[0].layer_names.extend(draft_names)
+            else:
+                plan.kv_cache_groups[0].kv_cache_specs.update(dict.fromkeys(draft_names, dense))
+
             plan.kv_cache_groups[0].is_eagle_group = True
         else:
-            plan.kv_cache_groups.append(KVCacheGroupSpec(draft_names, swa, is_eagle_group=True))
+            plan.kv_cache_groups.append(
+                KVCacheGroup(draft_names, swa, is_eagle_group=True)
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(draft_names, SlidingWindowManager.layer_config(swa, sliding_window=128)),
+                    is_eagle_group=True,
+                )
+            )
 
     def allocate():
         caches = {}
         for group in plan.kv_cache_groups:
             for name in group.layer_names:
-                spec = group.kv_cache_spec
-                if isinstance(spec, UniformTypeKVCacheSpecs):
-                    spec = spec.kv_cache_specs[name]
+                spec = group.kv_cache_spec if vllm_version_is("0.33.0") else group.kv_cache_specs[name]
+                if vllm_version_is("0.33.0"):
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        spec = spec.kv_cache_specs[name]
+
                 rows = spec.block_size // spec.tokens_per_state
                 shape = (plan.num_blocks, rows, 1, spec.head_size)
-                planes = 2 if type(spec) is FullAttentionSpec else 1
+                planes = 2 if type(spec) is AttentionSpec else 1
                 raw = aligned_buffer(planes * int(np.prod(shape)) * torch.empty((), dtype=spec.dtype).element_size())
                 tensors = raw.view(spec.dtype).view(planes, *shape)
                 caches[name] = tuple(tensors) if planes == 2 else tensors[0]
@@ -170,7 +226,9 @@ def devices_and_store(monkeypatch):
     monkeypatch.setattr(pool_worker, "get_pcp_group", lambda: SimpleNamespace(world_size=1))
     monkeypatch.setattr(pool_worker, "get_decode_context_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(pool_worker, "get_decode_context_model_parallel_rank", lambda: 0)
-    register_all_kvcache_specs(None)
+    if vllm_version_is("0.33.0"):
+        register_all_kvcache_specs(None)
+
     init_none_hash(sha256)
     # Unix-domain socket paths have a short platform-dependent size limit.
     with TemporaryDirectory(dir="/tmp") as rpc_dir:
@@ -203,11 +261,15 @@ def test_private_only_layout_rejected(devices_and_store, role, prefix_unit):
         ),
     )
     config.cache_config.prefix_match_unit = prefix_unit
-    spec = CircularBufferSpec(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
+    spec = (
+        CircularBufferSpec(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
+        if vllm_version_is("0.33.0")
+        else AttentionSpec(block_size=32, num_kv_heads=1, head_size=16, head_size_v=0, dtype=torch.float32)
+    )
     plan = KVCacheConfig(
         num_blocks=128,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(["model.layers.0.state_cache"], spec)],
+        kv_cache_groups=[KVCacheGroup(["model.layers.0.state_cache"], spec)],
     )
     with pytest.raises(AssertionError, match="AscendStore requires at least one prefix-cacheable KV cache group"):
         KVConnectorFactory.create_connector(config, role, plan)
@@ -222,7 +284,11 @@ def test_raw_sequence_lifecycle(
     plan, allocate = cache_layout
     if len(plan.kv_cache_groups) == 1 and prefix_unit == 32:
         pytest.skip("The upstream single-group scheduler always hashes whole 128-token blocks")
-    has_private_state = any(not is_prefix_cacheable(group.kv_cache_spec) for group in plan.kv_cache_groups)
+    has_private_state = any(
+        (not is_prefix_cacheable(group.kv_cache_spec) for group in plan.kv_cache_groups)
+        if vllm_version_is("0.33.0")
+        else (not group.prefix_cacheable for group in plan.kv_cache_groups)
+    )
     config = create_vllm_config(
         max_num_batched_tokens=256,
         speculative_method=speculative_method,
@@ -295,7 +361,11 @@ def test_raw_sequence_lifecycle(
             )
             if block_ids:
                 for gid, _, _, tensor in cache_entries(plan, caches):
-                    if not is_prefix_cacheable(plan.kv_cache_groups[gid].kv_cache_spec):
+                    if (
+                        not is_prefix_cacheable(plan.kv_cache_groups[gid].kv_cache_spec)
+                        if vllm_version_is("0.33.0")
+                        else not plan.kv_cache_groups[gid].prefix_cacheable
+                    ):
                         for bid in block_ids[gid]:
                             tensor[bid].fill_(-7)
             worker.start_load_kv(SimpleNamespace() if output.total_num_scheduled_tokens else None)
@@ -315,10 +385,17 @@ def test_raw_sequence_lifecycle(
                 assert req_meta.load_spec.vllm_cached_tokens == expected_local
                 for gid, name, plane, tensor in cache_entries(plan, caches):
                     for index, bid in enumerate(block_ids[gid]):
-                        if not is_prefix_cacheable(plan.kv_cache_groups[gid].kv_cache_spec):
-                            assert torch.all(tensor[bid] == -7)
-                        elif bid and (index + 1) * 128 <= expected_hit:
-                            assert torch.all(tensor[bid] == payload_value(tokens, (index + 1) * 128, name, plane))
+                        if vllm_version_is("0.33.0"):
+                            if not is_prefix_cacheable(plan.kv_cache_groups[gid].kv_cache_spec):
+                                assert torch.all(tensor[bid] == -7)
+                            elif bid and (index + 1) * 128 <= expected_hit:
+                                assert torch.all(tensor[bid] == payload_value(tokens, (index + 1) * 128, name, plane))
+                        else:
+                            if not plan.kv_cache_groups[gid].prefix_cacheable:
+                                assert torch.all(tensor[bid] == -7)
+                            elif bid and (index + 1) * 128 <= expected_hit:
+                                assert torch.all(tensor[bid] == payload_value(tokens, (index + 1) * 128, name, plane))
+
             scheduled = output.num_scheduled_tokens.get(req_id, 0)
             if scheduled:
                 end = request.num_computed_tokens
@@ -328,7 +405,11 @@ def test_raw_sequence_lifecycle(
                 # Model-compute leaf: write deterministic CPU bytes to allocated pages.
                 input_tokens = list(request.all_token_ids) + output.scheduled_spec_decode_tokens.get(req_id, [])
                 for gid, name, plane, tensor in cache_entries(plan, caches):
-                    if not is_prefix_cacheable(plan.kv_cache_groups[gid].kv_cache_spec):
+                    if (
+                        not is_prefix_cacheable(plan.kv_cache_groups[gid].kv_cache_spec)
+                        if vllm_version_is("0.33.0")
+                        else not plan.kv_cache_groups[gid].prefix_cacheable
+                    ):
                         continue
                     for index, bid in enumerate(block_ids[gid]):
                         if bid and start < (index + 1) * 128 <= end:
@@ -436,7 +517,7 @@ def test_raw_sequence_lifecycle(
         run_request("local-prefix", producer_tokens[:seed_length], seed_hit)
         # vLLM main caches speculative blocks in the base Scheduler; only the
         # pure full-attention dspark layout sees the doubled local prefix hit.
-        only_full_attention = isinstance(plan.kv_cache_groups[0].kv_cache_spec, FullAttentionSpec)
+        only_full_attention = isinstance(plan.kv_cache_groups[0].kv_cache_spec, AttentionSpec)
         mixed_local = 128
         if speculative_method == "dspark" and only_full_attention:
             mixed_local = 256

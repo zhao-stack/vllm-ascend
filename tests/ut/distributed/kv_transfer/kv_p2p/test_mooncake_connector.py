@@ -19,19 +19,25 @@ import zmq
 from vllm.config import KVTransferConfig
 from vllm.utils.network_utils import make_zmq_path
 
-# vLLM #61183 moved these KV-cache planning helpers to `kv_cache_planning` on
-# main; the v0.33.0 lane still ships them in `kv_cache_utils`.
-from vllm.v1.core.kv_cache_planning import (
-    get_kv_cache_config_from_groups,
-    is_kv_cache_spec_uniform,
-)
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheGroupSpec,
-    MambaSpec,
-    MLAAttentionSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.kv_cache_planning import get_kv_cache_config_from_groups, is_kv_cache_spec_uniform
+else:
+    from vllm.v1.core.kv_cache_planning import DefaultKVCacheConfigBuilder
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+
+from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.request import RequestStatus
 from zmq.constants import ROUTER
 from zmq.sugar.socket import Socket
@@ -102,7 +108,12 @@ def make_agent_metadata(**overrides: Any) -> MooncakeAgentMetadata:
     metadata: dict[str, Any] = {
         "engine_id": "engine1",
         "te_rpc_port": 9090,
-        "kv_group2layeridx": {0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0])},
+        "kv_group2layeridx": {
+            0: (
+                {"kv_cache_spec_type": "FullAttentionSpec"},
+                [0],
+            )
+        },
         "block_size": 16,
         "kv_caches_base_addr": [[12345678]],
         "block_size_scale": [[1]],
@@ -358,19 +369,20 @@ class TestMooncakeTransferGroups(unittest.TestCase):
             mla_layer: mla_spec,
             mtp_layer: mla_spec,
         }
-        uniform_spec = UniformTypeKVCacheSpecs(
-            block_size=128,
-            kv_cache_specs=layer_specs,
-        )
+        if vllm_version_is("0.33.0"):
+            uniform_spec = UniformTypeKVCacheSpecs(
+                block_size=128,
+                kv_cache_specs=layer_specs,
+            )
+
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.vllm_config = MockVllmConfig()
         worker.total_layers = 60
         worker.kv_cache_config = MockKVCacheConfig(
             kv_cache_groups=[
-                MockKVCacheGroup(
-                    layer_names=list(layer_specs),
-                    kv_cache_spec=uniform_spec,
-                )
+                MockKVCacheGroup(layer_names=list(layer_specs), kv_cache_spec=uniform_spec)
+                if vllm_version_is("0.33.0")
+                else make_group(layer_specs)
             ]
         )
         worker._layer_specs = dict(layer_specs)
@@ -386,7 +398,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
     def test_m3_index_spec_is_preserved_and_splits_transfer_group(self):
         main_layer = "model.layers.3.attn"
         index_layer = f"{main_layer}.index_cache"
-        main_spec = FullAttentionSpec(
+        main_spec = AttentionSpec(
             block_size=128,
             num_kv_heads=1,
             head_size=128,
@@ -403,18 +415,26 @@ class TestMooncakeTransferGroups(unittest.TestCase):
             main_layer: main_spec,
             index_layer: index_spec,
         }
-        self.assertFalse(is_kv_cache_spec_uniform(layer_specs))
-        uniform_spec = UniformTypeKVCacheSpecs(
-            block_size=128,
-            kv_cache_specs=layer_specs,
-        )
+        if vllm_version_is("0.33.0"):
+            self.assertFalse(is_kv_cache_spec_uniform(layer_specs))
+            uniform_spec = UniformTypeKVCacheSpecs(
+                block_size=128,
+                kv_cache_specs=layer_specs,
+            )
+
         vllm_config = MockVllmConfig()
         vllm_config.cache_config.num_gpu_blocks_override = None
         num_blocks = 10
-        allocated_config = get_kv_cache_config_from_groups(
-            vllm_config,
-            [KVCacheGroupSpec(layer_names=list(layer_specs), kv_cache_spec=uniform_spec)],
-            available_memory=uniform_spec.page_size_bytes * num_blocks,
+        allocated_config = (
+            get_kv_cache_config_from_groups(
+                vllm_config,
+                [KVCacheGroup(layer_names=list(layer_specs), kv_cache_spec=uniform_spec)],
+                available_memory=uniform_spec.page_size_bytes * num_blocks,
+            )
+            if vllm_version_is("0.33.0")
+            else DefaultKVCacheConfigBuilder().get_kv_cache_config_from_groups(
+                vllm_config, [make_group(layer_specs)], num_blocks
+            )
         )
         placements = {
             layer: tensor
@@ -433,10 +453,9 @@ class TestMooncakeTransferGroups(unittest.TestCase):
 
         kv_cache_config = MockKVCacheConfig(
             kv_cache_groups=[
-                MockKVCacheGroup(
-                    layer_names=list(layer_specs),
-                    kv_cache_spec=uniform_spec,
-                )
+                MockKVCacheGroup(layer_names=list(layer_specs), kv_cache_spec=uniform_spec)
+                if vllm_version_is("0.33.0")
+                else make_group(layer_specs)
             ]
         )
 
@@ -457,7 +476,10 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         self.assertEqual(len(kv_group2layeridx), 2)
         self.assertEqual(kv_group2layeridx[0][0]["kv_cache_group_id"], 0)
         self.assertEqual(kv_group2layeridx[1][0]["kv_cache_group_id"], 0)
-        self.assertEqual(kv_group2layeridx[0][0]["kv_cache_spec_type"], "FullAttentionSpec")
+        self.assertEqual(
+            kv_group2layeridx[0][0]["kv_cache_spec_type"],
+            ("FullAttentionSpec" if vllm_version_is("0.33.0") else "AttentionSpec"),
+        )
         self.assertEqual(kv_group2layeridx[0][1], [3])
         self.assertEqual(kv_group2layeridx[1][0]["kv_cache_spec_type"], "AscendSFAIndexerCacheSpec")
         self.assertEqual(kv_group2layeridx[1][1], [123])
@@ -531,7 +553,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
             head_size=64,
             dtype=torch.float16,
         )
-        qga_spec = FullAttentionSpec(
+        qga_spec = AttentionSpec(
             block_size=16,
             num_kv_heads=1,
             head_size=64,
@@ -542,7 +564,8 @@ class TestMooncakeTransferGroups(unittest.TestCase):
             "language_model.model.layers.0.self_attn": mla_spec,
             "model.layers.32.self_attn": qga_spec,
         }
-        uniform_spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=layer_specs)
+        if vllm_version_is("0.33.0"):
+            uniform_spec = UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=layer_specs)
 
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.vllm_config = MockVllmConfig()
@@ -557,10 +580,9 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         worker.total_layers = 32
         worker.kv_cache_config = MockKVCacheConfig(
             kv_cache_groups=[
-                MockKVCacheGroup(
-                    layer_names=list(layer_specs),
-                    kv_cache_spec=uniform_spec,
-                )
+                MockKVCacheGroup(layer_names=list(layer_specs), kv_cache_spec=uniform_spec)
+                if vllm_version_is("0.33.0")
+                else make_group(layer_specs)
             ]
         )
         worker._layer_specs = dict(layer_specs)
@@ -576,7 +598,7 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         self.assertEqual(kv_group2layeridx[1][0]["kv_cache_spec"]["num_kv_heads"], 1)
 
     def test_build_kv_group2layeridx_splits_equal_local_heads_by_total_heads(self):
-        shared_local_spec = FullAttentionSpec(
+        shared_local_spec = AttentionSpec(
             block_size=16,
             num_kv_heads=1,
             head_size=64,
@@ -600,10 +622,9 @@ class TestMooncakeTransferGroups(unittest.TestCase):
         worker.total_layers = 32
         worker.kv_cache_config = MockKVCacheConfig(
             kv_cache_groups=[
-                MockKVCacheGroup(
-                    layer_names=layer_names,
-                    kv_cache_spec=shared_local_spec,
-                )
+                MockKVCacheGroup(layer_names=layer_names, kv_cache_spec=shared_local_spec)
+                if vllm_version_is("0.33.0")
+                else make_group(dict.fromkeys(layer_names, shared_local_spec))
             ]
         )
         worker._layer_specs = {layer_name: shared_local_spec for layer_name in layer_names}
@@ -1138,7 +1159,12 @@ class TestCoreFunctionality(unittest.TestCase):
             "all_task_done": True,
             "remote_block_size": 16,
         }
-        self.thread.kv_group2layeridx = {0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0])}
+        self.thread.kv_group2layeridx = {
+            0: (
+                {"kv_cache_spec_type": "FullAttentionSpec"},
+                [0],
+            )
+        }
         self.thread.group_compress_ratios = {0: 1}
         self.thread.block_size_scale = [[1]]
         self.thread.task_tracker = MagicMock()
@@ -1860,15 +1886,34 @@ class MockRequest:
         self.block_hashes.append(tuple(self._all_token_ids))
 
 
-class MockKVCacheGroup:
-    def __init__(self, layer_names=None, kv_cache_spec=None):
-        self.layer_names = layer_names or ["model.layers.0.self_attn"]
-        self.kv_cache_spec = kv_cache_spec or MagicMock()
+if vllm_version_is("0.33.0"):
+
+    class MockKVCacheGroup:
+        def __init__(self, layer_names=None, kv_cache_spec=None):
+            self.layer_names = layer_names or ["model.layers.0.self_attn"]
+            self.kv_cache_spec = kv_cache_spec or MagicMock()
+else:
+
+    def make_group(layer_specs=None):
+        if layer_specs is None:
+            layer_specs = {
+                "model.layers.0.self_attn": AttentionSpec(
+                    block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float16
+                )
+            }
+        return KVCacheGroup.from_layers(
+            {
+                name: MambaManager.layer_config(spec)
+                if isinstance(spec, MambaSpec)
+                else FullAttentionManager.layer_config(spec)
+                for name, spec in layer_specs.items()
+            }
+        )
 
 
 class MockKVCacheConfig:
     def __init__(self, kv_cache_groups=None, num_blocks=10):
-        self.kv_cache_groups = kv_cache_groups or [MockKVCacheGroup()]
+        self.kv_cache_groups = kv_cache_groups or [(MockKVCacheGroup() if vllm_version_is("0.33.0") else make_group())]
         self.num_blocks = num_blocks
         self.transfer_group_ids = tuple(range(len(self.kv_cache_groups)))
 
@@ -1905,25 +1950,33 @@ def wire_transfer_contract(monkeypatch, request):
     # Constructor writes this setting; restore it after the case.
     monkeypatch.setenv("ASCEND_TRANSFER_TIMEOUT", "30")
     layer_name = "model.layers.0.self_attn"
-    spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float16)
+    spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float16)
     layer_names = [layer_name]
     local_addrs, remote_addrs = [[0x1000, 0x2000]], [[0x3000, 0x4000]]
     lengths, local_strides, remote_strides, scales = [[64, 64]], [[80, 80]], [[96, 96]], [[1, 1]]
     caches: dict[str, tuple[torch.Tensor, ...]] = {layer_name: (torch.empty(1), torch.empty(1))}
+    if not vllm_version_is("0.33.0"):
+        layer_specs = {layer_name: spec}
+
     if getattr(request, "param", None) == "split-kernels":
-        # One manager group, two transfer groups, different kernel scales.
-        # This is a fixed mixed-layout schema, not a real-model accuracy test.
         config.model_config.hf_text_config.num_hidden_layers = 2
         config.model_config.get_total_num_hidden_layers.return_value = 2
         second_layer = "model.layers.1.self_attn"
         layer_names.append(second_layer)
-        spec = UniformTypeKVCacheSpecs(
-            block_size=16,
-            kv_cache_specs={
+        if vllm_version_is("0.33.0"):
+            spec = UniformTypeKVCacheSpecs(
+                block_size=16,
+                kv_cache_specs={
+                    layer_name: spec,
+                    second_layer: MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float16),
+                },
+            )
+        else:
+            layer_specs = {
                 layer_name: spec,
                 second_layer: MLAAttentionSpec(block_size=16, num_kv_heads=1, head_size=2, dtype=torch.float16),
-            },
-        )
+            }
+
         local_addrs.append([0x5000])
         remote_addrs.append([0x6000])
         lengths.append([32])
@@ -1931,7 +1984,13 @@ def wire_transfer_contract(monkeypatch, request):
         remote_strides.append([64])
         scales.append([2])
         caches[second_layer] = (torch.empty(1),)
-    cache_config = MockKVCacheConfig([KVCacheGroupSpec(layer_names=layer_names, kv_cache_spec=spec)])
+    cache_config = MockKVCacheConfig(
+        [
+            KVCacheGroup(layer_names=layer_names, kv_cache_spec=spec)
+            if vllm_version_is("0.33.0")
+            else make_group(layer_specs)
+        ]
+    )
     worker = MooncakeConnectorWorker(config, "decode-engine", cache_config)
     worker.use_mla = worker.use_sparse = False
     worker.enable_sfa_dcp_replicated_indexer = module.enable_sfa_dcp_replicated_indexer(config)
@@ -1995,9 +2054,13 @@ def test_k3_registration_boundary_keeps_logical_metadata(wire_transfer_contract,
     worker.total_layers = 2
     worker.kv_cache_config.num_blocks = 2
     worker.kv_cache_config.kv_cache_groups = [
-        KVCacheGroupSpec(layer_names=[attention], kv_cache_spec=mla),
-        KVCacheGroupSpec(layer_names=[state], kv_cache_spec=mamba),
-        KVCacheGroupSpec(layer_names=[mtp], kv_cache_spec=mla),
+        KVCacheGroup(layer_names=[attention], kv_cache_spec=mla)
+        if vllm_version_is("0.33.0")
+        else make_group({attention: mla}),
+        KVCacheGroup(layer_names=[state], kv_cache_spec=mamba)
+        if vllm_version_is("0.33.0")
+        else make_group({state: mamba}),
+        KVCacheGroup(layer_names=[mtp], kv_cache_spec=mla) if vllm_version_is("0.33.0") else make_group({mtp: mla}),
     ]
     worker._layer_specs = worker._build_layer_specs_from_kv_cache_config(worker.kv_cache_config)
     caches = {
@@ -3928,7 +3991,10 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                 # Bd=32 stored as 2 kernels of 16 (scale 2); Bp=16 == 1 kernel.
                 worker.block_size_scale = [[2]]
                 worker.kv_group2layeridx = {
-                    0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0]),
+                    0: (
+                        {"kv_cache_spec_type": "FullAttentionSpec"},
+                        [0],
+                    )
                 }
 
                 meta = types.SimpleNamespace(
@@ -3981,7 +4047,10 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.handshake_port = worker.side_channel_port + worker.tp_rank
         worker.block_size_scale = [[1]]
         worker.kv_group2layeridx = {
-            0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0]),
+            0: (
+                {"kv_cache_spec_type": "FullAttentionSpec"},
+                [0],
+            )
         }
 
         # 6 prompt blocks, 4 external (P0 = 2 prefix-cached blocks), remote DCP=2.
@@ -4096,7 +4165,12 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         and trimmed to the local count - all inside _get_kv_split_metadata now."""
         worker = self._build_non_cp_worker()
         worker.block_size_scale = [[1]]
-        worker.kv_group2layeridx = {0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0])}
+        worker.kv_group2layeridx = {
+            0: (
+                {"kv_cache_spec_type": "FullAttentionSpec"},
+                [0],
+            )
+        }
 
         meta = types.SimpleNamespace(
             remote_pcp_size=1,
@@ -4200,8 +4274,14 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
         worker.handshake_port = worker.side_channel_port + (worker.pp_rank + pcp_rank) * worker.tp_size + tp_rank
         worker.block_size_scale = [[1], [1]]
         worker.kv_group2layeridx = {
-            0: ({"kv_cache_spec_type": "FullAttentionSpec"}, [0]),
-            1: ({"kv_cache_spec_type": "FullAttentionSpec"}, [1]),
+            0: (
+                {"kv_cache_spec_type": "FullAttentionSpec"},
+                [0],
+            ),
+            1: (
+                {"kv_cache_spec_type": "FullAttentionSpec"},
+                [1],
+            ),
         }
         return worker
 
@@ -4639,13 +4719,7 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                 },
                 [1],
             ),
-            2: (
-                {
-                    "kv_cache_spec_type": "MambaSpec",
-                    "kv_cache_group_id": 1,
-                },
-                [2],
-            ),
+            2: ({"kv_cache_spec_type": "MambaSpec", "kv_cache_group_id": 1}, [2]),
         }
 
         meta = types.SimpleNamespace(
@@ -5119,7 +5193,15 @@ class TestMooncakeConnectorWorker(unittest.TestCase):
                     self.assertEqual(remote_ids, (list(range(10 * remote_cp, 10 * remote_cp + 8)),))
 
     def test_decode_only_dcp_checks_each_cache_group_type(self):
-        for spec_type in ("MLAAttentionSpec", "AscendMLAAttentionSpec", "FullAttentionSpec"):
+        for spec_type in (
+            (
+                "MLAAttentionSpec",
+                "AscendMLAAttentionSpec",
+                ("FullAttentionSpec" if vllm_version_is("0.33.0") else "AttentionSpec"),
+            )
+            if vllm_version_is("0.33.0")
+            else ("MLAAttentionSpec", "AscendMLAAttentionSpec", "FullAttentionSpec")
+        ):
             with self.subTest(spec_type=spec_type):
                 worker = self._build_non_cp_worker()
                 worker.dcp_size = 2

@@ -12,9 +12,19 @@ import numpy as np
 import pytest
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+from vllm_ascend.utils import vllm_version_is
 
-# isort: split
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+if not vllm_version_is("0.33.0"):
+    # isort: split
+    import torch
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, FullAttentionManager, MambaManager
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 
 from tests.ut.distributed.ascend_store import test_pool_scheduler as scheduler_tests
 from tests.ut.distributed.ascend_store.test_pool_worker import make_worker
@@ -143,18 +153,27 @@ def worker_factory():
     case = unittest.TestCase()
 
     def create(backend_name, group_count=2):
-        groups = [
-            KVCacheGroupSpec(
-                [f"model.layers.{index}.attn"],
-                FullAttentionSpec(
-                    block_size=16,
-                    num_kv_heads=1,
-                    head_size=1,
-                    dtype="uint8",
-                ),
-            )
-            for index in range(group_count)
-        ]
+        groups = (
+            [
+                KVCacheGroup(
+                    [f"model.layers.{index}.attn"],
+                    AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                )
+                for index in range(group_count)
+            ]
+            if vllm_version_is("0.33.0")
+            else [
+                KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        [f"model.layers.{index}.attn"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                        ),
+                    )
+                )
+                for index in range(group_count)
+            ]
+        )
         with patch.object(KVPoolWorker, "_build_cache_coordinator", return_value=None):
             worker = make_worker(
                 case,
@@ -242,21 +261,46 @@ def test_mooncake_preserves_partial_get_errors():
 def test_packed_qsa_gdn_pages_restore_disjoint_live_block_ids(backend_name):
     """Restore actual shared-page views without touching another live owner."""
     import torch
-    from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec, MLAAttentionSpec
+    from vllm.v1.kv_cache_interface import MambaSpec, MLAAttentionSpec
+
+    if vllm_version_is("0.33.0"):
+        from vllm.v1.kv_cache_interface import CircularBufferSpec
 
     from vllm_ascend.models.qwen4_exp.cache_config import build_qwen4_kv_cache_layout, make_slab_view
 
-    main = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=8, head_size_v=8, dtype=torch.float16)
-    raw = CircularBufferSpec(block_size=8, num_kv_heads=1, head_size=4, head_size_v=0, dtype=torch.float16)
+    main = AttentionSpec(block_size=128, num_kv_heads=1, head_size=8, head_size_v=8, dtype=torch.float16)
+    raw = (
+        CircularBufferSpec(block_size=8, num_kv_heads=1, head_size=4, head_size_v=0, dtype=torch.float16)
+        if vllm_version_is("0.33.0")
+        else AttentionSpec(block_size=8, num_kv_heads=1, head_size=4, head_size_v=0, dtype=torch.float16)
+    )
     compressed = MLAAttentionSpec(block_size=128, num_kv_heads=1, head_size=4, dtype=torch.float16, tokens_per_state=4)
     gdn = MambaSpec(block_size=128, shapes=((2, 4), (4, 4)), dtypes=(torch.float16, torch.float32))
     ple = MambaSpec(block_size=128, shapes=((2, 4),), dtypes=(torch.float16,))
     groups = [
-        KVCacheGroupSpec(["model.layers.0.self_attn.attn"], main),
-        KVCacheGroupSpec(["model.layers.0.self_attn.indexer.raw_key_cache"], raw),
-        KVCacheGroupSpec(["model.layers.0.self_attn.indexer.compressed_key_cache"], compressed),
-        KVCacheGroupSpec(["model.layers.1.linear_attn"], gdn),
-        KVCacheGroupSpec(["model.ple"], ple),
+        KVCacheGroup(["model.layers.0.self_attn.attn"], main)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers(
+            dict.fromkeys(["model.layers.0.self_attn.attn"], FullAttentionManager.layer_config(main))
+        ),
+        KVCacheGroup(["model.layers.0.self_attn.indexer.raw_key_cache"], raw)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers(
+            {"model.layers.0.self_attn.indexer.raw_key_cache": CircularBufferManager.layer_config(raw)}
+        ),
+        KVCacheGroup(["model.layers.0.self_attn.indexer.compressed_key_cache"], compressed)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers(
+            dict.fromkeys(
+                ["model.layers.0.self_attn.indexer.compressed_key_cache"], FullAttentionManager.layer_config(compressed)
+            )
+        ),
+        KVCacheGroup(["model.layers.1.linear_attn"], gdn)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers({"model.layers.1.linear_attn": MambaManager.layer_config(gdn)}),
+        KVCacheGroup(["model.ple"], ple)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers({"model.ple": MambaManager.layer_config(ple)}),
     ]
     blocks = 5
     layout = build_qwen4_kv_cache_layout(groups, blocks)

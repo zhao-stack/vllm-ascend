@@ -19,10 +19,22 @@ from vllm.v1.core.kv_cache_coordinator import (
 )
 from vllm.v1.core.kv_cache_utils import resolve_dcp_kv_block_size, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager, MambaManager, SlidingWindowManager
+
+from vllm.v1.kv_cache_interface import MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+
 from vllm.v1.outputs import KVConnectorOutput
 
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+
 from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.preempt_offload.metadata import (
     MambaConvLoadMeta,
     PreemptOffloadMetadata,
@@ -134,27 +146,39 @@ class PreemptOffloadScheduler:
 
     @staticmethod
     def _get_group_is_sliding_window(kv_cache_config: "KVCacheConfig") -> list[bool]:
-        group_is_sliding_window: list[bool] = []
-        for group in kv_cache_config.kv_cache_groups:
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-                group_is_sliding_window.append(
-                    any(isinstance(spec, SlidingWindowSpec) for spec in group.kv_cache_spec.kv_cache_specs.values())
-                )
-            else:
-                group_is_sliding_window.append(isinstance(group.kv_cache_spec, SlidingWindowSpec))
-        return group_is_sliding_window
+        if vllm_version_is("0.33.0"):
+            group_is_sliding_window: list[bool] = []
+            for group in kv_cache_config.kv_cache_groups:
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                    group_is_sliding_window.append(
+                        any(isinstance(spec, SlidingWindowSpec) for spec in group.kv_cache_spec.kv_cache_specs.values())
+                    )
+                else:
+                    group_is_sliding_window.append(isinstance(group.kv_cache_spec, SlidingWindowSpec))
+
+        return (
+            group_is_sliding_window
+            if vllm_version_is("0.33.0")
+            else [issubclass(group.manager_cls, SlidingWindowManager) for group in kv_cache_config.kv_cache_groups]
+        )
 
     @staticmethod
     def _get_group_is_mamba(kv_cache_config: "KVCacheConfig") -> list[bool]:
-        group_is_mamba: list[bool] = []
-        for group in kv_cache_config.kv_cache_groups:
-            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-                group_is_mamba.append(
-                    any(isinstance(spec, MambaSpec) for spec in group.kv_cache_spec.kv_cache_specs.values())
-                )
-            else:
-                group_is_mamba.append(isinstance(group.kv_cache_spec, MambaSpec))
-        return group_is_mamba
+        if vllm_version_is("0.33.0"):
+            group_is_mamba: list[bool] = []
+            for group in kv_cache_config.kv_cache_groups:
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                    group_is_mamba.append(
+                        any(isinstance(spec, MambaSpec) for spec in group.kv_cache_spec.kv_cache_specs.values())
+                    )
+                else:
+                    group_is_mamba.append(isinstance(group.kv_cache_spec, MambaSpec))
+
+        return (
+            group_is_mamba
+            if vllm_version_is("0.33.0")
+            else [issubclass(group.manager_cls, MambaManager) for group in kv_cache_config.kv_cache_groups]
+        )
 
     @staticmethod
     def _get_group_has_mamba_conv(kv_cache_config: "KVCacheConfig") -> list[bool]:
@@ -167,9 +191,13 @@ class PreemptOffloadScheduler:
         group_has_mamba_conv: list[bool] = []
         for group in kv_cache_config.kv_cache_groups:
             specs = (
-                group.kv_cache_spec.kv_cache_specs.values()
-                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
-                else (group.kv_cache_spec,)
+                (
+                    group.kv_cache_spec.kv_cache_specs.values()
+                    if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                    else (group.kv_cache_spec,)
+                )
+                if vllm_version_is("0.33.0")
+                else group.distinct_specs
             )
             group_has_mamba_conv.append(
                 any(isinstance(spec, MambaSpec) and spec.mamba_type in conv_backends for spec in specs)
@@ -310,7 +338,6 @@ class PreemptOffloadScheduler:
             gpu_blocks: list[KVCacheBlock | None] = []
             effective_hashes: list[BlockHashWithGroupId | None] = []
             if self._group_is_mamba[g]:
-                # For Mamba cache, only the last `1 + num_spec_tokens` blocks need to offload
                 offload_start_idx = len(group_gpu_ids) - self.num_spec_tokens - 1
                 for block_idx, block_id in enumerate(group_gpu_ids):
                     if block_idx >= offload_start_idx:
@@ -319,8 +346,15 @@ class PreemptOffloadScheduler:
                         gpu_blocks.append(gpu_block)
                         effective_hashes.append(None)
             else:
-                group_block_size = resolve_dcp_kv_block_size(kv_cache_groups[g].kv_cache_spec, self.dcp_world_size)
-                is_circular = is_circular_kv_cache_spec(kv_cache_groups[g].kv_cache_spec)
+                group_block_size = resolve_dcp_kv_block_size(
+                    kv_cache_groups[g].kv_cache_spec if vllm_version_is("0.33.0") else kv_cache_groups[g],
+                    self.dcp_world_size,
+                )
+                is_circular = (
+                    is_circular_kv_cache_spec(kv_cache_groups[g].kv_cache_spec)
+                    if vllm_version_is("0.33.0")
+                    else issubclass(kv_cache_groups[g].manager_cls, CircularBufferManager)
+                )
                 # A ring owns one private block, independent of token position.
                 if is_circular and (len(group_gpu_ids) != 1 or group_gpu_ids[0] <= 0):
                     raise RuntimeError(f"Invalid circular cache blocks for {req_id}: {group_gpu_ids}")
@@ -469,104 +503,214 @@ class PreemptOffloadScheduler:
         cpu_block_ids: list[int] = []
         mamba_conv_loads: list[MambaConvLoadMeta] = []
         for g, group_cpu_ids in enumerate(state.cpu_block_ids):
-            if self._group_is_mamba[g]:
-                accept_token_idx = self.num_spec_tokens - (state.num_computed_tokens - request.num_tokens + 1)
-                group_gpu_ids = block_ids_by_group[g]
-                state_block_idx = len(group_gpu_ids) - self.num_spec_tokens - 1
-                cpu_block_id = group_cpu_ids[accept_token_idx] if 0 <= accept_token_idx < len(group_cpu_ids) else 0
-                gpu_block_id = group_gpu_ids[state_block_idx] if 0 <= state_block_idx < len(group_gpu_ids) else 0
-                if cpu_block_id <= 0 or gpu_block_id <= 0:
-                    raise RuntimeError(
-                        "Invalid recompute H2D Mamba block mapping: "
-                        f"req_id={request.request_id}, group={g}, "
-                        f"cpu={cpu_block_id}@{accept_token_idx}, "
-                        f"gpu={gpu_block_id}@{state_block_idx}"
-                    )
-                cpu_block_ids.append(cpu_block_id)
-                gpu_block_ids.append(gpu_block_id)
-
-                if not self._group_has_mamba_conv[g]:
-                    continue
-
-                # Keep the proven temporal/SSM restore above unchanged. Conv
-                # candidates live in the running-state block and require a
-                # separate accepted-token shift. If postprocess_mamba already
-                # crossed a cache boundary, only the residual in-block shift
-                # remains to be applied during resume.
-                mamba_block_size = self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec.block_size
-                num_tokens_running_state = request.num_tokens - 1 - accept_token_idx
-                accepted_state_position = request.num_tokens - 1
-                aligned_accepted_state_position = (accepted_state_position // mamba_block_size) * mamba_block_size
-                conv_source_offset = accept_token_idx
-                if aligned_accepted_state_position >= num_tokens_running_state:
-                    conv_source_offset = accepted_state_position - aligned_accepted_state_position
-
-                conv_cpu_block_id = group_cpu_ids[0] if group_cpu_ids else 0
-                if conv_cpu_block_id <= 0:
-                    raise RuntimeError(
-                        "Invalid recompute H2D Mamba Conv mapping: "
-                        f"req_id={request.request_id}, group={g}, "
-                        f"cpu={conv_cpu_block_id}@0"
-                    )
-                mamba_conv_loads.append(
-                    MambaConvLoadMeta(
-                        gpu_block_id=gpu_block_id,
-                        cpu_block_id=conv_cpu_block_id,
-                        source_offset=conv_source_offset,
-                    )
-                )
-            elif is_circular_kv_cache_spec(self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec):
-                # Reuse the ordinary block transfer, but always restore slot 0.
-                group_gpu_ids = block_ids_by_group[g]
-                if len(group_cpu_ids) != 1 or len(group_gpu_ids) != 1 or group_cpu_ids[0] <= 0 or group_gpu_ids[0] <= 0:
-                    raise RuntimeError(
-                        f"Invalid circular cache restore for {request.request_id}: "
-                        f"cpu={group_cpu_ids}, gpu={group_gpu_ids}"
-                    )
-                cpu_block_ids.append(group_cpu_ids[0])
-                gpu_block_ids.append(group_gpu_ids[0])
-            else:
-                group_block_size = resolve_dcp_kv_block_size(
-                    self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec, self.dcp_world_size
-                )
-                start_block = load_start_tokens // group_block_size
-                end_block = min(
-                    len(group_cpu_ids),
-                    len(
-                        self._align_group_block_ids(
-                            g,
-                            block_ids_by_group[g],
-                            max(
-                                cdiv(load_end_tokens, group_block_size),
-                                len(block_ids_by_group[g]),
-                            ),
-                        )
-                    ),
-                    cdiv(load_end_tokens, group_block_size),
-                )
-                if end_block == start_block:
-                    continue
-                if end_block < start_block:
-                    raise RuntimeError(
-                        "Recompute H2D produced an empty block range: "
-                        f"req_id={request.request_id}, group={g}, "
-                        f"start_block={start_block}, end_block={end_block}, "
-                        f"gpu_blocks={len(block_ids_by_group[g])}, "
-                        f"cpu_blocks={len(group_cpu_ids)}"
-                    )
-
-                aligned_group_gpu_ids = self._align_group_block_ids(
-                    g,
-                    block_ids_by_group[g],
-                    end_block,
-                )
-                for block_idx in range(start_block, end_block):
-                    cpu_block_id = group_cpu_ids[block_idx]
-                    gpu_block_id = aligned_group_gpu_ids[block_idx]
+            if vllm_version_is("0.33.0"):
+                if self._group_is_mamba[g]:
+                    accept_token_idx = self.num_spec_tokens - (state.num_computed_tokens - request.num_tokens + 1)
+                    group_gpu_ids = block_ids_by_group[g]
+                    state_block_idx = len(group_gpu_ids) - self.num_spec_tokens - 1
+                    cpu_block_id = group_cpu_ids[accept_token_idx] if 0 <= accept_token_idx < len(group_cpu_ids) else 0
+                    gpu_block_id = group_gpu_ids[state_block_idx] if 0 <= state_block_idx < len(group_gpu_ids) else 0
                     if cpu_block_id <= 0 or gpu_block_id <= 0:
-                        continue
+                        raise RuntimeError(
+                            "Invalid recompute H2D Mamba block mapping: "
+                            f"req_id={request.request_id}, group={g}, "
+                            f"cpu={cpu_block_id}@{accept_token_idx}, "
+                            f"gpu={gpu_block_id}@{state_block_idx}"
+                        )
                     cpu_block_ids.append(cpu_block_id)
                     gpu_block_ids.append(gpu_block_id)
+
+                    if not self._group_has_mamba_conv[g]:
+                        continue
+
+                    # Keep the proven temporal/SSM restore above unchanged. Conv
+                    # candidates live in the running-state block and require a
+                    # separate accepted-token shift. If postprocess_mamba already
+                    # crossed a cache boundary, only the residual in-block shift
+                    # remains to be applied during resume.
+                    mamba_block_size = self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec.block_size
+                    num_tokens_running_state = request.num_tokens - 1 - accept_token_idx
+                    accepted_state_position = request.num_tokens - 1
+                    aligned_accepted_state_position = (accepted_state_position // mamba_block_size) * mamba_block_size
+                    conv_source_offset = accept_token_idx
+                    if aligned_accepted_state_position >= num_tokens_running_state:
+                        conv_source_offset = accepted_state_position - aligned_accepted_state_position
+
+                    conv_cpu_block_id = group_cpu_ids[0] if group_cpu_ids else 0
+                    if conv_cpu_block_id <= 0:
+                        raise RuntimeError(
+                            "Invalid recompute H2D Mamba Conv mapping: "
+                            f"req_id={request.request_id}, group={g}, "
+                            f"cpu={conv_cpu_block_id}@0"
+                        )
+                    mamba_conv_loads.append(
+                        MambaConvLoadMeta(
+                            gpu_block_id=gpu_block_id,
+                            cpu_block_id=conv_cpu_block_id,
+                            source_offset=conv_source_offset,
+                        )
+                    )
+                elif is_circular_kv_cache_spec(self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec):
+                    # Reuse the ordinary block transfer, but always restore slot 0.
+                    group_gpu_ids = block_ids_by_group[g]
+                    if (
+                        len(group_cpu_ids) != 1
+                        or len(group_gpu_ids) != 1
+                        or group_cpu_ids[0] <= 0
+                        or group_gpu_ids[0] <= 0
+                    ):
+                        raise RuntimeError(
+                            f"Invalid circular cache restore for {request.request_id}: "
+                            f"cpu={group_cpu_ids}, gpu={group_gpu_ids}"
+                        )
+                    cpu_block_ids.append(group_cpu_ids[0])
+                    gpu_block_ids.append(group_gpu_ids[0])
+                else:
+                    group_block_size = resolve_dcp_kv_block_size(
+                        self.cpu_kv_cache_config.kv_cache_groups[g].kv_cache_spec, self.dcp_world_size
+                    )
+                    start_block = load_start_tokens // group_block_size
+                    end_block = min(
+                        len(group_cpu_ids),
+                        len(
+                            self._align_group_block_ids(
+                                g,
+                                block_ids_by_group[g],
+                                max(
+                                    cdiv(load_end_tokens, group_block_size),
+                                    len(block_ids_by_group[g]),
+                                ),
+                            )
+                        ),
+                        cdiv(load_end_tokens, group_block_size),
+                    )
+                    if end_block == start_block:
+                        continue
+                    if end_block < start_block:
+                        raise RuntimeError(
+                            "Recompute H2D produced an empty block range: "
+                            f"req_id={request.request_id}, group={g}, "
+                            f"start_block={start_block}, end_block={end_block}, "
+                            f"gpu_blocks={len(block_ids_by_group[g])}, "
+                            f"cpu_blocks={len(group_cpu_ids)}"
+                        )
+
+                    aligned_group_gpu_ids = self._align_group_block_ids(
+                        g,
+                        block_ids_by_group[g],
+                        end_block,
+                    )
+                    for block_idx in range(start_block, end_block):
+                        cpu_block_id = group_cpu_ids[block_idx]
+                        gpu_block_id = aligned_group_gpu_ids[block_idx]
+                        if cpu_block_id <= 0 or gpu_block_id <= 0:
+                            continue
+                        cpu_block_ids.append(cpu_block_id)
+                        gpu_block_ids.append(gpu_block_id)
+            else:
+                if self._group_is_mamba[g]:
+                    accept_token_idx = self.num_spec_tokens - (state.num_computed_tokens - request.num_tokens + 1)
+                    group_gpu_ids = block_ids_by_group[g]
+                    state_block_idx = len(group_gpu_ids) - self.num_spec_tokens - 1
+                    cpu_block_id = group_cpu_ids[accept_token_idx] if 0 <= accept_token_idx < len(group_cpu_ids) else 0
+                    gpu_block_id = group_gpu_ids[state_block_idx] if 0 <= state_block_idx < len(group_gpu_ids) else 0
+                    if cpu_block_id <= 0 or gpu_block_id <= 0:
+                        raise RuntimeError(
+                            "Invalid recompute H2D Mamba block mapping: "
+                            f"req_id={request.request_id}, group={g}, "
+                            f"cpu={cpu_block_id}@{accept_token_idx}, "
+                            f"gpu={gpu_block_id}@{state_block_idx}"
+                        )
+                    cpu_block_ids.append(cpu_block_id)
+                    gpu_block_ids.append(gpu_block_id)
+
+                    if not self._group_has_mamba_conv[g]:
+                        continue
+
+                    # Keep the proven temporal/SSM restore above unchanged. Conv
+                    # candidates live in the running-state block and require a
+                    # separate accepted-token shift. If postprocess_mamba already
+                    # crossed a cache boundary, only the residual in-block shift
+                    # remains to be applied during resume.
+                    mamba_block_size = self.cpu_kv_cache_config.kv_cache_groups[g].block_size
+                    num_tokens_running_state = request.num_tokens - 1 - accept_token_idx
+                    accepted_state_position = request.num_tokens - 1
+                    aligned_accepted_state_position = (accepted_state_position // mamba_block_size) * mamba_block_size
+                    conv_source_offset = accept_token_idx
+                    if aligned_accepted_state_position >= num_tokens_running_state:
+                        conv_source_offset = accepted_state_position - aligned_accepted_state_position
+
+                    conv_cpu_block_id = group_cpu_ids[0] if group_cpu_ids else 0
+                    if conv_cpu_block_id <= 0:
+                        raise RuntimeError(
+                            "Invalid recompute H2D Mamba Conv mapping: "
+                            f"req_id={request.request_id}, group={g}, "
+                            f"cpu={conv_cpu_block_id}@0"
+                        )
+                    mamba_conv_loads.append(
+                        MambaConvLoadMeta(
+                            gpu_block_id=gpu_block_id,
+                            cpu_block_id=conv_cpu_block_id,
+                            source_offset=conv_source_offset,
+                        )
+                    )
+                elif issubclass(self.cpu_kv_cache_config.kv_cache_groups[g].manager_cls, CircularBufferManager):
+                    # Reuse the ordinary block transfer, but always restore slot 0.
+                    group_gpu_ids = block_ids_by_group[g]
+                    if (
+                        len(group_cpu_ids) != 1
+                        or len(group_gpu_ids) != 1
+                        or group_cpu_ids[0] <= 0
+                        or group_gpu_ids[0] <= 0
+                    ):
+                        raise RuntimeError(
+                            f"Invalid circular cache restore for {request.request_id}: "
+                            f"cpu={group_cpu_ids}, gpu={group_gpu_ids}"
+                        )
+                    cpu_block_ids.append(group_cpu_ids[0])
+                    gpu_block_ids.append(group_gpu_ids[0])
+                else:
+                    group_block_size = resolve_dcp_kv_block_size(
+                        self.cpu_kv_cache_config.kv_cache_groups[g], self.dcp_world_size
+                    )
+                    start_block = load_start_tokens // group_block_size
+                    end_block = min(
+                        len(group_cpu_ids),
+                        len(
+                            self._align_group_block_ids(
+                                g,
+                                block_ids_by_group[g],
+                                max(
+                                    cdiv(load_end_tokens, group_block_size),
+                                    len(block_ids_by_group[g]),
+                                ),
+                            )
+                        ),
+                        cdiv(load_end_tokens, group_block_size),
+                    )
+                    if end_block == start_block:
+                        continue
+                    if end_block < start_block:
+                        raise RuntimeError(
+                            "Recompute H2D produced an empty block range: "
+                            f"req_id={request.request_id}, group={g}, "
+                            f"start_block={start_block}, end_block={end_block}, "
+                            f"gpu_blocks={len(block_ids_by_group[g])}, "
+                            f"cpu_blocks={len(group_cpu_ids)}"
+                        )
+
+                    aligned_group_gpu_ids = self._align_group_block_ids(
+                        g,
+                        block_ids_by_group[g],
+                        end_block,
+                    )
+                    for block_idx in range(start_block, end_block):
+                        cpu_block_id = group_cpu_ids[block_idx]
+                        gpu_block_id = aligned_group_gpu_ids[block_idx]
+                        if cpu_block_id <= 0 or gpu_block_id <= 0:
+                            continue
+                        cpu_block_ids.append(cpu_block_id)
+                        gpu_block_ids.append(gpu_block_id)
 
         if not cpu_block_ids or len(cpu_block_ids) != len(gpu_block_ids):
             raise RuntimeError(

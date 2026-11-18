@@ -1825,39 +1825,68 @@ def get_compressed_pos_and_indices(
     positions_compressed_list = []
     req_indices_compressed_list = []
     num_scheduled_tokens_compressed_list = []
+    if vllm_version_is("0.33.0"):
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 
-    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(kv_cache_groups):
+            # Calculate compressed length of historical & total tokens
+            if isinstance(kv_cache_group_spec.kv_cache_spec, UniformTypeKVCacheSpecs):
+                kv_cache_spec = next(iter(kv_cache_group_spec.kv_cache_spec.kv_cache_specs.values()))
+            else:
+                kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+            compress_ratio = getattr(kv_cache_spec, "compress_ratio", 1)
 
-    for kv_cache_group_id, kv_cache_group_spec in enumerate(kv_cache_groups):
-        # Calculate compressed length of historical & total tokens
-        if isinstance(kv_cache_group_spec.kv_cache_spec, UniformTypeKVCacheSpecs):
-            kv_cache_spec = next(iter(kv_cache_group_spec.kv_cache_spec.kv_cache_specs.values()))
-        else:
-            kv_cache_spec = kv_cache_group_spec.kv_cache_spec
-        compress_ratio = getattr(kv_cache_spec, "compress_ratio", 1)
+            # Note(qcs): some models use compress_ratio=0 as non-compression tag.
+            if compress_ratio > 1:
+                compressed_historical_len = num_computed_tokens // compress_ratio
+                compressed_total_len = (num_computed_tokens + num_scheduled_tokens) // compress_ratio
+            else:
+                compressed_historical_len = num_computed_tokens
+                compressed_total_len = num_computed_tokens + num_scheduled_tokens
 
-        # Note(qcs): some models use compress_ratio=0 as non-compression tag.
-        if compress_ratio > 1:
-            compressed_historical_len = num_computed_tokens // compress_ratio
-            compressed_total_len = (num_computed_tokens + num_scheduled_tokens) // compress_ratio
-        else:
-            compressed_historical_len = num_computed_tokens
-            compressed_total_len = num_computed_tokens + num_scheduled_tokens
+            # The number of new compressed position ids for each request
+            num_new_compressed_pos = compressed_total_len - compressed_historical_len
 
-        # The number of new compressed position ids for each request
-        num_new_compressed_pos = compressed_total_len - compressed_historical_len
+            # Core vectorized calculation (no for-loop)
+            pos_starts = compressed_historical_len
+            prefix_offsets = np.concatenate([[0], np.cumsum(num_new_compressed_pos[:-1])])
+            compressed_pos_ids = np.arange(np.sum(num_new_compressed_pos)) + np.repeat(
+                pos_starts - prefix_offsets, num_new_compressed_pos
+            )
 
-        # Core vectorized calculation (no for-loop)
-        pos_starts = compressed_historical_len
-        prefix_offsets = np.concatenate([[0], np.cumsum(num_new_compressed_pos[:-1])])
-        compressed_pos_ids = np.arange(np.sum(num_new_compressed_pos)) + np.repeat(
-            pos_starts - prefix_offsets, num_new_compressed_pos
-        )
+            req_indices_compressed = np.repeat(arrange_np, num_new_compressed_pos)
+            req_indices_compressed_list.append(req_indices_compressed)
+            positions_compressed_list.append(compressed_pos_ids)
+            num_scheduled_tokens_compressed_list.append(num_new_compressed_pos)
+    else:
+        for kv_cache_group_id, group in enumerate(kv_cache_groups):
+            # Layers in a compression group share the same logical token positions.
+            spec = group.distinct_specs[0]
+            compress_ratio = getattr(spec, "compress_ratio", 1)
 
-        req_indices_compressed = np.repeat(arrange_np, num_new_compressed_pos)
-        req_indices_compressed_list.append(req_indices_compressed)
-        positions_compressed_list.append(compressed_pos_ids)
-        num_scheduled_tokens_compressed_list.append(num_new_compressed_pos)
+            # Note(qcs): some models use compress_ratio=0 as non-compression tag.
+            if compress_ratio > 1:
+                compressed_historical_len = num_computed_tokens // compress_ratio
+                compressed_total_len = (num_computed_tokens + num_scheduled_tokens) // compress_ratio
+            else:
+                compressed_historical_len = num_computed_tokens
+                compressed_total_len = num_computed_tokens + num_scheduled_tokens
+
+            # The number of new compressed position ids for each request
+            num_new_compressed_pos = compressed_total_len - compressed_historical_len
+
+            # Core vectorized calculation (no for-loop)
+            pos_starts = compressed_historical_len
+            prefix_offsets = np.concatenate([[0], np.cumsum(num_new_compressed_pos[:-1])])
+            compressed_pos_ids = np.arange(np.sum(num_new_compressed_pos)) + np.repeat(
+                pos_starts - prefix_offsets, num_new_compressed_pos
+            )
+
+            req_indices_compressed = np.repeat(arrange_np, num_new_compressed_pos)
+            req_indices_compressed_list.append(req_indices_compressed)
+            positions_compressed_list.append(compressed_pos_ids)
+            num_scheduled_tokens_compressed_list.append(num_new_compressed_pos)
+
     return positions_compressed_list, req_indices_compressed_list, num_scheduled_tokens_compressed_list
 
 

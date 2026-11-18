@@ -5,7 +5,7 @@ import threading
 from concurrent.futures import Future
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -13,6 +13,17 @@ import pytest
 import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorTransferResults
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        CircularBufferManager,
+        FullAttentionManager,
+        MambaManager,
+        SlidingWindowManager,
+    )
+
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake import base_worker, pull_worker
@@ -183,7 +194,10 @@ def test_pcp_dcp_selects_one_complete_replica_group() -> None:
         request_id="request",
         remote_tp_rank_groups=[[0, 1, 2, 3]],
         remote_dcp_size=2,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=16,
         remote_block_size=16,
         local_group_block_ids=[10, 11],
@@ -215,7 +229,10 @@ def test_pcp2_tp4_full_dcp_block_order_matches_vllm_rank_order() -> None:
             request_id="request",
             remote_tp_rank_groups=[list(range(8))],
             remote_dcp_size=8,
-            spec_index=0,
+            **cast(
+                dict[str, Any],
+                {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+            ),
             local_block_size=16,
             remote_block_size=16,
             local_group_block_ids=[10],
@@ -392,7 +409,10 @@ def test_compute_full_attention_blocks_skips_remote_prefix_and_balances_replica(
         request_id="request",
         remote_tp_rank_groups=[[2, 3]],
         remote_dcp_size=1,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=16,
         remote_block_size=16,
         local_group_block_ids=[10, 11],
@@ -429,7 +449,10 @@ def test_compute_sfa_indexer_blocks_uses_virtual_block_size_for_prefix(
         request_id="request",
         remote_tp_rank_groups=[[0]],
         remote_dcp_size=remote_scale,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=32,
         remote_block_size=remote_block_size,
         local_group_block_ids=[10, 11],
@@ -460,7 +483,10 @@ def test_compute_non_replicated_sfa_indexer_uses_dcp_sequence_shards() -> None:
         request_id="request",
         remote_tp_rank_groups=[list(range(8))],
         remote_dcp_size=8,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=16,
         remote_block_size=16,
         local_group_block_ids=[10],
@@ -488,7 +514,10 @@ def test_dcp8_sharded_indexer_pd_uses_interleave_not_kernel_multiplier(rank, com
         request_id="request",
         remote_tp_rank_groups=[[0]],
         remote_dcp_size=1,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=1536,
         remote_block_size=1536,
         local_group_block_ids=[10, 11],
@@ -664,7 +693,7 @@ def test_compute_sliding_window_blocks_uses_unhashed_suffix() -> None:
         "request",
         [[0]],
         1,
-        0,
+        0 if vllm_version_is("0.33.0") else SlidingWindowManager.config(sliding_window=64),
         16,
         16,
         [10, 11],
@@ -691,7 +720,7 @@ def test_compute_circular_blocks_transfers_the_single_complete_page(spec: KVCach
         "request",
         [[0, 1, 2, 3]],
         4,
-        0,
+        0 if vllm_version_is("0.33.0") else CircularBufferManager.config(),
         16,
         16,
         [10],
@@ -719,7 +748,7 @@ def test_compute_circular_blocks_rejects_partial_or_mismatched_pages() -> None:
             "request",
             [[0]],
             1,
-            0,
+            0 if vllm_version_is("0.33.0") else CircularBufferManager.config(),
             16,
             16,
             [10, 11],
@@ -740,7 +769,7 @@ def test_compute_circular_blocks_rejects_partial_or_mismatched_pages() -> None:
             "request",
             [[0]],
             1,
-            0,
+            0 if vllm_version_is("0.33.0") else CircularBufferManager.config(),
             16,
             16,
             [10],
@@ -770,7 +799,7 @@ def test_compute_mamba_state_selects_pre_speculative_local_block(
         "request",
         [[0]],
         1,
-        0,
+        0 if vllm_version_is("0.33.0") else MambaManager.config(num_speculative_blocks=num_speculative_blocks),
         16,
         16,
         local_blocks,
@@ -781,7 +810,9 @@ def test_compute_mamba_state_selects_pre_speculative_local_block(
         0,
         1,
         1,
-        replace(make_mamba_spec(), num_speculative_blocks=num_speculative_blocks),
+        replace(make_mamba_spec(), num_speculative_blocks=num_speculative_blocks)
+        if vllm_version_is("0.33.0")
+        else make_mamba_spec(),
         0,
         remote_interleave_size=16,
     )
@@ -796,7 +827,7 @@ def test_compute_dcp_blocks_maps_local_shards_to_remote_dcp_ranks() -> None:
         "request",
         [[0, 1, 2, 3]],
         4,
-        0,
+        0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
         16,
         16,
         [10, 11],
@@ -822,7 +853,7 @@ def test_compute_dcp_blocks_supports_different_logical_block_sizes() -> None:
         "request",
         [[5]],
         1,
-        0,
+        0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
         16,
         32,
         [10, 11],
@@ -850,7 +881,7 @@ def test_hybrid_dcp_mapping_uses_token_interleave_before_scheduler_pages(rank, c
         "request",
         [[3]],
         1,
-        0,
+        0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
         101376,
         50688,
         [10],
@@ -1685,7 +1716,7 @@ def test_compute_same_block_size_dcp_matrix(
         "request",
         [candidate_ranks],
         remote_dcp_size,
-        0,
+        0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
         16,
         16,
         [10, 11],
@@ -1711,7 +1742,7 @@ def test_compute_dcp_stops_when_remote_prompt_has_fewer_blocks() -> None:
         "request",
         [[0]],
         1,
-        0,
+        0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
         16,
         16,
         [10, 11],
@@ -2079,7 +2110,10 @@ def test_compute_block_ids_across_equal_block_size_dcp_matrix(
         request_id="request",
         remote_tp_rank_groups=[candidate_ranks],
         remote_dcp_size=remote_dcp_size,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=16,
         remote_block_size=16,
         local_group_block_ids=local_blocks,
@@ -2170,7 +2204,10 @@ def test_compute_block_ids_across_unequal_block_size_dcp_matrix(
         request_id="request",
         remote_tp_rank_groups=[candidate_ranks],
         remote_dcp_size=remote_dcp_size,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=local_block_size,
         remote_block_size=remote_block_size,
         local_group_block_ids=local_blocks,
@@ -2197,7 +2234,23 @@ def test_replicated_mamba_selects_one_complete_producer_replica(local_tp: int, r
     groups = thread._get_layer_remote_tp_rank_groups(0, 0, spec, make_pp_metadata(), remote_pcp, remote_tp, 1)
     assert groups == [list(range(remote_pcp * remote_tp))]
     transfers = thread._compute_group_block_ids(
-        "request", groups, 1, 0, 16, 16, [2], [2], [3], 15, 15, 0, 1, 1, spec, 1, remote_interleave_size=1
+        "request",
+        groups,
+        1,
+        0 if vllm_version_is("0.33.0") else MambaManager.config(),
+        16,
+        16,
+        [2],
+        [2],
+        [3],
+        15,
+        15,
+        0,
+        1,
+        1,
+        spec,
+        1,
+        remote_interleave_size=1,
     )
     assert transfers == [(1, [2], [3])]
 
@@ -2264,7 +2317,10 @@ def test_interleaved_dcp_rejects_invalid_alignment(interleave, message) -> None:
     with pytest.raises(ValueError, match=message):
         thread._compute_group_block_ids(
             request_id="request",
-            spec_index=0,
+            **cast(
+                dict[str, Any],
+                {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+            ),
             spec=make_full_spec(block_size=512),
             local_group_block_ids=[],
             remote_dcp_size=1,
@@ -2291,7 +2347,10 @@ def test_interleaved_dcp_does_not_copy_a_fully_cached_partial_block() -> None:
     assert (
         thread._compute_group_block_ids(
             request_id="request",
-            spec_index=0,
+            **cast(
+                dict[str, Any],
+                {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+            ),
             spec=make_full_spec(block_size=512),
             local_group_block_ids=[],
             remote_dcp_size=1,
@@ -2326,7 +2385,10 @@ def test_interleaved_dcp_crosses_local_pages_using_full_block_table(computed, lo
         request_id="request",
         remote_tp_rank_groups=[[0]],
         remote_dcp_size=1,
-        spec_index=0,
+        **cast(
+            dict[str, Any],
+            {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+        ),
         local_block_size=512,
         remote_block_size=256,
         local_group_block_ids=[17] if computed else [10, 17],
@@ -2375,7 +2437,10 @@ def test_dcp_mapping_uses_each_peers_interleave(
             request_id="request",
             remote_tp_rank_groups=rank_groups,
             remote_dcp_size=remote_dcp,
-            spec_index=0,
+            **cast(
+                dict[str, Any],
+                {"spec_index": 0} if vllm_version_is("0.33.0") else {"manager_config": FullAttentionManager.config()},
+            ),
             local_block_size=local_page,
             remote_block_size=remote_page,
             local_group_block_ids=[],
@@ -2432,7 +2497,7 @@ def test_dcp_mapping_rejects_invalid_remote_interleave(interleave, message) -> N
             "request",
             [[0, 1]],
             2,
-            0,
+            0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
             512,
             512,
             [10],
@@ -2459,7 +2524,7 @@ def test_dcp_mapping_rejects_incomplete_block_tables(missing_side) -> None:
             "request",
             [[0, 1]],
             2,
-            0,
+            0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
             512,
             512,
             [10],

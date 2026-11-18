@@ -14,9 +14,22 @@ import numpy as np
 from numpy.typing import NDArray
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+from vllm_ascend.utils import vllm_version_is
 
-# isort: split
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+if not vllm_version_is("0.33.0"):
+    # isort: split
+    from dataclasses import replace
+
+    import torch
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, SlidingWindowManager
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 
 from tests.ut.distributed.ascend_store.test_mooncake_hybrid import MemoryRangeStore, cpu_cache
 from tests.ut.distributed.ascend_store.test_pool_worker import make_worker
@@ -53,26 +66,68 @@ class TestMooncakePipeline(unittest.TestCase):
         # layer that is not part of get_num_layers().
         layers = list(range(3)) if stage == 0 else list(range(3, 7 + int(draft)))
         names = [f"model.layers.{layer}.kv" for layer in layers]
-        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8")
-        groups = [KVCacheGroupSpec(names, spec)]
+        spec = AttentionSpec(
+            block_size=16, num_kv_heads=1, head_size=1, dtype="uint8" if vllm_version_is("0.33.0") else torch.uint8
+        )
+        groups = [
+            KVCacheGroup(names, spec)
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(dict.fromkeys(names, FullAttentionManager.layer_config(spec)))
+        ]
         if hybrid:
             groups = [
-                KVCacheGroupSpec([name for layer, name in zip(layers, names) if layer in (0, 2, 3, 6, 7)], spec),
-                KVCacheGroupSpec(
+                KVCacheGroup([name for layer, name in zip(layers, names) if layer in (0, 2, 3, 6, 7)], spec)
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        [name for layer, name in zip(layers, names) if layer in (0, 2, 3, 6, 7)],
+                        FullAttentionManager.layer_config(spec),
+                    )
+                ),
+                KVCacheGroup(
                     [f"model.layers.{layer}.c4" for layer in layers if layer in (1, 2, 4, 5, 6, 7)]
                     + (["model.layers.6.c4_indexer"] if stage else []),
-                    FullAttentionSpec(block_size=32, num_kv_heads=1, head_size=1, dtype="uint8"),
+                    AttentionSpec(block_size=32, num_kv_heads=1, head_size=1, dtype="uint8"),
+                )
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        [f"model.layers.{layer}.c4" for layer in layers if layer in (1, 2, 4, 5, 6, 7)]
+                        + (["model.layers.6.c4_indexer"] if stage else []),
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=32, num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                        ),
+                    )
                 ),
-                KVCacheGroupSpec(
+                KVCacheGroup(
                     [f"model.layers.{layer}.state" for layer in layers if layer in (0, 2, 3, 6, 7)],
                     SlidingWindowSpec(block_size=16, sliding_window=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                )
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        [f"model.layers.{layer}.state" for layer in layers if layer in (0, 2, 3, 6, 7)],
+                        SlidingWindowManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype=torch.uint8),
+                            sliding_window=16,
+                        ),
+                    )
                 ),
             ]
         if empty_tail:
-            # The final layer owns only unreachable SWA state in this step.
-            groups[0].layer_names = ["model.layers.3.kv", "model.layers.5.kv"]
-            groups[1].layer_names = ["model.layers.4.c4", "model.layers.5.c4"]
-            groups[2].layer_names = ["model.layers.6.state"]
+            if vllm_version_is("0.33.0"):
+                groups[0].layer_names = ["model.layers.3.kv", "model.layers.5.kv"]
+                groups[1].layer_names = ["model.layers.4.c4", "model.layers.5.c4"]
+                groups[2].layer_names = ["model.layers.6.state"]
+            else:
+                groups[0].kv_cache_specs = dict.fromkeys(
+                    ["model.layers.3.kv", "model.layers.5.kv"], groups[0].distinct_specs[0]
+                )
+                groups[1].kv_cache_specs = dict.fromkeys(
+                    ["model.layers.4.c4", "model.layers.5.c4"], groups[1].distinct_specs[0]
+                )
+                groups[2].kv_cache_specs = dict.fromkeys(["model.layers.6.state"], groups[2].distinct_specs[0])
+
         config = SimpleNamespace(num_blocks=10, kv_cache_groups=groups)
         with patch.object(BaseKVPoolWorker, "_build_cache_coordinator", return_value=None):
             worker = make_worker(
@@ -391,17 +446,26 @@ class TestMooncakePipeline(unittest.TestCase):
         config.model_config.get_layers_start_end_indices.side_effect = lambda p: ((0, 4), (4, 7))[p.rank // 2]
         self.assertNotEqual(original, protocol.layerwise_topology_namespace(config))
         groups = worker.kv_cache_config.kv_cache_groups
-        wrapped = SimpleNamespace(
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    g.layer_names, UniformTypeKVCacheSpecs.from_specs({name: g.kv_cache_spec for name in g.layer_names})
-                )
-                for g in groups
-            ]
-        )
+        if vllm_version_is("0.33.0"):
+            wrapped = SimpleNamespace(
+                kv_cache_groups=[
+                    KVCacheGroup(
+                        g.layer_names,
+                        UniformTypeKVCacheSpecs.from_specs({name: g.kv_cache_spec for name in g.layer_names}),
+                    )
+                    for g in groups
+                ]
+            )
+        else:
+            projected = SimpleNamespace(
+                kv_cache_groups=[
+                    replace(group, kv_cache_specs={}, unprojected_specs=group.distinct_specs) for group in groups
+                ]
+            )
+
         self.assertEqual(
             protocol.hybrid_layout_id(worker.kv_cache_config, 2, namespace=original),
-            protocol.hybrid_layout_id(wrapped, 2, namespace=original),
+            protocol.hybrid_layout_id(wrapped if vllm_version_is("0.33.0") else projected, 2, namespace=original),
         )
 
     def test_empty_groups_and_missing_local_mapping_fail_closed(self):

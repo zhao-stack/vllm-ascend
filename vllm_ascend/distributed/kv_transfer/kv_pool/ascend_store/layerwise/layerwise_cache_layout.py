@@ -9,13 +9,13 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    KVCacheTensor,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec, KVCacheTensor
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
 
 from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
@@ -244,15 +244,21 @@ def get_layerwise_kv_cache_specs(
     kv_cache_config: KVCacheConfig,
 ) -> dict[str, KVCacheSpec]:
     """Expand group specs into a cache spec for every logical layer."""
-    layer_specs: dict[str, KVCacheSpec] = {}
-    for group in kv_cache_config.kv_cache_groups:
-        group_spec = group.kv_cache_spec
-        for layer_name in group.layer_names:
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                layer_specs[layer_name] = group_spec.kv_cache_specs[layer_name]
-            else:
-                layer_specs[layer_name] = group_spec
-    return layer_specs
+    if vllm_version_is("0.33.0"):
+        layer_specs: dict[str, KVCacheSpec] = {}
+        for group in kv_cache_config.kv_cache_groups:
+            group_spec = group.kv_cache_spec
+            for layer_name in group.layer_names:
+                if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                    layer_specs[layer_name] = group_spec.kv_cache_specs[layer_name]
+                else:
+                    layer_specs[layer_name] = group_spec
+
+    return (
+        layer_specs
+        if vllm_version_is("0.33.0")
+        else {name: spec for group in kv_cache_config.kv_cache_groups for name, spec in group.kv_cache_specs.items()}
+    )
 
 
 def build_layerwise_reuse_layout(

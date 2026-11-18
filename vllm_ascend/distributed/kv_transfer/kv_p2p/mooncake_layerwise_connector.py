@@ -1,5 +1,7 @@
 # mypy: ignore-errors
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import contextlib
 import copy
 import hashlib
@@ -42,16 +44,19 @@ from vllm.utils.math_utils import round_down
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    MambaSpec,
-    MLAAttentionSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec, MLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec, SlidingWindowSpec, UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
 from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -167,7 +172,7 @@ class SendReqInfo:
     local_block_ids: list[list[int]]
     local_transferred_tokens: int
     local_computed_tokens: int
-    request: "Request"
+    request: Request
 
     def extend_local_block_ids(self, new_block_ids: list[list[int]]) -> None:
         """extend local block ids for this step"""
@@ -212,68 +217,134 @@ class SizedDict(OrderedDict):
 
 
 class KVCacheSendingLayerThread(threading.Thread):
-    def __init__(
-        self,
-        engine: TransferEngine,
-        vllm_config: VllmConfig,
-        kv_cache_config: KVCacheConfig,
-        kv_cache_specs: list[KVCacheSpec],
-        attn_resharding_group_idx: set,
-        total_layers: int,
-        ready_event: threading.Event,
-        tp_size: int,
-        tp_rank: int,
-        pd_head_ratio: int,
-        num_head_replica: int,
-        layer_metadata: dict[str, LayerMetadata],
-        use_mla: bool,
-        use_attn_mamba_hybrid: bool,
-        k_buffer: torch.Tensor,
-        v_buffer: torch.Tensor,
-        enable_kv_quant: bool,
-        enable_c8_quant: bool,
-        resharding_stream: torch.npu.Stream,
-        callback_func: Callable[..., None] = lambda x: None,
-        reuse_completion_callback: Callable[[int, str | None], None] | None = None,
-    ):
-        super().__init__(daemon=True, name="KVCacheSendingLayerThread")
-        self.engine = engine
-        self.vllm_config = vllm_config
-        self.kv_cache_config = kv_cache_config
-        self.kv_cache_specs = kv_cache_specs
-        self.attn_resharding_group_idx = attn_resharding_group_idx
-        self.mamba_cache_mode = self.vllm_config.cache_config.mamba_cache_mode
-        self.num_speculative_tokens = (
-            self.vllm_config.speculative_config.num_speculative_tokens
-            if self.vllm_config.speculative_config is not None
-            else 0
-        )
-        self.tp_size = tp_size
-        self.tp_rank = tp_rank
-        self.pd_head_ratio = pd_head_ratio
-        self.num_head_replica = num_head_replica
-        self.layer_metadata = layer_metadata
-        self.total_layers = total_layers
-        self.use_mla = use_mla
-        self.use_attn_mamba_hybrid = use_attn_mamba_hybrid
-        self.resharding_stream = resharding_stream
-        self.current_layer = -1
+    if vllm_version_is("0.33.0"):
 
-        send_queue_size = 0
-        if self.pd_head_ratio != 1:
-            if self.use_attn_mamba_hybrid:
-                send_queue_size = len(self.kv_cache_specs)
-            else:
-                send_queue_size = 1
-        self.send_queue = queue.Queue[SendTask](maxsize=send_queue_size)
-        self.failed_reqs: set[str] = set()
-        self.k_buffer = k_buffer
-        self.v_buffer = v_buffer
-        self.enable_kv_quant = enable_kv_quant
-        self.enable_c8_quant = enable_c8_quant
-        self.ready_event = ready_event
-        self.callback_func = callback_func
-        self.reuse_completion_callback = reuse_completion_callback
+        def __init__(
+            self,
+            engine: TransferEngine,
+            vllm_config: VllmConfig,
+            kv_cache_config: KVCacheConfig,
+            kv_cache_specs: list[KVCacheSpec],
+            attn_resharding_group_idx: set,
+            total_layers: int,
+            ready_event: threading.Event,
+            tp_size: int,
+            tp_rank: int,
+            pd_head_ratio: int,
+            num_head_replica: int,
+            layer_metadata: dict[str, LayerMetadata],
+            use_mla: bool,
+            use_attn_mamba_hybrid: bool,
+            k_buffer: torch.Tensor,
+            v_buffer: torch.Tensor,
+            enable_kv_quant: bool,
+            enable_c8_quant: bool,
+            resharding_stream: torch.npu.Stream,
+            callback_func: Callable[..., None] = lambda x: None,
+            reuse_completion_callback: Callable[[int, str | None], None] | None = None,
+        ):
+            super().__init__(daemon=True, name="KVCacheSendingLayerThread")
+            self.engine = engine
+            self.vllm_config = vllm_config
+            self.kv_cache_config = kv_cache_config
+            self.kv_cache_specs = kv_cache_specs
+            self.attn_resharding_group_idx = attn_resharding_group_idx
+            self.mamba_cache_mode = self.vllm_config.cache_config.mamba_cache_mode
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config is not None
+                else 0
+            )
+            self.tp_size = tp_size
+            self.tp_rank = tp_rank
+            self.pd_head_ratio = pd_head_ratio
+            self.num_head_replica = num_head_replica
+            self.layer_metadata = layer_metadata
+            self.total_layers = total_layers
+            self.use_mla = use_mla
+            self.use_attn_mamba_hybrid = use_attn_mamba_hybrid
+            self.resharding_stream = resharding_stream
+            self.current_layer = -1
+
+            send_queue_size = 0
+            if self.pd_head_ratio != 1:
+                if self.use_attn_mamba_hybrid:
+                    send_queue_size = len(self.kv_cache_specs)
+                else:
+                    send_queue_size = 1
+            self.send_queue = queue.Queue[SendTask](maxsize=send_queue_size)
+            self.failed_reqs: set[str] = set()
+            self.k_buffer = k_buffer
+            self.v_buffer = v_buffer
+            self.enable_kv_quant = enable_kv_quant
+            self.enable_c8_quant = enable_c8_quant
+            self.ready_event = ready_event
+            self.callback_func = callback_func
+            self.reuse_completion_callback = reuse_completion_callback
+    else:
+
+        def __init__(
+            self,
+            engine: TransferEngine,
+            vllm_config: VllmConfig,
+            kv_cache_config: KVCacheConfig,
+            kv_cache_groups: list[KVCacheGroup],
+            attn_resharding_group_idx: set,
+            total_layers: int,
+            ready_event: threading.Event,
+            tp_size: int,
+            tp_rank: int,
+            pd_head_ratio: int,
+            num_head_replica: int,
+            layer_metadata: dict[str, LayerMetadata],
+            use_mla: bool,
+            use_attn_mamba_hybrid: bool,
+            k_buffer: torch.Tensor,
+            v_buffer: torch.Tensor,
+            enable_kv_quant: bool,
+            enable_c8_quant: bool,
+            resharding_stream: torch.npu.Stream,
+            callback_func: Callable[..., None] = lambda x: None,
+            reuse_completion_callback: Callable[[int, str | None], None] | None = None,
+        ):
+            super().__init__(daemon=True, name="KVCacheSendingLayerThread")
+            self.engine = engine
+            self.vllm_config = vllm_config
+            self.kv_cache_config = kv_cache_config
+            self.kv_cache_groups = kv_cache_groups
+            self.attn_resharding_group_idx = attn_resharding_group_idx
+            self.mamba_cache_mode = self.vllm_config.cache_config.mamba_cache_mode
+            self.num_speculative_tokens = (
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config is not None
+                else 0
+            )
+            self.tp_size = tp_size
+            self.tp_rank = tp_rank
+            self.pd_head_ratio = pd_head_ratio
+            self.num_head_replica = num_head_replica
+            self.layer_metadata = layer_metadata
+            self.total_layers = total_layers
+            self.use_mla = use_mla
+            self.use_attn_mamba_hybrid = use_attn_mamba_hybrid
+            self.resharding_stream = resharding_stream
+            self.current_layer = -1
+
+            send_queue_size = 0
+            if self.pd_head_ratio != 1:
+                if self.use_attn_mamba_hybrid:
+                    send_queue_size = len(self.kv_cache_groups)
+                else:
+                    send_queue_size = 1
+            self.send_queue = queue.Queue[SendTask](maxsize=send_queue_size)
+            self.failed_reqs: set[str] = set()
+            self.k_buffer = k_buffer
+            self.v_buffer = v_buffer
+            self.enable_kv_quant = enable_kv_quant
+            self.enable_c8_quant = enable_c8_quant
+            self.ready_event = ready_event
+            self.callback_func = callback_func
+            self.reuse_completion_callback = reuse_completion_callback
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -334,7 +405,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         dst_list: list[int] = []
         length_list: list[int] = []
 
-        layer_kv_cache_spec = self.kv_cache_specs[layer_group_idx]
+        layer_kv_cache_spec = (
+            self if vllm_version_is("0.33.0") else self.kv_cache_groups[layer_group_idx]
+        ).kv_cache_specs[layer_group_idx if vllm_version_is("0.33.0") else layer_name]
         remote_block_ids = req_meta.remote_block_ids[layer_group_idx]
         remote_layer_metadata = req_meta.remote_layer_metadata[layer_name]
         local_layer_metadata = self.layer_metadata[layer_name]
@@ -765,17 +838,17 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_scheduler = None
             self.connector_worker = MooncakeLayerwiseConnectorWorker(vllm_config, kv_cache_config, str(self.engine_id))
 
-    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+    def get_loaded_kv_cache_group_ids(self, request: Request) -> tuple[int, ...]:
         # vLLM main's scheduler uses this for skip_zeroing_group_ids and for
         # the DSV4.1 SWA replay-window check; a P/D transfer restores the
         # request's own blocks, i.e. every transfer group.
         return self._kv_cache_config.transfer_group_ids
 
-    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+    def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
 
@@ -788,7 +861,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
 
     def request_finished(
         self,
-        request: "Request",
+        request: Request,
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
@@ -796,7 +869,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
 
     def request_finished_all_groups(
         self,
-        request: "Request",
+        request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
@@ -827,7 +900,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         # Layerwise writes need the step's counters and send mappings beforehand.
         self.connector_worker.prepare_layerwise_step(connector_metadata)
 
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeLayerwiseConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
@@ -852,7 +925,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         self.connector_worker.on_kv_cache_written(layer_name)
 
     def save_kv_layer(
-        self, layer_name: str, kv_layer: list[torch.Tensor], attn_metadata: "AttentionMetadata", **kwargs
+        self, layer_name: str, kv_layer: list[torch.Tensor], attn_metadata: AttentionMetadata, **kwargs
     ) -> None:
         """MooncakeLayerwiseConnector does not save explicitly."""
         assert self.connector_worker is not None
@@ -861,7 +934,6 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
 
     def wait_for_save(self):
         """MooncakeLayerwiseConnector does not save explicitly."""
-        pass
 
 
 class MooncakeLayerwiseConnectorScheduler:
@@ -870,7 +942,11 @@ class MooncakeLayerwiseConnectorScheduler:
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
-        self.block_size = [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
+        self.block_size = (
+            [group_spec.kv_cache_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
+            if vllm_version_is("0.33.0")
+            else [group_spec.block_size for group_spec in kv_cache_config.kv_cache_groups]
+        )
         self.engine_id = engine_id
         logger.info("Initializing Mooncake Scheduler %s", engine_id)
 
@@ -912,12 +988,16 @@ class MooncakeLayerwiseConnectorScheduler:
 
     @staticmethod
     def _iter_kv_cache_specs(kv_cache_config: KVCacheConfig):
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
-            kv_cache_spec = kv_cache_group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                yield from kv_cache_spec.kv_cache_specs.values()
-            else:
-                yield kv_cache_spec
+        if vllm_version_is("0.33.0"):
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                kv_cache_spec = kv_cache_group.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    yield from kv_cache_spec.kv_cache_specs.values()
+                else:
+                    yield kv_cache_spec
+        else:
+            for group in kv_cache_config.kv_cache_groups:
+                yield from group.distinct_specs
 
     @classmethod
     def _has_attn_mamba_hybrid_cache(cls, kv_cache_config: KVCacheConfig) -> bool:
@@ -933,7 +1013,7 @@ class MooncakeLayerwiseConnectorScheduler:
             return num_prompt_tokens - 1
         return num_prompt_tokens
 
-    def _truncate_request_for_hybrid_prefill(self, request: "Request") -> None:
+    def _truncate_request_for_hybrid_prefill(self, request: Request) -> None:
         params = request.kv_transfer_params
         if (
             params is None
@@ -967,7 +1047,7 @@ class MooncakeLayerwiseConnectorScheduler:
                 trimmed_block_ids.append(list(group_block_ids))
         return tuple(trimmed_block_ids)
 
-    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         """
         For remote prefill, pull all prompt blocks from remote
         asynchronously relative to engine execution.
@@ -1002,7 +1082,7 @@ class MooncakeLayerwiseConnectorScheduler:
         # No remote prefill for this request.
         return 0, False
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+    def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int):
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeLayerwiseConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
@@ -1178,7 +1258,7 @@ class MooncakeLayerwiseConnectorScheduler:
 
     def request_finished(
         self,
-        request: "Request",
+        request: Request,
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
@@ -1190,7 +1270,7 @@ class MooncakeLayerwiseConnectorScheduler:
 
     def request_finished_all_groups(
         self,
-        request: "Request",
+        request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """
@@ -1215,7 +1295,13 @@ class MooncakeLayerwiseConnectorWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
-        self.kv_cache_specs: list[KVCacheSpec] = [spec.kv_cache_spec for spec in self.kv_cache_config.kv_cache_groups]
+        if vllm_version_is("0.33.0"):
+            self.kv_cache_specs: list[KVCacheSpec] = [
+                spec.kv_cache_spec for spec in self.kv_cache_config.kv_cache_groups
+            ]
+        else:
+            self.kv_cache_groups = self.kv_cache_config.kv_cache_groups
+
         self.local_engine_id: str = " "
         self.engine_id = engine_id
         self.dp_rank: int = vllm_config.parallel_config.data_parallel_rank
@@ -1259,7 +1345,11 @@ class MooncakeLayerwiseConnectorWorker:
         self._pending_reuse_layers: set[int] = set()
         self._cache_write_events: list[torch.npu.Event | None] = [None] * self.total_layers
 
-        self.block_size: list[int] = [spec.block_size for spec in self.kv_cache_specs]
+        self.block_size: list[int] = (
+            [spec.block_size for spec in self.kv_cache_specs]
+            if vllm_version_is("0.33.0")
+            else [group.block_size for group in self.kv_cache_groups]
+        )
         self.kernel_block_size_scale: list[int] = [1 for _ in range(self.num_kv_cache_groups)]
         self.layer_metadata: dict[str, LayerMetadata] = {}
         self.sparse_sfa_c8_layers: set[str] = set()
@@ -1393,7 +1483,9 @@ class MooncakeLayerwiseConnectorWorker:
         conv_total_padding_size = 0
         for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
             for layer_name in get_kv_cache_tensor_layers(kv_cache_tensor):
-                layer_kv_cache_spec = self.kv_cache_specs[layer2group_ids[layer_name]]
+                layer_kv_cache_spec = (
+                    self if vllm_version_is("0.33.0") else kv_cache_groups[layer2group_ids[layer_name]]
+                ).kv_cache_specs[layer2group_ids[layer_name] if vllm_version_is("0.33.0") else layer_name]
                 if isinstance(layer_kv_cache_spec, MambaSpec):
                     use_mamba = True
                     conv_shape, conv_dtype = layer_kv_cache_spec.shapes[0], layer_kv_cache_spec.dtypes[0]
@@ -1414,9 +1506,15 @@ class MooncakeLayerwiseConnectorWorker:
             if isinstance(kv_cache_tuple, (list, tuple)) is False:
                 kv_cache_tuple = [kv_cache_tuple]
             layer_kv_group_id = layer2group_ids[layer_name]
-            layer_kv_cache_spec = kv_cache_groups[layer_kv_group_id].kv_cache_spec
-            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
-                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+            layer_kv_cache_spec = (
+                kv_cache_groups[layer_kv_group_id].kv_cache_spec
+                if vllm_version_is("0.33.0")
+                else kv_cache_groups[layer_kv_group_id].kv_cache_specs[layer_name]
+            )
+            if vllm_version_is("0.33.0"):
+                if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                    layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+
             # Read the layout flags directly: some Ascend versions expose the
             # cache spec flags without the corresponding utils helpers.
             is_mla = isinstance(layer_kv_cache_spec, MLAAttentionSpec)
@@ -1436,10 +1534,17 @@ class MooncakeLayerwiseConnectorWorker:
                 not sparse_sfa_c8
                 and "indexer" not in layer_name.lower()
                 and (
-                    (
-                        self.pd_head_ratio > 1
-                        and (isinstance(layer_kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)))
-                    )
+                    self.pd_head_ratio > 1
+                    and isinstance(layer_kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec))
+                    or self.enable_kv_quant
+                    or self.enable_c8_quant
+                )
+                if vllm_version_is("0.33.0")
+                else not sparse_sfa_c8
+                and "indexer" not in layer_name.lower()
+                and (
+                    self.pd_head_ratio > 1
+                    and type(layer_kv_cache_spec) is AttentionSpec
                     or self.enable_kv_quant
                     or self.enable_c8_quant
                 )
@@ -1536,7 +1641,9 @@ class MooncakeLayerwiseConnectorWorker:
                 engine=self.engine,
                 vllm_config=self.vllm_config,
                 kv_cache_config=self.kv_cache_config,
-                kv_cache_specs=self.kv_cache_specs,
+                **{"kv_cache_specs": self.kv_cache_specs}
+                if vllm_version_is("0.33.0")
+                else {"kv_cache_groups": self.kv_cache_groups},
                 attn_resharding_group_idx=self.attn_resharding_group_idx,
                 total_layers=self.total_layers,
                 ready_event=ready_event,
@@ -1746,7 +1853,11 @@ class MooncakeLayerwiseConnectorWorker:
         remote_block_size = req_meta.remote_block_size
         remote_block_ids = req_meta.remote_block_ids
         for i in range(self.num_kv_cache_groups):
-            if isinstance(self.kv_cache_specs[i], MambaSpec):
+            if (
+                isinstance(self.kv_cache_specs[i], MambaSpec)
+                if vllm_version_is("0.33.0")
+                else issubclass(self.kv_cache_groups[i].manager_cls, MambaManager)
+            ):
                 continue
             if remote_block_size[i] != self.block_size[i] and len(req_meta.remote_block_ids[i]) > 0:
                 assert remote_block_size[i] > self.block_size[i] and remote_block_size[i] % self.block_size[i] == 0, (
@@ -1765,7 +1876,11 @@ class MooncakeLayerwiseConnectorWorker:
 
     def _get_kernel_block_ids(self, block_ids):
         for i in range(self.num_kv_cache_groups):
-            if isinstance(self.kv_cache_specs[i], MambaSpec):
+            if (
+                isinstance(self.kv_cache_specs[i], MambaSpec)
+                if vllm_version_is("0.33.0")
+                else issubclass(self.kv_cache_groups[i].manager_cls, MambaManager)
+            ):
                 continue
             if len(block_ids[i]) > 0:
                 block_ids[i] = [
@@ -1792,34 +1907,59 @@ class MooncakeLayerwiseConnectorWorker:
         self.current_layer = 0
         self._cache_write_events = [None] * self.total_layers
         if self.vllm_config.kv_transfer_config.is_kv_producer:
-            # update trans info
             update_metadata = {}
             for req_idx, (req_id, req_meta) in enumerate(metadata.requests.items()):
                 transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
                 self._align_remote_block_ids(req_meta)
-                for i, kv_cache_spec in enumerate(self.kv_cache_specs):
-                    if isinstance(kv_cache_spec, MambaSpec):
-                        single_group_transfer_mappings = self._get_kv_split_metadata_for_mamba(
-                            req_meta, req_idx, req_id, i
-                        )
-                    else:
-                        single_group_transfer_mappings = self._get_kv_split_metadata(req_meta, req_idx, req_id, i)
-                    for (host, port), block_dict in single_group_transfer_mappings.items():
-                        if (host, port) not in transfer_mappings:
-                            transfer_mappings[(host, port)] = {
-                                "local_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
-                                "remote_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
-                                "trans_count": [0 for _ in range(self.num_kv_cache_groups)],
-                            }
-                        transfer_mappings[(host, port)]["local_block_ids"][i].extend(
-                            single_group_transfer_mappings[(host, port)]["local_block_ids"]
-                        )
-                        transfer_mappings[(host, port)]["remote_block_ids"][i].extend(
-                            single_group_transfer_mappings[(host, port)]["remote_block_ids"]
-                        )
-                        transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[
-                            (host, port)
-                        ]["trans_count"]
+                if vllm_version_is("0.33.0"):
+                    for i, kv_cache_spec in enumerate(self.kv_cache_specs):
+                        if isinstance(kv_cache_spec, MambaSpec):
+                            single_group_transfer_mappings = self._get_kv_split_metadata_for_mamba(
+                                req_meta, req_idx, req_id, i
+                            )
+                        else:
+                            single_group_transfer_mappings = self._get_kv_split_metadata(req_meta, req_idx, req_id, i)
+                        for (host, port), block_dict in single_group_transfer_mappings.items():
+                            if (host, port) not in transfer_mappings:
+                                transfer_mappings[(host, port)] = {
+                                    "local_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                                    "remote_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                                    "trans_count": [0 for _ in range(self.num_kv_cache_groups)],
+                                }
+                            transfer_mappings[(host, port)]["local_block_ids"][i].extend(
+                                single_group_transfer_mappings[(host, port)]["local_block_ids"]
+                            )
+                            transfer_mappings[(host, port)]["remote_block_ids"][i].extend(
+                                single_group_transfer_mappings[(host, port)]["remote_block_ids"]
+                            )
+                            transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[
+                                (host, port)
+                            ]["trans_count"]
+                else:
+                    for i, group in enumerate(self.kv_cache_groups):
+                        if issubclass(group.manager_cls, MambaManager):
+                            single_group_transfer_mappings = self._get_kv_split_metadata_for_mamba(
+                                req_meta, req_idx, req_id, i
+                            )
+                        else:
+                            single_group_transfer_mappings = self._get_kv_split_metadata(req_meta, req_idx, req_id, i)
+                        for (host, port), block_dict in single_group_transfer_mappings.items():
+                            if (host, port) not in transfer_mappings:
+                                transfer_mappings[(host, port)] = {
+                                    "local_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                                    "remote_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                                    "trans_count": [0 for _ in range(self.num_kv_cache_groups)],
+                                }
+                            transfer_mappings[(host, port)]["local_block_ids"][i].extend(
+                                single_group_transfer_mappings[(host, port)]["local_block_ids"]
+                            )
+                            transfer_mappings[(host, port)]["remote_block_ids"][i].extend(
+                                single_group_transfer_mappings[(host, port)]["remote_block_ids"]
+                            )
+                            transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[
+                                (host, port)
+                            ]["trans_count"]
+
                 assert len(transfer_mappings) <= 1, f"Not support add mutil transfer task for req_id:{req_id}"
                 update_req_meta = copy.deepcopy(req_meta)
                 for (host, port), block_dict in transfer_mappings.items():
@@ -1885,7 +2025,7 @@ class MooncakeLayerwiseConnectorWorker:
         self,
         layer_name: str,
         kv_layer: list[torch.Tensor],
-        attn_metadata: "AttentionMetadata",
+        attn_metadata: AttentionMetadata,
         connector_metadata: MooncakeLayerwiseConnectorMetadata,
         **kwargs,
     ) -> None:
@@ -1918,14 +2058,30 @@ class MooncakeLayerwiseConnectorWorker:
             values = None
             quant_keys = None
             quant_values = None
-            if layer_name not in self.sparse_sfa_c8_layers and (
-                (
+            if (
+                layer_name not in self.sparse_sfa_c8_layers
+                and (
                     self.pd_head_ratio != 1
-                    and (isinstance(self.kv_cache_specs[layer_group_idx], (FullAttentionSpec, SlidingWindowSpec)))
-                    and send_task.group_num_blocks[layer_group_idx] > 0
+                    and isinstance(self.kv_cache_specs[layer_group_idx], (FullAttentionSpec, SlidingWindowSpec))
+                    and (send_task.group_num_blocks[layer_group_idx] > 0)
+                    or (self.enable_c8_quant and self.current_layer in self.vllm_config.quant_config.c8_quant_layers)
+                    or (
+                        self.enable_kv_quant
+                        and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers
+                    )
                 )
-                or (self.enable_c8_quant and self.current_layer in self.vllm_config.quant_config.c8_quant_layers)
-                or (self.enable_kv_quant and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers)
+                if vllm_version_is("0.33.0")
+                else layer_name not in self.sparse_sfa_c8_layers
+                and (
+                    self.pd_head_ratio != 1
+                    and type(self.kv_cache_groups[layer_group_idx].kv_cache_specs[layer_name]) is AttentionSpec
+                    and (send_task.group_num_blocks[layer_group_idx] > 0)
+                    or (self.enable_c8_quant and self.current_layer in self.vllm_config.quant_config.c8_quant_layers)
+                    or (
+                        self.enable_kv_quant
+                        and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers
+                    )
+                )
             ):
                 assert self.resharding_stream is not None
                 with npu_stream_switch(self.resharding_stream):

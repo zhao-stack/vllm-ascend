@@ -4,13 +4,29 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
-from vllm.v1.core.single_type_kv_cache_manager import (
-    register_all_kvcache_specs,
-)
-from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        register_all_kvcache_specs,
+    )
+
+from vllm.v1.kv_cache_interface import MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
+if not vllm_version_is("0.33.0"):
+    from tests.ut.models.test_glm5next_cache_config import make_layer_configs
+
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
@@ -26,6 +42,10 @@ from vllm_ascend.models.glm5next.cache_config import (
     get_glm5_next_pool_bytes_per_block,
 )
 from vllm_ascend.models.glm5next.cache_views import view_kpool_tail_cache
+
+if not vllm_version_is("0.33.0"):
+    from vllm_ascend.models.glm5next.kv_cache import KpoolTailManager
+
 from vllm_ascend.utils import get_kv_cache_tensor_layers
 from vllm_ascend.worker.v2 import attn_utils
 
@@ -109,7 +129,7 @@ def _make_specs(main_head_size=4):
         STATE: AscendIndexerKPoolTailSpec(
             block_size=2,
             ring_capacity=2,
-            sliding_window=2,
+            **cast(dict[str, Any], {"sliding_window": 2} if vllm_version_is("0.33.0") else {}),
             compress_ratio=2,
             num_kv_heads=1,
             head_size=1,
@@ -117,20 +137,18 @@ def _make_specs(main_head_size=4):
             model_version="glm5_next",
             indexes_kv_by_block_stride=True,
         ),
-        MAMBA: MambaSpec(
-            block_size=8,
-            shapes=((2, 2), (1, 2, 2)),
-            dtypes=(torch.bfloat16, torch.float32),
-        ),
+        MAMBA: MambaSpec(block_size=8, shapes=((2, 2), (1, 2, 2)), dtypes=(torch.bfloat16, torch.float32)),
     }
 
 
 def _make_plan(num_blocks=3, main_head_size=4):
     # Match production: vLLM registers built-in specs before the Ascend hook.
-    register_all_kvcache_specs(None)
+    if vllm_version_is("0.33.0"):
+        register_all_kvcache_specs(None)
+
     config = _make_config()
     specs = _make_specs(main_head_size)
-    groups = get_glm5_next_kv_cache_groups(config, specs)
+    groups = get_glm5_next_kv_cache_groups(config, specs if vllm_version_is("0.33.0") else make_layer_configs(specs))
     bytes_per_block = get_glm5_next_pool_bytes_per_block(groups)
     plan = get_glm5_next_kv_cache_config(
         config,
@@ -145,15 +163,22 @@ def v2_glm_cache_plan(request, monkeypatch):
     config, _, plan = _make_plan()
     if not request.param:
         for group in plan.kv_cache_groups:
-            spec = group.kv_cache_spec
-            if isinstance(spec, UniformTypeKVCacheSpecs):
-                group.kv_cache_spec = replace(
-                    spec,
-                    kv_cache_specs={
-                        name: replace(layer_spec, model_version=None)
-                        for name, layer_spec in spec.kv_cache_specs.items()
-                    },
-                )
+            if vllm_version_is("0.33.0"):
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    group.kv_cache_spec = replace(
+                        spec,
+                        kv_cache_specs={
+                            name: replace(layer_spec, model_version=None)
+                            for name, layer_spec in spec.kv_cache_specs.items()
+                        },
+                    )
+            else:
+                group.kv_cache_specs = {
+                    name: replace(spec, model_version=None) if isinstance(spec, AscendMLAAttentionSpec) else spec
+                    for name, spec in group.kv_cache_specs.items()
+                }
+
     config.model_config.get_num_layers = lambda _: 2
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(attn_utils.KVPPConfig, "from_vllm_config", lambda _: SimpleNamespace(size=1))
@@ -239,8 +264,10 @@ def test_glm_fp8_indexer_keys_and_scales_share_padded_pages_without_overlapping(
         scale_dtype=torch.float32,
         page_size_padded=640,
     )
-    register_all_kvcache_specs(None)
-    groups = get_glm5_next_kv_cache_groups(config, specs)
+    if vllm_version_is("0.33.0"):
+        register_all_kvcache_specs(None)
+
+    groups = get_glm5_next_kv_cache_groups(config, specs if vllm_version_is("0.33.0") else make_layer_configs(specs))
     plan = get_glm5_next_kv_cache_config(config, groups, 3 * get_glm5_next_pool_bytes_per_block(groups))
     config.model_config.get_num_layers = lambda _: 2
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
@@ -277,7 +304,11 @@ def test_cann_tail_views_keep_interleaved_rows_and_shared_page_stride(monkeypatc
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda _: False)
     raw_caches = attn_utils._allocate_kv_cache(plan, {}, torch.device("cpu"))
     spec = replace(_make_specs()[STATE], head_size=2)
-    plan.kv_cache_groups = [KVCacheGroupSpec(layer_names=[STATE], kv_cache_spec=spec)]
+    plan.kv_cache_groups = [
+        KVCacheGroup(layer_names=[STATE], kv_cache_spec=spec)
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers({STATE: KpoolTailManager.layer_config(spec)})
+    ]
     raw = raw_caches[STATE]
     expected = view_kpool_tail_cache(STATE, spec, raw, plan.num_blocks)[0]
     group = SimpleNamespace(kv_cache_group_id=0, kv_cache_spec=spec, layer_names=[STATE], backend=_StateBackend)
@@ -297,7 +328,7 @@ def test_speculative_tail_view_preserves_all_nine_physical_rows():
     spec = AscendIndexerKPoolTailSpec(
         block_size=4,
         ring_capacity=9,
-        sliding_window=4,
+        **cast(dict[str, Any], {"sliding_window": 4} if vllm_version_is("0.33.0") else {}),
         compress_ratio=4,
         num_kv_heads=1,
         head_size=2,

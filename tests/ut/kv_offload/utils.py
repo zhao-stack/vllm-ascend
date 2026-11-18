@@ -5,7 +5,7 @@
 
 import os
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import torch
@@ -24,12 +24,23 @@ from vllm.model_executor.models import ModelRegistry
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
-
-from vllm_ascend.utils import vllm_version_is
 
 EOS_TOKEN_ID = 50256
 
@@ -158,8 +169,17 @@ def create_scheduler(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(
-                ["layer"], FullAttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float16)
+            KVCacheGroup(
+                ["layer"], AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float16)
+            )
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(
+                dict.fromkeys(
+                    ["layer"],
+                    FullAttentionManager.layer_config(
+                        AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float16)
+                    ),
+                )
             )
         ],
     )
@@ -260,7 +280,7 @@ def create_model_runner_output(
 
     model_runner_output = ModelRunnerOutput(
         req_ids=req_ids,
-        **({"req_id_to_index": req_id_to_index} if vllm_version_is("0.33.0") else {}),
+        **(cast(dict[str, Any], {"req_id_to_index": req_id_to_index} if vllm_version_is("0.33.0") else {})),
         sampled_token_ids=sampled_token_ids,
         logprobs=None,
         prompt_logprobs_dict={},

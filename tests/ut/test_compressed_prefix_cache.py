@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Ascend project
 
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -9,39 +10,54 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 
-# vLLM #61183 moved `is_kv_cache_spec_uniform` to `kv_cache_planning` on main;
-# the v0.33.0 lane still ships it in `kv_cache_utils`.
-from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    # vLLM #61183 moved `is_kv_cache_spec_uniform` to `kv_cache_planning` on main;
+    # the v0.33.0 lane still ships it in `kv_cache_utils`.
+    from vllm.v1.core.kv_cache_planning import is_kv_cache_spec_uniform
+else:
+    from vllm.v1.core.kv_cache_coordinator import HybridKVCacheCoordinator
+
 from vllm.v1.core.kv_cache_utils import (
     BlockHashListWithBlockSize,
     get_block_hash,
     get_request_block_hasher,
     init_none_hash,
 )
-from vllm.v1.core.single_type_kv_cache_manager import (
-    FullAttentionManager,
-    register_all_kvcache_specs,
-)
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    MambaSpec,
-    MLAAttentionSpec,
-)
+from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+else:
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, MLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.request import Request
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, get_storage_block_size
-from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
-    AscendHybridKVCacheCoordinator,
-)
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
+        AscendHybridKVCacheCoordinator,
+    )
+
 
 pytestmark = pytest.mark.cpu_test
 
 
 @pytest.fixture(autouse=True)
 def _init_hash_seed():
-    register_all_kvcache_specs(None)
+    if vllm_version_is("0.33.0"):
+        register_all_kvcache_specs(None)
+
     init_none_hash(sha256)
 
 
@@ -77,7 +93,9 @@ def _make_full_manager(
         hash_block_size=physical_block_size,
     )
     manager = FullAttentionManager(
-        spec,
+        spec
+        if vllm_version_is("0.33.0")
+        else KVCacheGroup.from_layers({"mla": FullAttentionManager.layer_config(spec)}),
         block_pool=block_pool,
         enable_caching=True,
         kv_cache_group_id=0,
@@ -86,20 +104,22 @@ def _make_full_manager(
     return spec, block_pool, manager
 
 
-def test_ascend_mla_spec_is_not_uniform_with_mamba() -> None:
-    mla_spec, _, _ = _make_full_manager()
-    mamba_spec = MambaSpec(
-        block_size=1,
-        shapes=((1,),),
-        dtypes=(torch.float32,),
-    )
+if vllm_version_is("0.33.0"):
 
-    assert not is_kv_cache_spec_uniform(
-        {
-            "mla": mla_spec,
-            "mamba": mamba_spec,
-        }
-    )
+    def test_ascend_mla_spec_is_not_uniform_with_mamba() -> None:
+        mla_spec, _, _ = _make_full_manager()
+        mamba_spec = MambaSpec(
+            block_size=1,
+            shapes=((1,),),
+            dtypes=(torch.float32,),
+        )
+
+        assert not is_kv_cache_spec_uniform(
+            {
+                "mla": mla_spec,
+                "mamba": mamba_spec,
+            }
+        )
 
 
 @pytest.mark.parametrize("physical_block_size", [32, 64, 128])
@@ -187,7 +207,12 @@ def test_compressed_prefix_cache_uses_logical_block_hash() -> None:
         max_length=logical_block_size,
         kv_cache_group_ids=[0],
         block_pool=block_pool,
-        kv_cache_spec=spec,
+        **cast(
+            dict[str, Any],
+            {"kv_cache_spec": spec}
+            if vllm_version_is("0.33.0")
+            else {"block_size": spec.block_size, "manager_config": FullAttentionManager.config()},
+        ),
         drop_eagle_block=False,
         alignment_tokens=logical_block_size,
     )
@@ -227,7 +252,12 @@ def test_compressed_prefix_cache_hits_identical_logical_block() -> None:
         max_length=logical_block_size,
         kv_cache_group_ids=[0],
         block_pool=block_pool,
-        kv_cache_spec=spec,
+        **cast(
+            dict[str, Any],
+            {"kv_cache_spec": spec}
+            if vllm_version_is("0.33.0")
+            else {"block_size": spec.block_size, "manager_config": FullAttentionManager.config()},
+        ),
         drop_eagle_block=False,
         alignment_tokens=logical_block_size,
     )
@@ -254,29 +284,49 @@ def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
         model_version="deepseek_v4",
         **ratio_kwargs,
     )
-    full_spec = FullAttentionSpec(
+    full_spec = AttentionSpec(
         block_size=physical_block_size,
         num_kv_heads=1,
         head_size=1,
         dtype=torch.float32,
     )
-    coordinator = AscendHybridKVCacheCoordinator(
-        kv_cache_config=KVCacheConfig(
-            num_blocks=16,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(["compressed"], compressed_spec),
-                KVCacheGroupSpec(["full"], full_spec),
-            ],
-        ),
-        max_model_len=logical_block_size,
-        use_eagle=False,
-        enable_caching=True,
-        enable_kv_cache_events=False,
-        dcp_world_size=1,
-        pcp_world_size=1,
-        hash_block_size=physical_block_size,
-        scheduler_block_size=logical_block_size,
+    coordinator = (
+        AscendHybridKVCacheCoordinator(
+            kv_cache_config=KVCacheConfig(
+                num_blocks=16,
+                kv_cache_tensors=[],
+                kv_cache_groups=[KVCacheGroup(["compressed"], compressed_spec), KVCacheGroup(["full"], full_spec)],
+            ),
+            max_model_len=logical_block_size,
+            **cast(dict[str, Any], {}),
+            use_eagle=False,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            hash_block_size=physical_block_size,
+            scheduler_block_size=logical_block_size,
+        )
+        if vllm_version_is("0.33.0")
+        else HybridKVCacheCoordinator(
+            kv_cache_config=KVCacheConfig(
+                num_blocks=16,
+                kv_cache_tensors=[],
+                kv_cache_groups=[
+                    KVCacheGroup.from_layers({"compressed": FullAttentionManager.layer_config(compressed_spec)}),
+                    KVCacheGroup.from_layers({"full": FullAttentionManager.layer_config(full_spec)}),
+                ],
+            ),
+            max_model_len=logical_block_size,
+            **cast(dict[str, Any], {"max_in_flight_tokens": 512}),
+            use_eagle=False,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            hash_block_size=physical_block_size,
+            scheduler_block_size=logical_block_size,
+        )
     )
 
     for manager in coordinator.single_type_managers:
@@ -312,48 +362,80 @@ def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
 def test_hybrid_coordinator_truncates_every_full_attention_group() -> None:
     hash_block_size = 2
     block_size = 2 * hash_block_size
-    coordinator = AscendHybridKVCacheCoordinator(
-        kv_cache_config=KVCacheConfig(
-            num_blocks=32,
-            kv_cache_tensors=[],
-            kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["full_a"],
-                    FullAttentionSpec(
-                        block_size=block_size,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype=torch.float32,
+    coordinator = (
+        AscendHybridKVCacheCoordinator(
+            kv_cache_config=KVCacheConfig(
+                num_blocks=32,
+                kv_cache_tensors=[],
+                kv_cache_groups=[
+                    KVCacheGroup(
+                        ["full_a"],
+                        AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32),
                     ),
-                ),
-                KVCacheGroupSpec(
-                    ["full_b"],
-                    FullAttentionSpec(
-                        block_size=2 * block_size,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype=torch.float32,
+                    KVCacheGroup(
+                        ["full_b"],
+                        AttentionSpec(block_size=2 * block_size, num_kv_heads=1, head_size=1, dtype=torch.float32),
                     ),
-                ),
-                KVCacheGroupSpec(
-                    ["mamba"],
-                    MambaSpec(
-                        block_size=block_size,
-                        shapes=((1,),),
-                        dtypes=(torch.float32,),
-                        mamba_cache_mode="align",
+                    KVCacheGroup(
+                        ["mamba"],
+                        MambaSpec(
+                            block_size=block_size, shapes=((1,),), dtypes=(torch.float32,), mamba_cache_mode="align"
+                        ),
                     ),
-                ),
-            ],
-        ),
-        max_model_len=8192,
-        use_eagle=False,
-        enable_caching=True,
-        enable_kv_cache_events=False,
-        dcp_world_size=1,
-        pcp_world_size=1,
-        hash_block_size=hash_block_size,
-        scheduler_block_size=block_size,
+                ],
+            ),
+            max_model_len=8192,
+            **cast(dict[str, Any], {}),
+            use_eagle=False,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            hash_block_size=hash_block_size,
+            scheduler_block_size=block_size,
+        )
+        if vllm_version_is("0.33.0")
+        else HybridKVCacheCoordinator(
+            kv_cache_config=KVCacheConfig(
+                num_blocks=32,
+                kv_cache_tensors=[],
+                kv_cache_groups=[
+                    KVCacheGroup.from_layers(
+                        {
+                            "full_a": FullAttentionManager.layer_config(
+                                AttentionSpec(block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32)
+                            )
+                        }
+                    ),
+                    KVCacheGroup.from_layers(
+                        {
+                            "full_b": FullAttentionManager.layer_config(
+                                AttentionSpec(
+                                    block_size=2 * block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
+                                )
+                            )
+                        }
+                    ),
+                    KVCacheGroup.from_layers(
+                        {
+                            "mamba": MambaManager.layer_config(
+                                MambaSpec(block_size=block_size, shapes=((1,),), dtypes=(torch.float32,)),
+                                mamba_cache_mode="align",
+                            )
+                        }
+                    ),
+                ],
+            ),
+            max_model_len=8192,
+            **cast(dict[str, Any], {"max_in_flight_tokens": 512}),
+            use_eagle=False,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            hash_block_size=hash_block_size,
+            scheduler_block_size=2 * block_size,
+        )
     )
     request = _make_request(
         "a",

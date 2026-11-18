@@ -2,6 +2,7 @@ import importlib
 from contextlib import nullcontext
 from functools import partial
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 import numpy as np
@@ -9,6 +10,13 @@ import pytest
 import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.worker.gpu import attn_utils
 from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -23,7 +31,6 @@ from vllm_ascend.attention.dsa_v1 import AscendDSABackend, AscendDSAMetadataBuil
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadataBuilder
 from vllm_ascend.patch.worker import patch_model_runner
-from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 from vllm_ascend.worker.v2.spec_decode.dflash2.speculator import AscendDFlash2Speculator
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
@@ -278,24 +285,42 @@ def test_adaptive_verification_manager_initialization(cpu_manager_resources, mon
     speculator = AscendMTPSpeculator.__new__(AscendMTPSpeculator)
     speculator.draft_attn_layer_names = {"draft"}
     speculator.enable_adaptive_verification = enabled
-    cache_spec = SimpleNamespace(
-        block_size=128,
-        uses_slot_mapping=True,
-        dcp_sharded=False,
-        block_table_token_alignment=1,
-        max_num_blocks_per_req=lambda *args: 1,
+    cache_spec = (
+        SimpleNamespace(
+            block_size=128,
+            **cast(
+                dict[str, Any],
+                {
+                    "uses_slot_mapping": True,
+                    "dcp_sharded": False,
+                    "block_table_token_alignment": 1,
+                    "max_num_blocks_per_req": lambda *args: 1,
+                },
+            ),
+        )
+        if vllm_version_is("0.33.0")
+        else AttentionSpec(
+            block_size=128, **cast(dict[str, Any], {"num_kv_heads": 1, "head_size": 16, "dtype": torch.float16})
+        )
     )
+    if not vllm_version_is("0.33.0"):
+        cache_group = KVCacheGroup.from_layers(
+            dict.fromkeys(("target", "draft"), FullAttentionManager.layer_config(cache_spec))
+        )
+        vllm_config = kwargs["vllm_config"]
+        vllm_config.parallel_config = SimpleNamespace(decode_context_parallel_size=1)
+
     runner = SimpleNamespace(
         parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
         is_encoder_decoder=False,
         max_model_len=128,
+        **cast(dict[str, Any], {} if vllm_version_is("0.33.0") else {"batch_sharder": None}),
         speculator=speculator,
         vllm_config=kwargs["vllm_config"],
         device=torch.device("cpu"),
         jit_warmup_registry=SimpleNamespace(activate=nullcontext),
         model_state=SimpleNamespace(
-            get_additional_cg_support=lambda: (AttentionCGSupport.ALWAYS, None),
-            num_new_sampled_tokens_per_step=1,
+            get_additional_cg_support=lambda: (AttentionCGSupport.ALWAYS, None), num_new_sampled_tokens_per_step=1
         ),
         req_states=kwargs["req_states"],
         input_buffers=SimpleNamespace(query_start_loc=kwargs["query_start_loc"]),
@@ -320,10 +345,18 @@ def test_adaptive_verification_manager_initialization(cpu_manager_resources, mon
     # Stop after the real manager call, before device cache allocation or graph setup.
     monkeypatch.setattr(upstream, "BlockTables", Mock(side_effect=BeforeCacheAllocation))
     cache_config = SimpleNamespace(
-        kv_cache_groups=[SimpleNamespace(kv_cache_spec=cache_spec, layer_names=["target", "draft"])]
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=cache_spec, layer_names=["target", "draft"])
+            if vllm_version_is("0.33.0")
+            else cache_group
+        ]
     )
     with pytest.raises(BeforeCacheAllocation):
-        patch_model_runner.initialize_kv_cache(runner, cache_config)
+        if vllm_version_is("0.33.0"):
+            patch_model_runner.initialize_kv_cache(runner, cache_config)
+        else:
+            GPUModelRunner.initialize_kv_cache(runner, cache_config)
+
     manager_call.assert_called_once()
     assert manager_call.call_args.kwargs["enable_adaptive_verification"] is enabled
     assert manager_call.call_args.kwargs["target_layer_names"] == {"target"}

@@ -2,18 +2,39 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """KV cache layers and metadata helpers for the GLM-Next pooled indexer."""
 
-from collections.abc import Sequence
-from typing import Any, ClassVar
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from collections.abc import Sequence
+
+from typing import Any
+
+if vllm_version_is("0.33.0"):
+    from typing import ClassVar
+
 
 import torch
 from torch import nn
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.core.block_pool import BlockPool
-from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.core.kv_cache_utils import BlockHashList, KVCacheBlock
+
 from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+
 from vllm.v1.kv_cache_interface import KVCacheSpec
-from vllm.v1.request import Request
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheLayerConfig
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.request import Request
+
 
 from vllm_ascend.core.kv_cache_interface import (
     AscendIndexerKPoolTailSpec,
@@ -104,6 +125,11 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_context[prefix] = self
 
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+            return FullAttentionManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
         ratio_kwargs: dict[str, Any] = {"tokens_per_state": self.compress_ratio}
@@ -163,15 +189,23 @@ class Glm5NextTailCache(nn.Module, AttentionLayerBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         static_context[prefix] = self
 
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+            return KpoolTailManager.layer_config(self.get_kv_cache_spec(vllm_config))
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         del vllm_config
+        sliding_window_kwargs: dict[str, Any] = (
+            {"sliding_window": self.compress_ratio} if vllm_version_is("0.33.0") else {}
+        )
         return AscendIndexerKPoolTailSpec(
             block_size=self.compress_ratio,
             ring_capacity=self.ring_capacity,
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
-            sliding_window=self.compress_ratio,
+            **sliding_window_kwargs,
             compress_ratio=self.compress_ratio,
         )
 
@@ -185,109 +219,119 @@ class Glm5NextTailCache(nn.Module, AttentionLayerBase):
     def forward(self): ...
 
 
-class KpoolTailManager(FullAttentionManager):
-    """Own one unshared ring block until request completion or preemption.
+if vllm_version_is("0.33.0"):
 
-    Prefix hits never initialize this transient cache. Logical pool-aligned
-    prefix lookup lets the next forward seed it without historical tail reads.
-    """
+    class KpoolTailManager(FullAttentionManager):
+        """Own one unshared ring block until request completion or preemption.
 
-    supports_fine_grained_hash_lookup: ClassVar[bool] = False
+        Prefix hits never initialize this transient cache. Logical pool-aligned
+        prefix lookup lets the next forward seed it without historical tail reads.
+        """
 
-    def __init__(
-        self,
-        kv_cache_spec: KVCacheSpec,
-        block_pool: BlockPool,
-        enable_caching: bool,
-        kv_cache_group_id: int,
-        scheduler_block_size: int,
-        **kwargs: Any,
-    ) -> None:
-        # The global pool can cache other groups; this manager never does.
-        # Disable it before entering the base constructor, independently of
-        # coordinator-side filtering and the caller's global caching setting.
-        super().__init__(
-            kv_cache_spec=kv_cache_spec,
-            block_pool=block_pool,
-            enable_caching=False,
-            kv_cache_group_id=kv_cache_group_id,
-            scheduler_block_size=scheduler_block_size,
-            **kwargs,
-        )
+        supports_fine_grained_hash_lookup: ClassVar[bool] = False
 
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        kv_cache_spec: KVCacheSpec,
-        drop_eagle_block: bool,
-        alignment_tokens: int,
-        dcp_world_size: int = 1,
-        pcp_world_size: int = 1,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        return tuple([] for _ in kv_cache_group_ids), 0
+        def __init__(
+            self,
+            kv_cache_spec: KVCacheSpec,
+            block_pool: BlockPool,
+            enable_caching: bool,
+            kv_cache_group_id: int,
+            scheduler_block_size: int,
+            **kwargs: Any,
+        ) -> None:
+            # The global pool can cache other groups; this manager never does.
+            # Disable it before entering the base constructor, independently of
+            # coordinator-side filtering and the caller's global caching setting.
+            super().__init__(
+                kv_cache_spec=kv_cache_spec,
+                block_pool=block_pool,
+                enable_caching=False,
+                kv_cache_group_id=kv_cache_group_id,
+                scheduler_block_size=scheduler_block_size,
+                **kwargs,
+            )
 
-    def cache_blocks(
-        self,
-        request: Request,
-        num_tokens: int,
-        retention_interval: int | None = None,
-        *,
-        replay_boundary: int | None = None,
-        replay_boundaries: Sequence[int] | None = None,
-    ) -> None:
-        # Upstream uses either replay boundary spelling; neither path publishes
-        # this request-private ring to the shared block cache.
-        return
+        @classmethod
+        def find_longest_cache_hit(
+            cls,
+            block_hashes: BlockHashList,
+            max_length: int,
+            kv_cache_group_ids: list[int],
+            block_pool: BlockPool,
+            kv_cache_spec: KVCacheSpec,
+            drop_eagle_block: bool,
+            alignment_tokens: int,
+            dcp_world_size: int = 1,
+            pcp_world_size: int = 1,
+        ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+            return tuple([] for _ in kv_cache_group_ids), 0
 
-    def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
-        return 0
+        def cache_blocks(
+            self,
+            request: Request,
+            num_tokens: int,
+            retention_interval: int | None = None,
+            *,
+            replay_boundary: int | None = None,
+            replay_boundaries: Sequence[int] | None = None,
+        ) -> None:
+            # Upstream uses either replay boundary spelling; neither path publishes
+            # this request-private ring to the shared block cache.
+            return
 
-    def get_num_blocks_to_allocate(
-        self,
-        request_id: str,
-        num_tokens: int,
-        new_computed_blocks: Sequence[KVCacheBlock],
-        total_computed_tokens: int,
-        num_local_computed_tokens: int,
-        num_tokens_main_model: int,
-        apply_admission_cap: bool = False,
-        prefill_end: int = 0,
-    ) -> int:
-        return 0 if self.req_to_blocks.get(request_id) else 1
+        def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
+            return 0
 
-    def _claim_ring_block(self, request_id: str, record_for_zeroing: bool = True) -> list[KVCacheBlock]:
-        req_blocks = self.req_to_blocks[request_id]
-        if req_blocks:
-            return []
-        new_blocks = self.block_pool.get_new_blocks(1)
-        req_blocks.extend(new_blocks)
-        if self._record_new_block_ids and record_for_zeroing:
-            self.new_block_ids.extend(block.block_id for block in new_blocks)
-        return new_blocks
+        def get_num_blocks_to_allocate(
+            self,
+            request_id: str,
+            num_tokens: int,
+            new_computed_blocks: Sequence[KVCacheBlock],
+            total_computed_tokens: int,
+            num_local_computed_tokens: int,
+            num_tokens_main_model: int,
+            apply_admission_cap: bool = False,
+            prefill_end: int = 0,
+        ) -> int:
+            return 0 if self.req_to_blocks.get(request_id) else 1
 
-    def allocate_new_blocks(self, request_id: str, num_tokens: int, num_tokens_main_model: int) -> list[KVCacheBlock]:
-        return self._claim_ring_block(request_id)
+        def _claim_ring_block(self, request_id: str, record_for_zeroing: bool = True) -> list[KVCacheBlock]:
+            req_blocks = self.req_to_blocks[request_id]
+            if req_blocks:
+                return []
+            new_blocks = self.block_pool.get_new_blocks(1)
+            req_blocks.extend(new_blocks)
+            if self._record_new_block_ids and record_for_zeroing:
+                self.new_block_ids.extend(block.block_id for block in new_blocks)
+            return new_blocks
 
-    def add_local_computed_blocks(
-        self,
-        request_id: str,
-        new_computed_blocks: Sequence[KVCacheBlock],
-        num_local_computed_tokens: int,
-        num_external_computed_tokens: int,
-    ) -> None:
-        assert not new_computed_blocks, "Tail blocks cannot be shared through prefix caching."
+        def allocate_new_blocks(
+            self, request_id: str, num_tokens: int, num_tokens_main_model: int
+        ) -> list[KVCacheBlock]:
+            return self._claim_ring_block(request_id)
 
-    def allocate_external_computed_blocks(
-        self,
-        request_id: str,
-        num_local_computed_tokens: int,
-        num_external_computed_tokens: int,
-        record_for_zeroing: bool = True,
-    ) -> None:
-        # An asynchronous connector load initializes the ring; zeroing it after
-        # the transfer starts would race with and overwrite the received state.
-        self._claim_ring_block(request_id, record_for_zeroing)
+        def add_local_computed_blocks(
+            self,
+            request_id: str,
+            new_computed_blocks: Sequence[KVCacheBlock],
+            num_local_computed_tokens: int,
+            num_external_computed_tokens: int,
+        ) -> None:
+            assert not new_computed_blocks, "Tail blocks cannot be shared through prefix caching."
+
+        def allocate_external_computed_blocks(
+            self,
+            request_id: str,
+            num_local_computed_tokens: int,
+            num_external_computed_tokens: int,
+            record_for_zeroing: bool = True,
+        ) -> None:
+            # An asynchronous connector load initializes the ring; zeroing it after
+            # the transfer starts would race with and overwrite the received state.
+            self._claim_ring_block(request_id, record_for_zeroing)
+else:
+
+    class KpoolTailManager(CircularBufferManager):  # type: ignore[no-redef]
+        """Reserve one zeroed ring block per request."""
+
+        zeroes_new_blocks = True

@@ -9,15 +9,20 @@ import pytest
 import torch
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    KVCacheLayout,
-    KVCacheTensor,
-    MambaSpec,
-    UniformTypeKVCacheSpecs,
-    compute_layout_strides,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheLayout, KVCacheTensor, MambaSpec, compute_layout_strides
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
@@ -85,14 +90,37 @@ def make_paired_cache(config, scale_dtype, with_draft=True, local_layers=None, d
                 is_draft=True,
                 non_causal_multi_token_decode=True,
             )
-    groups = paired_sfa_cache_groups(config, specs)
+    if not vllm_version_is("0.33.0"):
+        layer_configs = {
+            name: MambaManager.layer_config(spec, mamba_cache_mode="align")
+            if isinstance(spec, MambaSpec)
+            else replace(FullAttentionManager.layer_config(spec), is_draft=spec.is_draft)
+            for name, spec in specs.items()
+        }
+
+    groups = paired_sfa_cache_groups(config, specs if vllm_version_is("0.33.0") else layer_configs)
     if local_layers is not None:
-        groups = [
-            replace(
-                group, layer_names=[name for name in group.layer_names if extract_layer_index(name) in local_layers]
-            )
-            for group in groups
-        ]
+        groups = (
+            [
+                replace(
+                    group, layer_names=[name for name in group.layer_names if extract_layer_index(name) in local_layers]
+                )
+                for group in groups
+            ]
+            if vllm_version_is("0.33.0")
+            else [
+                replace(
+                    group,
+                    kv_cache_specs={
+                        name: spec
+                        for name, spec in group.kv_cache_specs.items()
+                        if extract_layer_index(name) in local_layers
+                    },
+                    unprojected_specs=group.distinct_specs,
+                )
+                for group in groups
+            ]
+        )
     local_specs = {name: specs[name] for group in groups for name in group.layer_names}
     return paired_sfa_cache_config(config, groups, 0), local_specs
 
@@ -293,9 +321,13 @@ def test_generic_sfa_mixed_group_keeps_private_caches(monkeypatch, vllm_config, 
         num_blocks=NUM_BLOCKS,
         kv_cache_tensors=descriptors,
         kv_cache_groups=[
-            KVCacheGroupSpec(
+            KVCacheGroup(
                 layer_names=list(specs),
                 kv_cache_spec=UniformTypeKVCacheSpecs(block_size=BLOCK_SIZE, kv_cache_specs=specs),
+            )
+            if vllm_version_is("0.33.0")
+            else KVCacheGroup.from_layers(
+                {name: FullAttentionManager.layer_config(spec) for name, spec in specs.items()}
             )
         ],
     )

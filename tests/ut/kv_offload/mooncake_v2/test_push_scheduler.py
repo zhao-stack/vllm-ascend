@@ -10,7 +10,18 @@ from unittest.mock import Mock
 import httpx
 import msgspec
 import pytest
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import MambaSpec
+else:
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
 from vllm.v1.request import RequestStatus
 from zmq.constants import SocketOption, SocketType
 from zmq.sugar.context import Context
@@ -29,6 +40,9 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.pull_scheduler import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.push_scheduler import MooncakePushConnectorScheduler
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake.utils import MooncakeMetaserverClient
+
+if not vllm_version_is("0.33.0"):
+    from .helpers import make_full_spec, make_mamba_spec
 
 
 def workers():
@@ -72,7 +86,13 @@ def scheduler():
     obj.metaserver_client = None
     obj._remote_worker_addresses = ()
     obj.group_block_size = [16, 16]
-    obj.group_unique_specs = [[Mock(spec=FullAttentionSpec, is_circular=False)] for _ in range(2)]
+    if vllm_version_is("0.33.0"):
+        obj.group_unique_specs = [[Mock(spec=AttentionSpec, is_circular=False)] for _ in range(2)]
+    else:
+        obj.kv_cache_groups = [
+            KVCacheGroup.from_layers({str(i): FullAttentionManager.layer_config(make_full_spec())}) for i in range(2)
+        ]
+
     obj.num_speculative_tokens = 0
     obj._reqs_pending_recv = {}
     obj._reqs_need_send_layerwise = {}
@@ -260,9 +280,15 @@ def test_producer_snapshots_new_and_cached_prefill_chunks(producer_scheduler, mo
 
 @pytest.mark.parametrize("num_speculative_blocks", [0, 2])
 def test_producer_mamba_excludes_speculative_tail(producer_scheduler, num_speculative_blocks):
-    producer_scheduler.group_unique_specs[1] = [
-        Mock(spec=MambaSpec, num_speculative_blocks=num_speculative_blocks, is_circular=False)
-    ]
+    if vllm_version_is("0.33.0"):
+        producer_scheduler.group_unique_specs[1] = [
+            Mock(spec=MambaSpec, num_speculative_blocks=num_speculative_blocks, is_circular=False)
+        ]
+    else:
+        producer_scheduler.kv_cache_groups[1] = KVCacheGroup.from_layers(
+            {"state": MambaManager.layer_config(make_mamba_spec(), num_speculative_blocks=num_speculative_blocks)}
+        )
+
     request = prefill_request()
     blocks = ([1, 2, 3], [10, 11, 12])
     allocate(producer_scheduler, request, blocks)
@@ -447,9 +473,15 @@ def test_push_load_order_covers_chunks_pending_sends_and_idle(producer_scheduler
 def test_metaserver_mamba_blocks_exclude_only_speculative_tail(scheduler, use_replayssm, metaserver):
     # MambaSpec derives this count from use_replayssm at model registration.
     num_speculative_blocks = 0 if use_replayssm else 2
-    scheduler.group_unique_specs[1] = [
-        Mock(spec=MambaSpec, num_speculative_blocks=num_speculative_blocks, is_circular=False)
-    ]
+    if vllm_version_is("0.33.0"):
+        scheduler.group_unique_specs[1] = [
+            Mock(spec=MambaSpec, num_speculative_blocks=num_speculative_blocks, is_circular=False)
+        ]
+    else:
+        scheduler.kv_cache_groups[1] = KVCacheGroup.from_layers(
+            {"state": MambaManager.layer_config(make_mamba_spec(), num_speculative_blocks=num_speculative_blocks)}
+        )
+
     scheduler.dcp_size = 1
     scheduler._metadata_thread = Mock(error=None)
     messages = []

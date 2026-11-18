@@ -9,10 +9,13 @@ import types
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import torch
 import zmq
+
+from vllm_ascend.utils import vllm_version_is
 
 fake_engine = types.ModuleType("mooncake.engine")
 fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
@@ -50,7 +53,7 @@ for _m in _to_remove:
 
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec  # noqa: E402
-from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (  # noqa
     KVCacheRecvingLayerThread,
     KVCacheSendingLayerThread,
     KVConnectorRole,
@@ -64,13 +67,16 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     ReqMeta,
     SendReqInfo,
     SendTask,
-    UniformTypeKVCacheSpecs,
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
     string_to_int64_hash,
     zmq_ctx,
 )
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import UniformTypeKVCacheSpecs  # noqa
+
 
 # Restore the mocked modules so other test files still work correctly.
 # For keys that our real import loaded, overwrite with the saved mock.
@@ -102,7 +108,12 @@ def _make_mock_kv_cache_config(block_size=16):
     kv_cache_spec = MagicMock()
     kv_cache_spec.block_size = block_size
     group_spec = MagicMock()
-    group_spec.kv_cache_spec = kv_cache_spec
+    if vllm_version_is("0.33.0"):
+        group_spec.kv_cache_spec = kv_cache_spec
+    else:
+        group_spec.block_size = block_size
+        group_spec.kv_cache_specs = {"layer0": kv_cache_spec}
+
     group_spec.layer_names = ["layer0"]
     kv_cache_config = MagicMock()
     kv_cache_config.kv_cache_groups = [group_spec]
@@ -151,7 +162,10 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         self.vllm_config.speculative_config = None
 
         self.kv_cache_config = _make_mock_kv_cache_config()
-        self.kv_cache_specs = [MagicMock(block_size=16)]
+        if vllm_version_is("0.33.0"):
+            self.kv_cache_specs = [MagicMock(block_size=16)]
+        else:
+            self.kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
         self.key = torch.zeros((4, 8), dtype=torch.float32)
         self.value = torch.zeros((4, 8), dtype=torch.float32)
@@ -159,7 +173,12 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             engine=self.engine,
             vllm_config=self.vllm_config,
             kv_cache_config=self.kv_cache_config,
-            kv_cache_specs=self.kv_cache_specs,
+            **cast(
+                dict[str, Any],
+                {"kv_cache_specs": self.kv_cache_specs}
+                if vllm_version_is("0.33.0")
+                else {"kv_cache_groups": self.kv_cache_groups},
+            ),
             attn_resharding_group_idx=set(),
             total_layers=3,
             ready_event=self.ready_event,
@@ -254,13 +273,19 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         vllm_config.speculative_config = None
 
         kv_cache_config = _make_mock_kv_cache_config()
-        kv_cache_specs = [MagicMock(block_size=16)]
+        if vllm_version_is("0.33.0"):
+            kv_cache_specs = [MagicMock(block_size=16)]
 
         thread = KVCacheSendingLayerThread(
             engine=self.engine,
             vllm_config=vllm_config,
             kv_cache_config=kv_cache_config,
-            kv_cache_specs=kv_cache_specs,
+            **cast(
+                dict[str, Any],
+                {"kv_cache_specs": kv_cache_specs}
+                if vllm_version_is("0.33.0")
+                else {"kv_cache_groups": kv_cache_config.kv_cache_groups},
+            ),
             attn_resharding_group_idx=set(),
             total_layers=2,
             ready_event=self.ready_event,
@@ -360,7 +385,11 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
                 block_size_scale=[1, 1],
             ),
         }
-        self.thread.kv_cache_specs = [MagicMock(block_size=16)]
+        if vllm_version_is("0.33.0"):
+            self.thread.kv_cache_specs = [MagicMock(block_size=16)]
+        else:
+            self.thread.kv_cache_groups = _make_mock_kv_cache_config().kv_cache_groups
+
         req_meta = self.req_meta_base
         req_meta.local_block_ids = [[5, 6]]
         req_meta.remote_block_ids = [[10, 11]]
@@ -479,7 +508,11 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
                 block_len=[32],
             ),
         }
-        self.thread.kv_cache_specs = [MagicMock(block_size=16)]
+        if vllm_version_is("0.33.0"):
+            self.thread.kv_cache_specs = [MagicMock(block_size=16)]
+        else:
+            self.thread.kv_cache_groups = _make_mock_kv_cache_config().kv_cache_groups
+
         req_meta = self.req_meta_base
         req_meta.local_block_ids = [[5, 6]]
         req_meta.remote_block_ids = [[10, 11]]
@@ -842,7 +875,12 @@ class MockKVCacheConfig:
         kv_cache_spec = MagicMock()
         kv_cache_spec.block_size = block_size
         group_spec = MagicMock()
-        group_spec.kv_cache_spec = kv_cache_spec
+        if vllm_version_is("0.33.0"):
+            group_spec.kv_cache_spec = kv_cache_spec
+        else:
+            group_spec.block_size = block_size
+            group_spec.kv_cache_specs = {"encoder.layer.0": kv_cache_spec}
+
         group_spec.layer_names = ["encoder.layer.0"]
         self.kv_cache_groups = [group_spec]
         self.kv_cache_tensors = []
@@ -1352,7 +1390,11 @@ def _make_worker_for_cache_write_event_test():
     worker.enable_c8_quant = False
     worker.enable_kv_quant = False
     worker.sparse_sfa_c8_layers = set()
-    worker.kv_cache_specs = [MagicMock()]
+    if vllm_version_is("0.33.0"):
+        worker.kv_cache_specs = [MagicMock()]
+    else:
+        worker.kv_cache_groups = _make_mock_kv_cache_config().kv_cache_groups
+
     worker.kv_send_layer_thread = MagicMock()
     worker.update_decoder_info = MagicMock(side_effect=lambda _req_id, req_meta: req_meta)
     worker._mark_layer_reuse_pending = MagicMock()
@@ -1673,9 +1715,23 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
     def _make_packed_sfa_worker(self, *, c8=True):
         layer_name = "model.layers.0.self_attn.attn"
         group = MagicMock()
-        group.kv_cache_spec = UniformTypeKVCacheSpecs(
-            block_size=16,
-            kv_cache_specs={
+        if vllm_version_is("0.33.0"):
+            group.kv_cache_spec = UniformTypeKVCacheSpecs(
+                block_size=16,
+                kv_cache_specs={
+                    layer_name: AscendMLAAttentionSpec(
+                        block_size=16,
+                        num_kv_heads=1,
+                        head_size=656,
+                        dtype=torch.float8_e4m3fn,
+                        cache_sparse_sfa_c8=c8,
+                        cache_sparse_sfa_turboquant=not c8,
+                    )
+                },
+            )
+        else:
+            group.block_size = 16
+            group.kv_cache_specs = {
                 layer_name: AscendMLAAttentionSpec(
                     block_size=16,
                     num_kv_heads=1,
@@ -1684,8 +1740,8 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
                     cache_sparse_sfa_c8=c8,
                     cache_sparse_sfa_turboquant=not c8,
                 )
-            },
-        )
+            }
+
         group.layer_names = [layer_name]
         kv_cache_config = MagicMock()
         kv_cache_config.kv_cache_groups = [group]
@@ -1704,7 +1760,11 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
                 indexer_name = "model.layers.0.self_attn.indexer.k_cache"
                 group = worker.kv_cache_config.kv_cache_groups[0]
                 group.layer_names.append(indexer_name)
-                group.kv_cache_spec.kv_cache_specs[indexer_name] = MagicMock()
+                if vllm_version_is("0.33.0"):
+                    group.kv_cache_spec.kv_cache_specs[indexer_name] = MagicMock()
+                else:
+                    group.kv_cache_specs[indexer_name] = MagicMock()
+
                 caches: dict[str, tuple[MagicMock, ...]] = {}
                 # Register indexer first to check it never selects quant staging.
                 for name, count in ((indexer_name, 2), (layer_name, 1)):
@@ -1747,7 +1807,11 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         worker, layer_name = self._make_packed_sfa_worker()
         spec = C8Spec(block_size=16, num_kv_heads=1, head_size=656, dtype=torch.float8_e4m3fn)
         self.assertFalse(hasattr(spec, "uses_packed_sfa_main_cache"))
-        worker.kv_cache_specs[0].kv_cache_specs[layer_name] = spec
+        if vllm_version_is("0.33.0"):
+            worker.kv_cache_specs[0].kv_cache_specs[layer_name] = spec
+        else:
+            worker.kv_cache_groups[0].kv_cache_specs[layer_name] = spec
+
         cache = MagicMock()
         cache.shape = (10, 16, 1, 656)
         cache.data_ptr.return_value = 0x1000
@@ -1771,7 +1835,11 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         indexer_0 = "model.layers.0.self_attn.indexer.k_cache"
         main_1 = "model.layers.1.self_attn.attn"
         group = MagicMock()
-        group.kv_cache_spec = MagicMock(block_size=16)
+        if vllm_version_is("0.33.0"):
+            group.kv_cache_spec = MagicMock(block_size=16)
+        else:
+            group.block_size = 16
+
         group.layer_names = [main_0, indexer_0, main_1]
         kv_cache_config = MagicMock()
         kv_cache_config.kv_cache_groups = [group]
@@ -1805,7 +1873,11 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         main_name = "model.layers.0.self_attn.attn"
         indexer_name = "model.layers.0.self_attn.indexer.k_cache"
         group = MagicMock()
-        group.kv_cache_spec = MagicMock(block_size=16)
+        if vllm_version_is("0.33.0"):
+            group.kv_cache_spec = MagicMock(block_size=16)
+        else:
+            group.block_size = 16
+
         group.layer_names = [main_name, indexer_name]
         kv_cache_config = MagicMock()
         kv_cache_config.kv_cache_groups = [group]
@@ -1841,10 +1913,18 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         main_name = "model.layers.0.self_attn.attn"
         indexer_name = "model.layers.0.self_attn.indexer.k_cache"
         main_group = MagicMock()
-        main_group.kv_cache_spec = MagicMock(block_size=16)
+        if vllm_version_is("0.33.0"):
+            main_group.kv_cache_spec = MagicMock(block_size=16)
+        else:
+            main_group.block_size = 16
+
         main_group.layer_names = [main_name]
         indexer_group = MagicMock()
-        indexer_group.kv_cache_spec = MagicMock(block_size=16)
+        if vllm_version_is("0.33.0"):
+            indexer_group.kv_cache_spec = MagicMock(block_size=16)
+        else:
+            indexer_group.block_size = 16
+
         indexer_group.layer_names = [indexer_name]
         kv_cache_config = MagicMock()
         kv_cache_config.kv_cache_groups = [main_group, indexer_group]
@@ -1874,7 +1954,11 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         main_name = "model.layers.0.self_attn.attn"
         indexer_name = "model.layers.0.self_attn.indexer.k_cache"
         group = MagicMock()
-        group.kv_cache_spec = MagicMock(block_size=16)
+        if vllm_version_is("0.33.0"):
+            group.kv_cache_spec = MagicMock(block_size=16)
+        else:
+            group.block_size = 16
+
         group.layer_names = [indexer_name, main_name]
         kv_cache_config = MagicMock()
         kv_cache_config.kv_cache_groups = [group]

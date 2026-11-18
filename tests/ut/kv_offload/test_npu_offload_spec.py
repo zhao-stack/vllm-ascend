@@ -11,7 +11,18 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 
 import vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.native.cpu_npu as cpu_npu_mod
@@ -275,7 +286,7 @@ def test_upstream_compatible_layout_uses_upstream_canonicalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer_name = "model.layers.0.self_attn"
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=2,
         num_kv_heads=1,
         head_size=3,
@@ -313,7 +324,7 @@ def test_split_attention_cache_is_zero_copy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     layer_name = "model.layers.0.self_attn"
-    spec = FullAttentionSpec(
+    spec = AttentionSpec(
         block_size=2,
         num_kv_heads=1,
         head_size=3,
@@ -322,9 +333,12 @@ def test_split_attention_cache_is_zero_copy(
     worker, captured = _make_layout_worker(
         SimpleNamespace(
             num_blocks=4,
-            kv_cache_groups=[KVCacheGroupSpec([layer_name], spec)],
+            kv_cache_groups=[
+                KVCacheGroup([layer_name], spec)
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(dict.fromkeys([layer_name], FullAttentionManager.layer_config(spec)))
+            ],
             kv_cache_tensors=[],
-            # The connector offloads the groups vLLM selects, not all of them.
             prefix_cacheable_group_ids=(0,),
             hisparse_host_num_blocks=None,
         ),

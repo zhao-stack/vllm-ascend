@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import contextlib
 import copy
 import hashlib
@@ -27,7 +29,16 @@ from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheGroup
+
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (
     GroupPull,
     GroupTransferInfo,
@@ -1788,13 +1799,20 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
 
     def _get_scheduler_block_size(self) -> int:
         for group in self.kv_cache_config.kv_cache_groups:
-            for spec in self._get_group_unique_specs(group):
-                if isinstance(spec, AscendSlidingWindowMLASpec) and spec.model_version == "deepseek_v4":
-                    return spec.block_size
+            if vllm_version_is("0.33.0"):
+                for spec in self._get_group_unique_specs(group):
+                    if isinstance(spec, AscendSlidingWindowMLASpec) and spec.model_version == "deepseek_v4":
+                        return spec.block_size
+            else:
+                if group.sliding_window_reach and any(
+                    getattr(spec, "model_version", None) == "deepseek_v4" for spec in group.distinct_specs
+                ):
+                    return group.block_size
+
         return self.vllm_config.cache_config.block_size
 
     def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
-        specs = self._get_group_unique_specs(group)
+        specs = self._get_group_unique_specs(group) if vllm_version_is("0.33.0") else group.distinct_specs
         if specs and all(
             isinstance(spec, AscendMLAAttentionSpec) and spec.model_version == "deepseek_v4" for spec in specs
         ):
@@ -1812,7 +1830,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
             )
         return super()._get_group_transfer_info(group)
 
-    def _d2rh_prefix_fingerprint(self, request: "Request", end_token: int) -> bytes:
+    def _d2rh_prefix_fingerprint(self, request: Request, end_token: int) -> bytes:
         """Stable-within-engine fingerprint for KV content through end_token.
 
         Request.block_hashes is a chained hash, so the final complete hash
@@ -1833,7 +1851,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
 
     def _d2rh_get_transfer_block_hashes(
         self,
-        request: "Request",
+        request: Request,
         block_ids: BlockIds,
         remote_block_ids: BlockIds,
     ) -> tuple[list[str | None], ...]:
@@ -1882,7 +1900,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
 
     def _d2rh_get_decode_endpoint_hashes(
         self,
-        request: "Request",
+        request: Request,
         remote_block_ids: BlockIds,
     ) -> tuple[list[str | None], ...] | None:
         """Reuse Request's chained hashes at only the transferred endpoints.
@@ -1929,7 +1947,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
 
     def _d2rh_get_decode_block_hashes(
         self,
-        request: "Request",
+        request: Request,
         remote_block_ids: BlockIds,
     ) -> tuple[list[str | None], ...]:
         """Hash prompt prefixes locally on D, aligned to P's remote blocks.
@@ -1990,7 +2008,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
 
     def request_finished(
         self,
-        request: "Request",
+        request: Request,
         block_ids: BlockIds,
     ) -> tuple[bool, dict[str, Any] | None]:
         delay_free, params = super().request_finished(request, block_ids)
@@ -2044,7 +2062,11 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
             prefill_pp_rank = remote_rank // prefill_tp_size
             group_pulls: list[GroupPull] = []
             for group_id, group in enumerate(self.kv_cache_groups):
-                if isinstance(group.kv_cache_spec, MambaSpec):
+                if (
+                    isinstance(group.kv_cache_spec, MambaSpec)
+                    if vllm_version_is("0.33.0")
+                    else any(isinstance(spec, MambaSpec) for spec in group.distinct_specs)
+                ):
                     num_group_pulls = max(1, prefill_tp_size // self._decode_tp_size)
                 else:
                     group_spec = self._serialize_group_for_scheduler(group)
@@ -2068,17 +2090,31 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
             pulls_by_port.append(group_pulls)
         return pulls_by_port
 
-    @staticmethod
-    def _serialize_group_for_scheduler(group: Any) -> dict[str, Any]:
-        kv_cache_spec = group.kv_cache_spec
-        return {
-            "kv_cache_spec_type": type(kv_cache_spec).__name__,
-            "kv_cache_spec": {
-                "num_kv_heads": getattr(kv_cache_spec, "num_kv_heads", None),
-                "num_key_value_heads": getattr(kv_cache_spec, "num_key_value_heads", None),
-            },
-            "layer_names": list(group.layer_names),
-        }
+    if vllm_version_is("0.33.0"):
+
+        @staticmethod
+        def _serialize_group_for_scheduler(group: Any) -> dict[str, Any]:
+            kv_cache_spec = group.kv_cache_spec
+            return {
+                "kv_cache_spec_type": type(kv_cache_spec).__name__,
+                "kv_cache_spec": {
+                    "num_kv_heads": getattr(kv_cache_spec, "num_kv_heads", None),
+                    "num_key_value_heads": getattr(kv_cache_spec, "num_key_value_heads", None),
+                },
+                "layer_names": list(group.layer_names),
+            }
+    else:
+
+        def _serialize_group_for_scheduler(self, group: KVCacheGroup) -> dict[str, Any]:  # type: ignore[misc]
+            kv_cache_spec = next(iter(group.distinct_specs))
+            return {
+                "kv_cache_spec_type": type(kv_cache_spec).__name__,
+                "kv_cache_spec": {
+                    "num_kv_heads": getattr(kv_cache_spec, "num_kv_heads", None),
+                    "num_key_value_heads": getattr(kv_cache_spec, "num_key_value_heads", None),
+                },
+                "layer_names": list(group.layer_names),
+            }
 
     def _build_start_pull_params(self, request_id: str, params: dict[str, Any], decode_tp_rank: int) -> dict[str, Any]:
         prefill_tp_size = params.get("remote_ptp_size") or self._prefill_tp_size
@@ -2159,7 +2195,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
             self.remote_poller.unregister(sock)
         sock.close(linger=0)
 
-    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_prefill"):
             # START_PULL serializes a copy of params. Publish the D-local
@@ -2216,7 +2252,7 @@ class MooncakeConnectorScheduler(BaseMooncakeConnectorScheduler):
             self._truncate_request_for_prefill(request)
         return 0, False
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+    def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int):
         if self.kv_role == "kv_consumer":
             with self.listeningthread.ready_lock:
                 self.all_requests.discard(request.request_id)

@@ -9,7 +9,13 @@ import torch
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+from vllm.v1.kv_cache_interface import MambaSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.kv_offload.preempt_offload.metadata import (
     MambaConvLoadMeta,
@@ -107,11 +113,20 @@ class PreemptOffloadWorker:
         mamba_layers: dict[str, MambaSpec] = {}
         for group in self.kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
-                layer_spec = group.kv_cache_spec
-                if isinstance(layer_spec, UniformTypeKVCacheSpecs):
-                    layer_spec = layer_spec.kv_cache_specs[layer_name]
-                if isinstance(layer_spec, MambaSpec):
-                    mamba_layers[layer_name] = layer_spec
+                layer_spec = group.kv_cache_spec if vllm_version_is("0.33.0") else group.kv_cache_specs[layer_name]
+                if (
+                    isinstance(layer_spec, UniformTypeKVCacheSpecs)
+                    if vllm_version_is("0.33.0")
+                    else isinstance(layer_spec, MambaSpec)
+                ):
+                    if vllm_version_is("0.33.0"):
+                        layer_spec = layer_spec.kv_cache_specs[layer_name]
+                    else:
+                        mamba_layers[layer_name] = layer_spec
+
+                if vllm_version_is("0.33.0"):
+                    if isinstance(layer_spec, MambaSpec):
+                        mamba_layers[layer_name] = layer_spec
 
         unique_gpu_caches: dict[str, torch.Tensor] = {}
         cache_name_by_ptr: dict[int, str] = {}

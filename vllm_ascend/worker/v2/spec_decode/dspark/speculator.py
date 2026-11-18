@@ -165,9 +165,14 @@ class AscendDSparkSpeculator(LmheadTPDraftSamplingMixin, DSparkSpeculator):
             layer_group_ids = tuple(group_ids[index] for index in self._layer_group_idx)
         if not group_ids or not layer_group_ids:
             raise ValueError("DSpark context initialization requires loaded draft attention layers")
-        block_sizes = {
-            group_id: self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size for group_id in group_ids
-        }
+        block_sizes = (
+            {
+                group_id: self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.block_size
+                for group_id in group_ids
+            }
+            if vllm_version_is("0.33.0")
+            else {group_id: self.kv_cache_config.kv_cache_groups[group_id].block_size for group_id in group_ids}
+        )
         return group_ids, layer_group_ids, block_sizes
 
     @torch.inference_mode()

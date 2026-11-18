@@ -10,10 +10,23 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401
+from vllm_ascend.utils import vllm_version_is
 
 # isort: split
 import torch
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, SlidingWindowSpec
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager, SlidingWindowManager
+
+from vllm.v1.kv_cache_interface import MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import mooncake_layerwise
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import MemcacheBackend
@@ -61,12 +74,19 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         config = self.make_config()
         config.parallel_config.tensor_parallel_size = 1
         cache = self.make_cache_config(2)
-        cache.kv_cache_groups[1].kv_cache_spec = MambaSpec(
-            block_size=32,
-            shapes=((4,),),
-            dtypes=(torch.float32,),
-            mamba_cache_mode="align",
-        )
+        if vllm_version_is("0.33.0"):
+            cache.kv_cache_groups[1].kv_cache_spec = MambaSpec(
+                block_size=32,
+                shapes=((4,),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode="align",
+            )
+        else:
+            state = MambaSpec(block_size=32, shapes=((4,),), dtypes=(torch.float32,))
+            cache.kv_cache_groups[1] = KVCacheGroup.from_layers(
+                {"model.layers.1.kv": MambaManager.layer_config(state, mamba_cache_mode="align")}
+            )
+
         for backend_class in (MooncakeBackend, MemcacheBackend):
             with self.subTest(backend=backend_class.__name__):
                 key_sets = []
@@ -151,7 +171,7 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         config.parallel_config.decode_context_parallel_size = 2
         cache = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
+                KVCacheGroup(
                     ["model.layers.0.state"],
                     MambaSpec(
                         block_size=16,
@@ -160,6 +180,17 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
                         mamba_cache_mode="align",
                         num_speculative_blocks=1,
                     ),
+                )
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.0.state"],
+                        MambaManager.layer_config(
+                            MambaSpec(block_size=16, shapes=((4,),), dtypes=("uint8",)),
+                            mamba_cache_mode="align",
+                            num_speculative_blocks=1,
+                        ),
+                    )
                 )
             ]
         )
@@ -177,15 +208,18 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         config.parallel_config.decode_context_parallel_size = 2
         cache = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
+                KVCacheGroup(
                     ["model.layers.0.swa"],
-                    SlidingWindowSpec(
-                        block_size=16,
-                        sliding_window=16,
-                        num_kv_heads=1,
-                        head_size=1,
-                        dtype="uint8",
-                    ),
+                    SlidingWindowSpec(block_size=16, sliding_window=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                )
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.0.swa"],
+                        SlidingWindowManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"), sliding_window=16
+                        ),
+                    )
                 )
             ]
         )
@@ -216,13 +250,13 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         config.parallel_config.decode_context_parallel_size = 2
         cache = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["model.layers.0.state"],
-                    MambaSpec(
-                        block_size=16,
-                        shapes=((4,),),
-                        dtypes=("uint8",),
-                    ),
+                KVCacheGroup(["model.layers.0.state"], MambaSpec(block_size=16, shapes=((4,),), dtypes=("uint8",)))
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.0.state"],
+                        MambaManager.layer_config(MambaSpec(block_size=16, shapes=((4,),), dtypes=("uint8",))),
+                    )
                 )
             ]
         )
@@ -270,13 +304,29 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
         config.parallel_config.decode_context_parallel_size = 2
         cache = SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
-                    ["model.layers.0.kv"],
-                    FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8"),
+                KVCacheGroup(
+                    ["model.layers.0.kv"], AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8")
+                )
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.0.kv"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=16, num_kv_heads=1, head_size=1, dtype="uint8")
+                        ),
+                    )
                 ),
-                KVCacheGroupSpec(
-                    ["model.layers.1.kv"],
-                    FullAttentionSpec(block_size=24, num_kv_heads=1, head_size=1, dtype="uint8"),
+                KVCacheGroup(
+                    ["model.layers.1.kv"], AttentionSpec(block_size=24, num_kv_heads=1, head_size=1, dtype="uint8")
+                )
+                if vllm_version_is("0.33.0")
+                else KVCacheGroup.from_layers(
+                    dict.fromkeys(
+                        ["model.layers.1.kv"],
+                        FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=24, num_kv_heads=1, head_size=1, dtype="uint8")
+                        ),
+                    )
                 ),
             ]
         )
@@ -354,9 +404,20 @@ class TestBoundLayerwiseKeys(unittest.TestCase):
     def make_cache_config(num_groups):
         return SimpleNamespace(
             kv_cache_groups=[
-                KVCacheGroupSpec(
+                KVCacheGroup(
                     [f"model.layers.{group}.kv"],
-                    FullAttentionSpec(block_size=16 * (group + 1), num_kv_heads=1, head_size=1, dtype="uint8"),
+                    AttentionSpec(block_size=16 * (group + 1), num_kv_heads=1, head_size=1, dtype="uint8"),
+                )
+                for group in range(num_groups)
+            ]
+            if vllm_version_is("0.33.0")
+            else [
+                KVCacheGroup.from_layers(
+                    {
+                        f"model.layers.{group}.kv": FullAttentionManager.layer_config(
+                            AttentionSpec(block_size=16 * (group + 1), num_kv_heads=1, head_size=1, dtype=torch.uint8)
+                        )
+                    }
                 )
                 for group in range(num_groups)
             ]

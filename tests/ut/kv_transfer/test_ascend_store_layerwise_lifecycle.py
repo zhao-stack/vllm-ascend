@@ -25,15 +25,23 @@ from vllm.utils.hashing import sha256
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash, resolve_kv_cache_block_sizes
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    KVCacheGroupSpec,
-    MambaSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+else:
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager, SlidingWindowManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import KVCacheGroupSpec as KVCacheGroup
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup
+
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
@@ -167,222 +175,438 @@ def memory_store(monkeypatch, tmp_path):
     monkeypatch.setattr(pool_worker, "get_pcp_group", lambda: SimpleNamespace(world_size=1))
     monkeypatch.setattr(pool_worker, "get_decode_context_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(pool_worker, "get_decode_context_model_parallel_rank", lambda: 0)
-    register_all_kvcache_specs(None)
+    if vllm_version_is("0.33.0"):
+        register_all_kvcache_specs(None)
+
     init_none_hash(sha256)
     return store
 
 
-@pytest.mark.parametrize(
-    "recurrent_type",
-    [MambaAttentionBackendEnum.MAMBA2, MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, None],
-)
-@pytest.mark.parametrize("wrapped", [False, True])
-def test_raw_tokens_hybrid_roundtrip(memory_store, recurrent_type, wrapped):
-    # The fixture installs the external client leaf before importing its backend.
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import MooncakeBackend
+if vllm_version_is("0.33.0"):
 
-    full = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
-    recurrent = (
-        MambaSpec(
-            block_size=32,
-            shapes=((8,), (8,)),
-            dtypes=(torch.float32, torch.float32),
-            mamba_type=recurrent_type,
-            mamba_cache_mode="align",
+    @pytest.mark.parametrize(
+        "recurrent_type",
+        [MambaAttentionBackendEnum.MAMBA2, MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, None],
+    )
+    @pytest.mark.parametrize("wrapped", [False, True])
+    def test_raw_tokens_hybrid_roundtrip(memory_store, recurrent_type, wrapped):
+        # The fixture installs the external client leaf before importing its backend.
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import MooncakeBackend
+
+        full = AttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
+        recurrent = (
+            MambaSpec(
+                block_size=32,
+                shapes=((8,), (8,)),
+                dtypes=(torch.float32, torch.float32),
+                mamba_type=recurrent_type,
+                mamba_cache_mode="align",
+            )
+            if recurrent_type is not None
+            else SlidingWindowSpec(block_size=32, num_kv_heads=1, head_size=8, dtype=torch.float32, sliding_window=32)
         )
-        if recurrent_type is not None
-        else SlidingWindowSpec(block_size=32, num_kv_heads=1, head_size=8, dtype=torch.float32, sliding_window=32)
-    )
-    groups = [
-        KVCacheGroupSpec(["model.layers.0.attn", "model.layers.2.attn"], full),
-        KVCacheGroupSpec(["model.layers.1.attn", "model.layers.3.attn"], recurrent),
-    ]
-    plan = KVCacheConfig(
-        num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups, prefix_cache_retention_interval=None
-    )
-    # Scheduler merged specs and worker per-layer specs must describe the same layout.
-    worker_plan = KVCacheConfig(
-        num_blocks=plan.num_blocks,
-        kv_cache_tensors=[],
-        kv_cache_groups=[
-            KVCacheGroupSpec(
-                group.layer_names,
-                UniformTypeKVCacheSpecs(
-                    block_size=group.kv_cache_spec.block_size,
-                    kv_cache_specs={name: group.kv_cache_spec for name in group.layer_names},
+        groups = [
+            KVCacheGroup(["model.layers.0.attn", "model.layers.2.attn"], full),
+            KVCacheGroup(["model.layers.1.attn", "model.layers.3.attn"], recurrent),
+        ]
+        plan = KVCacheConfig(
+            num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups, prefix_cache_retention_interval=None
+        )
+        # Scheduler merged specs and worker per-layer specs must describe the same layout.
+        worker_plan = KVCacheConfig(
+            num_blocks=plan.num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroup(
+                    group.layer_names,
+                    UniformTypeKVCacheSpecs(
+                        block_size=group.kv_cache_spec.block_size,
+                        kv_cache_specs={name: group.kv_cache_spec for name in group.layer_names},
+                    )
+                    if wrapped
+                    else group.kv_cache_spec,
                 )
-                if wrapped
-                else group.kv_cache_spec,
-            )
-            for group in groups
-        ],
-        prefix_cache_retention_interval=None,
-    )
-    config = create_vllm_config(max_num_batched_tokens=32, block_size=16)
-    config.model_config.hf_text_config.num_hidden_layers = 4
-    config.model_config.model_arch_config.total_num_hidden_layers = 4
-    config.model_config.max_model_len = 512
-    config.scheduler_config.max_model_len = 512
-    config.scheduler_config.disable_hybrid_kv_cache_manager = False
-    config.cache_config.mamba_cache_mode = "align"
-    # Retain every prefix boundary for the round-trip assertions below.
-    config.cache_config.prefix_cache_retention_interval = None
-    config.cache_config.num_gpu_blocks = plan.num_blocks
-    config.kv_transfer_config = KVTransferConfig(
-        kv_connector="AscendStoreConnector",
-        kv_connector_module_path="vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector",
-        kv_role="kv_both",
-        kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
-    )
-    block_size, hash_size = resolve_kv_cache_block_sizes(plan, config)
-    worker = KVConnectorFactory.create_connector(config, KVConnectorRole.WORKER, worker_plan)
-    specs = get_layerwise_kv_cache_specs(worker_plan)
-    caches = {
-        name: tuple(aligned_tensor((plan.num_blocks, *shape)) for shape in spec.shapes)
-        if isinstance(spec, MambaSpec)
-        else tuple(aligned_tensor((plan.num_blocks, spec.block_size, 1, spec.head_size)) for _ in range(2))
-        for name, spec in specs.items()
-    }
-    pool = worker.connector_worker
-    worker.register_kv_caches(caches)
-    scheduler = Scheduler(
-        config,
-        plan,
-        StructuredOutputManager(config),
-        block_size=block_size,
-        hash_block_size=hash_size,
-    )
-    assert isinstance(pool.m_store, MooncakeBackend)
-    assert isinstance(pool.kv_send_thread, KVCacheStoreLayerSendingThread)
-    assert isinstance(pool.kv_recv_thread, KVCacheStoreLayerRecvingThread)
-    assert isinstance(pool.cache_coordinator, AscendStoreCoordinator)
-    assert pool.block_key_hybrid
-    assert pool.grouped_block_size == [16, 32]
-    assert pool.hash_block_size == hash_size == 16
-    assert pool.cache_transfer_granularity == 32
-    assert pool.kv_recv_thread.group_builders[1].group_id == 1
-    assert pool.kv_send_thread.token_database is pool.token_database
-
-    def run_request(req_id, tokens, expected_hit):
-        request = Request(
-            request_id=req_id,
-            prompt_token_ids=tokens,
-            sampling_params=SamplingParams(max_tokens=2),
-            pooling_params=None,
-            block_hasher=get_request_block_hasher(hash_size, sha256),
+                for group in groups
+            ],
+            prefix_cache_retention_interval=None,
         )
-        scheduler.add_request(request)
-        starts = []
-        loaded = False
+        config = create_vllm_config(max_num_batched_tokens=32, block_size=16)
+        config.model_config.hf_text_config.num_hidden_layers = 4
+        config.model_config.model_arch_config.total_num_hidden_layers = 4
+        config.model_config.max_model_len = 512
+        config.scheduler_config.max_model_len = 512
+        config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        config.cache_config.mamba_cache_mode = "align"
+        # Retain every prefix boundary for the round-trip assertions below.
+        config.cache_config.prefix_cache_retention_interval = None
+        config.cache_config.num_gpu_blocks = plan.num_blocks
+        config.kv_transfer_config = KVTransferConfig(
+            kv_connector="AscendStoreConnector",
+            kv_connector_module_path="vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
+        )
+        block_size, hash_size = resolve_kv_cache_block_sizes(plan, config)
+        worker = KVConnectorFactory.create_connector(config, KVConnectorRole.WORKER, worker_plan)
+        specs = get_layerwise_kv_cache_specs(worker_plan)
+        caches = {
+            name: tuple(aligned_tensor((plan.num_blocks, *shape)) for shape in spec.shapes)
+            if isinstance(spec, MambaSpec)
+            else tuple(aligned_tensor((plan.num_blocks, spec.block_size, 1, spec.head_size)) for _ in range(2))
+            for name, spec in specs.items()
+        }
+        pool = worker.connector_worker
+        worker.register_kv_caches(caches)
+        scheduler = Scheduler(
+            config,
+            plan,
+            StructuredOutputManager(config),
+            block_size=block_size,
+            hash_block_size=hash_size,
+        )
+        assert isinstance(pool.m_store, MooncakeBackend)
+        assert isinstance(pool.kv_send_thread, KVCacheStoreLayerSendingThread)
+        assert isinstance(pool.kv_recv_thread, KVCacheStoreLayerRecvingThread)
+        assert isinstance(pool.cache_coordinator, AscendStoreCoordinator)
+        assert pool.block_key_hybrid
+        assert pool.grouped_block_size == [16, 32]
+        assert pool.hash_block_size == hash_size == 16
+        assert pool.cache_transfer_granularity == 32
+        assert pool.kv_recv_thread.group_builders[1].group_id == 1
+        assert pool.kv_send_thread.token_database is pool.token_database
 
-        def compute(layer, block_ids, start, end):
-            name = f"model.layers.{layer}.attn"
-            spec = specs[name]
-            for index, bid in enumerate(block_ids):
-                boundary = (index + 1) * spec.block_size
-                if bid and start < boundary <= end:
-                    for plane, cache in enumerate(caches[name]):
-                        cache[bid].fill_(payload(request.all_token_ids, boundary, layer, plane))
-
-        for _ in range(12):
-            output = scheduler.schedule()
-            meta = output.kv_connector_metadata
-            worker.handle_preemptions(meta)
-            worker.bind_connector_metadata(meta)
-            scheduled = output.num_scheduled_tokens.get(req_id, 0)
-            worker.start_load_kv(SimpleNamespace() if scheduled else None)
-            if scheduled:
-                end = request.num_computed_tokens
-                start = end - scheduled
-                starts.append(start)
-                blocks = scheduler.kv_cache_manager.get_blocks(req_id).get_block_ids()
-                load_meta = next((item for item in meta.requests if item.load_spec and item.load_spec.can_load), None)
-                if load_meta is not None and len(starts) == 1:
-                    assert load_meta.load_spec.kvpool_cached_tokens == expected_hit
-                    loaded = True
-                for layer in range(4):
-                    name = f"model.layers.{layer}.attn"
-                    spec = specs[name]
-                    group_id = layer % 2
-                    worker.wait_for_layer_load(name)
-                    # Validate restored bytes BEFORE simulating the next model operation.
-                    if load_meta is not None:
-                        stored_prefix = load_meta.load_spec.kvpool_store_skip_tokens or start
-                        for index, bid in enumerate(blocks[group_id]):
-                            if bid and (index + 1) * spec.block_size <= stored_prefix:
-                                for plane, cache in enumerate(caches[name]):
-                                    assert torch.all(
-                                        cache[bid] == payload(tokens, (index + 1) * spec.block_size, layer, plane)
-                                    )
-
-                    if isinstance(spec, MambaSpec):
-                        record_attention_compute_start()
-                        # Let an incorrectly early PUT finish before the state
-                        # update, so the warm request deterministically sees it.
-                        if layer in pool._attention_saved_layers:
-                            wait_until(pool.layer_save_finished_events[layer].is_set, pool)
-                        # Conv/SSM updates happen inside recurrent attention.
-                        compute(layer, blocks[group_id], start, end)
-                    else:
-                        # Full attention's cache scatter precedes the kernel.
-                        compute(layer, blocks[group_id], start, end)
-                        with attention_transfer_window():
-                            assert layer in pool._attention_saved_layers
-                    worker.save_kv_layer(name, caches[name], None)
-                assert pool.kv_send_thread.request_queue.unfinished_tasks == 0
-            sending, recving = worker.get_finished(output.finished_req_ids)
-            result = create_model_runner_output([request] if scheduled else [])
-            if scheduled and request.num_computed_tokens < len(tokens):
-                result.sampled_token_ids = [[]]
-            result.kv_connector_output = KVConnectorOutput(
-                finished_sending=sending,
-                finished_recving=recving,
-                kv_connector_worker_meta=worker.build_connector_worker_meta(),
+        def run_request(req_id, tokens, expected_hit):
+            request = Request(
+                request_id=req_id,
+                prompt_token_ids=tokens,
+                sampling_params=SamplingParams(max_tokens=2),
+                pooling_params=None,
+                block_hasher=get_request_block_hasher(hash_size, sha256),
             )
-            scheduler.update_from_output(output, result)
-            worker.clear_connector_metadata()
-            if req_id not in scheduler.requests:
-                terminal = scheduler.schedule()
-                worker.bind_connector_metadata(terminal.kv_connector_metadata)
-                worker.get_finished(terminal.finished_req_ids)
-                worker.clear_connector_metadata()
-                break
-        assert starts[0] == expected_hit
-        assert any(start >= len(tokens) for start in starts), "Decode was not exercised"
-        assert loaded == bool(expected_hit)
-        assert not scheduler.requests and not scheduler.running and not scheduler.waiting
-        assert not scheduler.finished_req_ids and not scheduler.finished_recving_kv_req_ids
-        block_pool = scheduler.kv_cache_manager.block_pool
-        assert block_pool.get_num_free_blocks() == plan.num_blocks - 1
-        assert all(block.ref_cnt == 0 for block in block_pool.blocks if not block.is_null)
-        assert all(not manager.req_to_blocks for manager in scheduler.kv_cache_manager.coordinator.single_type_managers)
-        assert not scheduler.connector.connector_scheduler.load_specs
-        assert not memory_store.open_reads and not memory_store.open_puts
-        assert not pool._put_started_keys
-        assert not pool.get_block_ids_with_load_errors()
-        return expected_hit
+            scheduler.add_request(request)
+            starts = []
+            loaded = False
 
-    producer = list(range(128))
-    assert run_request("cold", producer, 0) == 0
-    assert memory_store.complete
-    # Evict local APC so each next hit must come from the external store.
-    assert scheduler.reset_prefix_cache()
-    for values in caches.values():
-        for cache in values:
-            cache.fill_(-1)
-    assert run_request("warm", producer + [128], 128) == 128
-    assert scheduler.reset_prefix_cache()
-    # Preserve main's complete-hit policy: reserve the final token for replay.
-    assert run_request("complete-hit", producer, 127) == 127
-    assert scheduler.reset_prefix_cache()
-    assert run_request("boundary", producer[:-1], 96) == 96
-    assert scheduler.reset_prefix_cache()
-    forked = producer.copy()
-    forked[64] += 1000
-    assert run_request("shared-prefix", forked, 64) == 64
-    assert scheduler.reset_prefix_cache()
-    for key in list(memory_store.objects):
-        if "@group:1@" in key:
-            del memory_store.objects[key]
-            memory_store.complete.discard(key)
-    assert run_request("missing-state", list(range(160)), 0) == 0
+            def compute(layer, block_ids, start, end):
+                name = f"model.layers.{layer}.attn"
+                spec = specs[name]
+                for index, bid in enumerate(block_ids):
+                    boundary = (index + 1) * spec.block_size
+                    if bid and start < boundary <= end:
+                        for plane, cache in enumerate(caches[name]):
+                            cache[bid].fill_(payload(request.all_token_ids, boundary, layer, plane))
+
+            for _ in range(12):
+                output = scheduler.schedule()
+                meta = output.kv_connector_metadata
+                worker.handle_preemptions(meta)
+                worker.bind_connector_metadata(meta)
+                scheduled = output.num_scheduled_tokens.get(req_id, 0)
+                worker.start_load_kv(SimpleNamespace() if scheduled else None)
+                if scheduled:
+                    end = request.num_computed_tokens
+                    start = end - scheduled
+                    starts.append(start)
+                    blocks = scheduler.kv_cache_manager.get_blocks(req_id).get_block_ids()
+                    load_meta = next(
+                        (item for item in meta.requests if item.load_spec and item.load_spec.can_load), None
+                    )
+                    if load_meta is not None and len(starts) == 1:
+                        assert load_meta.load_spec.kvpool_cached_tokens == expected_hit
+                        loaded = True
+                    for layer in range(4):
+                        name = f"model.layers.{layer}.attn"
+                        spec = specs[name]
+                        group_id = layer % 2
+                        worker.wait_for_layer_load(name)
+                        # Validate restored bytes BEFORE simulating the next model operation.
+                        if load_meta is not None:
+                            stored_prefix = load_meta.load_spec.kvpool_store_skip_tokens or start
+                            for index, bid in enumerate(blocks[group_id]):
+                                if bid and (index + 1) * spec.block_size <= stored_prefix:
+                                    for plane, cache in enumerate(caches[name]):
+                                        assert torch.all(
+                                            cache[bid] == payload(tokens, (index + 1) * spec.block_size, layer, plane)
+                                        )
+
+                        if isinstance(spec, MambaSpec):
+                            record_attention_compute_start()
+                            # Let an incorrectly early PUT finish before the state
+                            # update, so the warm request deterministically sees it.
+                            if layer in pool._attention_saved_layers:
+                                wait_until(pool.layer_save_finished_events[layer].is_set, pool)
+                            # Conv/SSM updates happen inside recurrent attention.
+                            compute(layer, blocks[group_id], start, end)
+                        else:
+                            # Full attention's cache scatter precedes the kernel.
+                            compute(layer, blocks[group_id], start, end)
+                            with attention_transfer_window():
+                                assert layer in pool._attention_saved_layers
+                        worker.save_kv_layer(name, caches[name], None)
+                    assert pool.kv_send_thread.request_queue.unfinished_tasks == 0
+                sending, recving = worker.get_finished(output.finished_req_ids)
+                result = create_model_runner_output([request] if scheduled else [])
+                if scheduled and request.num_computed_tokens < len(tokens):
+                    result.sampled_token_ids = [[]]
+                result.kv_connector_output = KVConnectorOutput(
+                    finished_sending=sending,
+                    finished_recving=recving,
+                    kv_connector_worker_meta=worker.build_connector_worker_meta(),
+                )
+                scheduler.update_from_output(output, result)
+                worker.clear_connector_metadata()
+                if req_id not in scheduler.requests:
+                    terminal = scheduler.schedule()
+                    worker.bind_connector_metadata(terminal.kv_connector_metadata)
+                    worker.get_finished(terminal.finished_req_ids)
+                    worker.clear_connector_metadata()
+                    break
+            assert starts[0] == expected_hit
+            assert any(start >= len(tokens) for start in starts), "Decode was not exercised"
+            assert loaded == bool(expected_hit)
+            assert not scheduler.requests and not scheduler.running and not scheduler.waiting
+            assert not scheduler.finished_req_ids and not scheduler.finished_recving_kv_req_ids
+            block_pool = scheduler.kv_cache_manager.block_pool
+            assert block_pool.get_num_free_blocks() == plan.num_blocks - 1
+            assert all(block.ref_cnt == 0 for block in block_pool.blocks if not block.is_null)
+            assert all(
+                not manager.req_to_blocks for manager in scheduler.kv_cache_manager.coordinator.single_type_managers
+            )
+            assert not scheduler.connector.connector_scheduler.load_specs
+            assert not memory_store.open_reads and not memory_store.open_puts
+            assert not pool._put_started_keys
+            assert not pool.get_block_ids_with_load_errors()
+            return expected_hit
+
+        producer = list(range(128))
+        assert run_request("cold", producer, 0) == 0
+        assert memory_store.complete
+        # Evict local APC so each next hit must come from the external store.
+        assert scheduler.reset_prefix_cache()
+        for values in caches.values():
+            for cache in values:
+                cache.fill_(-1)
+        assert run_request("warm", producer + [128], 128) == 128
+        assert scheduler.reset_prefix_cache()
+        # Preserve main's complete-hit policy: reserve the final token for replay.
+        assert run_request("complete-hit", producer, 127) == 127
+        assert scheduler.reset_prefix_cache()
+        assert run_request("boundary", producer[:-1], 96) == 96
+        assert scheduler.reset_prefix_cache()
+        forked = producer.copy()
+        forked[64] += 1000
+        assert run_request("shared-prefix", forked, 64) == 64
+        assert scheduler.reset_prefix_cache()
+        for key in list(memory_store.objects):
+            if "@group:1@" in key:
+                del memory_store.objects[key]
+                memory_store.complete.discard(key)
+        assert run_request("missing-state", list(range(160)), 0) == 0
+else:
+
+    @pytest.mark.parametrize(
+        "recurrent_type",
+        [MambaAttentionBackendEnum.MAMBA2, MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR, None],
+    )
+    def test_raw_tokens_hybrid_roundtrip(memory_store, recurrent_type):
+        # The fixture installs the external client leaf before importing its backend.
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.mooncake_backend import MooncakeBackend
+
+        full = AttentionSpec(block_size=16, num_kv_heads=1, head_size=8, dtype=torch.float32)
+        recurrent = (
+            MambaSpec(
+                block_size=32,
+                shapes=((8,), (8,)),
+                dtypes=(torch.float32, torch.float32),
+                mamba_type=recurrent_type,
+            )
+            if recurrent_type is not None
+            else AttentionSpec(block_size=32, num_kv_heads=1, head_size=8, dtype=torch.float32)
+        )
+        recurrent_config = (
+            MambaManager.layer_config(recurrent, mamba_cache_mode="align")
+            if isinstance(recurrent, MambaSpec)
+            else SlidingWindowManager.layer_config(recurrent, sliding_window=32)
+        )
+        groups = [
+            KVCacheGroup.from_layers(
+                dict.fromkeys(("model.layers.0.attn", "model.layers.2.attn"), FullAttentionManager.layer_config(full))
+            ),
+            KVCacheGroup.from_layers(dict.fromkeys(("model.layers.1.attn", "model.layers.3.attn"), recurrent_config)),
+        ]
+        plan = KVCacheConfig(
+            num_blocks=128, kv_cache_tensors=[], kv_cache_groups=groups, prefix_cache_retention_interval=None
+        )
+        worker_plan = plan
+        config = create_vllm_config(max_num_batched_tokens=32, block_size=16)
+        config.model_config.hf_text_config.num_hidden_layers = 4
+        config.model_config.model_arch_config.total_num_hidden_layers = 4
+        config.model_config.max_model_len = 512
+        config.scheduler_config.max_model_len = 512
+        config.scheduler_config.disable_hybrid_kv_cache_manager = False
+        config.cache_config.mamba_cache_mode = "align"
+        # Retain every prefix boundary for the round-trip assertions below.
+        config.cache_config.prefix_cache_retention_interval = None
+        config.cache_config.num_gpu_blocks = plan.num_blocks
+        config.kv_transfer_config = KVTransferConfig(
+            kv_connector="AscendStoreConnector",
+            kv_connector_module_path="vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector",
+            kv_role="kv_both",
+            kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
+        )
+        block_size, hash_size = resolve_kv_cache_block_sizes(plan, config)
+        worker = KVConnectorFactory.create_connector(config, KVConnectorRole.WORKER, worker_plan)
+        specs = get_layerwise_kv_cache_specs(worker_plan)
+        caches = {
+            name: tuple(aligned_tensor((plan.num_blocks, *shape)) for shape in spec.shapes)
+            if isinstance(spec, MambaSpec)
+            else tuple(aligned_tensor((plan.num_blocks, spec.block_size, 1, spec.head_size)) for _ in range(2))
+            for name, spec in specs.items()
+        }
+        pool = worker.connector_worker
+        worker.register_kv_caches(caches)
+        scheduler = Scheduler(
+            config,
+            plan,
+            StructuredOutputManager(config),
+            block_size=block_size,
+            hash_block_size=hash_size,
+        )
+        assert isinstance(pool.m_store, MooncakeBackend)
+        assert isinstance(pool.kv_send_thread, KVCacheStoreLayerSendingThread)
+        assert isinstance(pool.kv_recv_thread, KVCacheStoreLayerRecvingThread)
+        assert isinstance(pool.cache_coordinator, AscendStoreCoordinator)
+        assert pool.block_key_hybrid
+        assert pool.grouped_block_size == [16, 32]
+        assert pool.hash_block_size == hash_size == 16
+        assert pool.cache_transfer_granularity == 32
+        assert pool.kv_recv_thread.group_builders[1].group_id == 1
+        assert pool.kv_send_thread.token_database is pool.token_database
+
+        def run_request(req_id, tokens, expected_hit):
+            request = Request(
+                request_id=req_id,
+                prompt_token_ids=tokens,
+                sampling_params=SamplingParams(max_tokens=2),
+                pooling_params=None,
+                block_hasher=get_request_block_hasher(hash_size, sha256),
+            )
+            scheduler.add_request(request)
+            starts = []
+            loaded = False
+
+            def compute(layer, block_ids, start, end):
+                name = f"model.layers.{layer}.attn"
+                spec = specs[name]
+                for index, bid in enumerate(block_ids):
+                    boundary = (index + 1) * spec.block_size
+                    if bid and start < boundary <= end:
+                        for plane, cache in enumerate(caches[name]):
+                            cache[bid].fill_(payload(request.all_token_ids, boundary, layer, plane))
+
+            for _ in range(12):
+                output = scheduler.schedule()
+                meta = output.kv_connector_metadata
+                worker.handle_preemptions(meta)
+                worker.bind_connector_metadata(meta)
+                scheduled = output.num_scheduled_tokens.get(req_id, 0)
+                worker.start_load_kv(SimpleNamespace() if scheduled else None)
+                if scheduled:
+                    end = request.num_computed_tokens
+                    start = end - scheduled
+                    starts.append(start)
+                    blocks = scheduler.kv_cache_manager.get_blocks(req_id).get_block_ids()
+                    load_meta = next(
+                        (item for item in meta.requests if item.load_spec and item.load_spec.can_load), None
+                    )
+                    if load_meta is not None and len(starts) == 1:
+                        assert load_meta.load_spec.kvpool_cached_tokens == expected_hit
+                        loaded = True
+                    for layer in range(4):
+                        name = f"model.layers.{layer}.attn"
+                        spec = specs[name]
+                        group_id = layer % 2
+                        worker.wait_for_layer_load(name)
+                        # Validate restored bytes BEFORE simulating the next model operation.
+                        if load_meta is not None:
+                            stored_prefix = load_meta.load_spec.kvpool_store_skip_tokens or start
+                            for index, bid in enumerate(blocks[group_id]):
+                                if bid and (index + 1) * spec.block_size <= stored_prefix:
+                                    for plane, cache in enumerate(caches[name]):
+                                        assert torch.all(
+                                            cache[bid] == payload(tokens, (index + 1) * spec.block_size, layer, plane)
+                                        )
+
+                        if isinstance(spec, MambaSpec):
+                            record_attention_compute_start()
+                            # Let an incorrectly early PUT finish before the state
+                            # update, so the warm request deterministically sees it.
+                            if layer in pool._attention_saved_layers:
+                                wait_until(pool.layer_save_finished_events[layer].is_set, pool)
+                            # Conv/SSM updates happen inside recurrent attention.
+                            compute(layer, blocks[group_id], start, end)
+                        else:
+                            # Full attention's cache scatter precedes the kernel.
+                            compute(layer, blocks[group_id], start, end)
+                            with attention_transfer_window():
+                                assert layer in pool._attention_saved_layers
+                        worker.save_kv_layer(name, caches[name], None)
+                    assert pool.kv_send_thread.request_queue.unfinished_tasks == 0
+                sending, recving = worker.get_finished(output.finished_req_ids)
+                result = create_model_runner_output([request] if scheduled else [])
+                if scheduled and request.num_computed_tokens < len(tokens):
+                    result.sampled_token_ids = [[]]
+                result.kv_connector_output = KVConnectorOutput(
+                    finished_sending=sending,
+                    finished_recving=recving,
+                    kv_connector_worker_meta=worker.build_connector_worker_meta(),
+                )
+                scheduler.update_from_output(output, result)
+                worker.clear_connector_metadata()
+                if req_id not in scheduler.requests:
+                    terminal = scheduler.schedule()
+                    worker.bind_connector_metadata(terminal.kv_connector_metadata)
+                    worker.get_finished(terminal.finished_req_ids)
+                    worker.clear_connector_metadata()
+                    break
+            assert starts[0] == expected_hit
+            assert any(start >= len(tokens) for start in starts), "Decode was not exercised"
+            assert loaded == bool(expected_hit)
+            assert not scheduler.requests and not scheduler.running and not scheduler.waiting
+            assert not scheduler.finished_req_ids and not scheduler.finished_recving_kv_req_ids
+            block_pool = scheduler.kv_cache_manager.block_pool
+            assert block_pool.get_num_free_blocks() == plan.num_blocks - 1
+            assert all(block.ref_cnt == 0 for block in block_pool.blocks if not block.is_null)
+            assert all(
+                not manager.req_to_blocks for manager in scheduler.kv_cache_manager.coordinator.single_type_managers
+            )
+            assert not scheduler.connector.connector_scheduler.load_specs
+            assert not memory_store.open_reads and not memory_store.open_puts
+            assert not pool._put_started_keys
+            assert not pool.get_block_ids_with_load_errors()
+            return expected_hit
+
+        producer = list(range(128))
+        assert run_request("cold", producer, 0) == 0
+        assert memory_store.complete
+        # Evict local APC so each next hit must come from the external store.
+        assert scheduler.reset_prefix_cache()
+        for values in caches.values():
+            for cache in values:
+                cache.fill_(-1)
+        assert run_request("warm", producer + [128], 128) == 128
+        assert scheduler.reset_prefix_cache()
+        # Preserve main's complete-hit policy: reserve the final token for replay.
+        assert run_request("complete-hit", producer, 127) == 127
+        assert scheduler.reset_prefix_cache()
+        assert run_request("boundary", producer[:-1], 96) == 96
+        assert scheduler.reset_prefix_cache()
+        forked = producer.copy()
+        forked[64] += 1000
+        assert run_request("shared-prefix", forked, 64) == 64
+        assert scheduler.reset_prefix_cache()
+        for key in list(memory_store.objects):
+            if "@group:1@" in key:
+                del memory_store.objects[key]
+                memory_store.complete.discard(key)
+        assert run_request("missing-state", list(range(160)), 0) == 0

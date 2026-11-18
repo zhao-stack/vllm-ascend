@@ -20,11 +20,17 @@ from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.model_executor.model_loader.utils import get_model_cls
 from vllm.v1.core.kv_cache_utils import BlockHash, maybe_convert_block_hash
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    MambaSpec,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
 from vllm.v1.worker.mamba_utils import get_mamba_groups
 
 from vllm_ascend.ascend_config import KVPPConfig
@@ -423,33 +429,49 @@ class BaseKVPoolWorker(ABC):
     def _infer_group_uses_align_state(self) -> list[bool]:
         if self.kv_cache_config is None:
             return [False]
-
-        group_uses_align_state: list[bool] = []
-        for group in self.kv_cache_config.kv_cache_groups:
-            kv_cache_spec = group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                specs = [kv_cache_spec.kv_cache_specs[layer_name] for layer_name in group.layer_names]
-            else:
-                specs = [kv_cache_spec]
-            group_uses_align_state.append(
-                any(
-                    isinstance(spec, MambaSpec) and getattr(spec, "mamba_cache_mode", None) == "align" for spec in specs
+        if vllm_version_is("0.33.0"):
+            group_uses_align_state: list[bool] = []
+            for group in self.kv_cache_config.kv_cache_groups:
+                kv_cache_spec = group.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    specs = [kv_cache_spec.kv_cache_specs[layer_name] for layer_name in group.layer_names]
+                else:
+                    specs = [kv_cache_spec]
+                group_uses_align_state.append(
+                    any(
+                        isinstance(spec, MambaSpec) and getattr(spec, "mamba_cache_mode", None) == "align"
+                        for spec in specs
+                    )
                 )
-            )
-        return group_uses_align_state
+
+        return (
+            group_uses_align_state
+            if vllm_version_is("0.33.0")
+            else [
+                isinstance(group.manager_config.params, MambaManager.Params)
+                and group.manager_config.params.mamba_cache_mode == "align"
+                for group in self.kv_cache_config.kv_cache_groups
+            ]
+        )
 
     @staticmethod
     def _uses_mamba_kv_cache(use_hybrid: bool, kv_cache_config: KVCacheConfig | None):
         if not use_hybrid or kv_cache_config is None:
             return False
-        for group in kv_cache_config.kv_cache_groups:
-            kv_cache_spec = group.kv_cache_spec
-            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-                if any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.kv_cache_specs.values()):
+        if vllm_version_is("0.33.0"):
+            for group in kv_cache_config.kv_cache_groups:
+                kv_cache_spec = group.kv_cache_spec
+                if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                    if any(isinstance(spec, MambaSpec) for spec in kv_cache_spec.kv_cache_specs.values()):
+                        return True
+                elif isinstance(kv_cache_spec, MambaSpec):
                     return True
-            elif isinstance(kv_cache_spec, MambaSpec):
-                return True
-        return False
+
+        return (
+            False
+            if vllm_version_is("0.33.0")
+            else any(issubclass(group.manager_cls, MambaManager) for group in kv_cache_config.kv_cache_groups)
+        )
 
     @staticmethod
     def _as_cache_tuple(cache_or_caches) -> tuple[torch.Tensor, ...]:
@@ -667,12 +689,26 @@ class BaseKVPoolWorker(ABC):
         result = dict(kv_caches)
         copy_funcs = None
         for group in self.kv_cache_config.kv_cache_groups:
-            specs = group.kv_cache_spec
+            if vllm_version_is("0.33.0"):
+                specs = group.kv_cache_spec
+
             for name in group.layer_names:
-                spec = specs.kv_cache_specs[name] if isinstance(specs, UniformTypeKVCacheSpecs) else specs
+                spec = (
+                    (specs.kv_cache_specs[name] if isinstance(specs, UniformTypeKVCacheSpecs) else specs)
+                    if vllm_version_is("0.33.0")
+                    else group.kv_cache_specs[name]
+                )
                 if not isinstance(spec, MambaSpec):
                     continue
-                if spec.num_speculative_blocks != 0:
+                if not vllm_version_is("0.33.0"):
+                    params = group.manager_config.params
+                    assert isinstance(params, MambaManager.Params)
+
+                if (
+                    spec.num_speculative_blocks != 0
+                    if vllm_version_is("0.33.0")
+                    else params.num_speculative_blocks != 0
+                ):
                     raise ValueError("RecoverSSM pooling requires zero speculative state blocks")
                 if copy_funcs is None:
                     mamba_groups = get_mamba_groups(self.kv_cache_config)

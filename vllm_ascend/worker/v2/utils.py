@@ -7,6 +7,12 @@ from typing import TYPE_CHECKING, Any
 import torch
 from vllm.compilation import breakable_cudagraph
 from vllm.logger import logger
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import CircularBufferManager
+
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -16,7 +22,10 @@ from vllm_ascend.compilation.acl_graph import (
     weak_ref_workspaces,
 )
 from vllm_ascend.compilation.updatable_graph import UpdatableGraph
-from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import is_circular_kv_cache_spec
+
 from vllm_ascend.utils import super_kernel_scope, weak_ref_tensor, weak_ref_tensors
 from vllm_ascend.worker.v2.attn_utils import ring_state_update_skipped
 
@@ -243,7 +252,11 @@ def prepare_v41_dummy_ring_state(runner: "NPUModelRunner", num_reqs: int) -> Non
     if ring_state_update_skipped():
         return
     for gid, group in enumerate(runner.kv_cache_config.kv_cache_groups):
-        if not is_circular_kv_cache_spec(group.kv_cache_spec):
+        if (
+            not is_circular_kv_cache_spec(group.kv_cache_spec)
+            if vllm_version_is("0.33.0")
+            else not issubclass(group.manager_cls, CircularBufferManager)
+        ):
             continue
         if num_reqs >= runner.kv_cache_config.num_blocks:
             raise ValueError("Insufficient ring pages for dummy graph requests")

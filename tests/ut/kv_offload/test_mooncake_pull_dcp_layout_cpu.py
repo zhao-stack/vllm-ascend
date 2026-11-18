@@ -6,34 +6,45 @@ import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    import torch
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        CircularBufferManager,
+        FullAttentionManager,
+        MambaManager,
+        SlidingWindowManager,
+    )
+    from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheGroup, MambaSpec, MLAAttentionSpec
+
+    from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+
+
 SOURCE = Path(__file__).resolve().parents[3] / "vllm_ascend/distributed/kv_transfer/kv_p2p/mooncake"
+if vllm_version_is("0.33.0"):
 
+    class FullAttentionSpec(SimpleNamespace):
+        pass
 
-class FullAttentionSpec(SimpleNamespace):
-    pass
+    class MLAAttentionSpec(FullAttentionSpec):  # type: ignore[no-redef]
+        pass
 
+    class SlidingWindowSpec(SimpleNamespace):
+        pass
 
-class MLAAttentionSpec(FullAttentionSpec):
-    pass
+    class SlidingWindowMLASpec(SlidingWindowSpec):
+        pass
 
+    class AscendSFAIndexerCacheSpec(MLAAttentionSpec):  # type: ignore[no-redef]
+        pass
 
-class SlidingWindowSpec(SimpleNamespace):
-    pass
-
-
-class SlidingWindowMLASpec(SlidingWindowSpec):
-    pass
-
-
-class AscendSFAIndexerCacheSpec(MLAAttentionSpec):
-    pass
-
-
-class MambaSpec(SimpleNamespace):
-    pass
+    class MambaSpec(SimpleNamespace):  # type: ignore[no-redef]
+        pass
 
 
 def load_class(filename, name, methods, dependencies=None):
@@ -44,6 +55,18 @@ def load_class(filename, name, methods, dependencies=None):
     scope = dict(
         globals(),
         math=math,
+        **cast(
+            dict[str, Any],
+            {}
+            if vllm_version_is("0.33.0")
+            else {
+                "FullAttentionManager": FullAttentionManager,
+                "CircularBufferManager": CircularBufferManager,
+                "MambaManager": MambaManager,
+                "SlidingWindowManager": SlidingWindowManager,
+                "MambaSpec": MambaSpec,
+            },
+        ),
         prod=math.prod,
         dataclass=dataclass,
         is_circular_kv_cache_spec=lambda spec: False,
@@ -124,18 +147,36 @@ def worker():
     return worker
 
 
-@pytest.mark.parametrize("spec_type", [FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec, SlidingWindowMLASpec])
-@pytest.mark.parametrize("heads", [1, 4])
-@pytest.mark.parametrize("local_sharded", [False, True])
-@pytest.mark.parametrize("remote_sharded", [False, True])
-def test_layout_uses_independent_endpoint_flags(worker, spec_type, heads, local_sharded, remote_sharded):
-    spec = spec_type(dcp_sharded=local_sharded)
-    worker.block_shapes = [[(heads, 16, 4)]]
-    remote = SimpleNamespace(dcp_sharded=[remote_sharded], block_shapes=[[(heads, 16, 4)]])
-    assert worker._get_attention_dcp_sizes(spec, 0, remote, 4) == (
-        2 if local_sharded else 1,
-        4 if remote_sharded else 1,
+if vllm_version_is("0.33.0"):
+
+    @pytest.mark.parametrize(
+        "spec_type", [FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec, SlidingWindowMLASpec]
     )
+    @pytest.mark.parametrize("heads", [1, 4])
+    @pytest.mark.parametrize("local_sharded", [False, True])
+    @pytest.mark.parametrize("remote_sharded", [False, True])
+    def test_layout_uses_independent_endpoint_flags(worker, spec_type, heads, local_sharded, remote_sharded):
+        spec = spec_type(dcp_sharded=local_sharded)
+        worker.block_shapes = [[(heads, 16, 4)]]
+        remote = SimpleNamespace(dcp_sharded=[remote_sharded], block_shapes=[[(heads, 16, 4)]])
+        assert worker._get_attention_dcp_sizes(spec, 0, remote, 4) == (
+            2 if local_sharded else 1,
+            4 if remote_sharded else 1,
+        )
+else:
+
+    @pytest.mark.parametrize("spec_type", [AttentionSpec, MLAAttentionSpec])
+    @pytest.mark.parametrize("heads", [1, 4])
+    @pytest.mark.parametrize("local_sharded", [False, True])
+    @pytest.mark.parametrize("remote_sharded", [False, True])
+    def test_layout_uses_independent_endpoint_flags(worker, spec_type, heads, local_sharded, remote_sharded):
+        spec = spec_type(block_size=16, num_kv_heads=heads, head_size=4, dtype=torch.float16, dcp_sharded=local_sharded)
+        worker.block_shapes = [[(heads, 16, 4)]]
+        remote = SimpleNamespace(dcp_sharded=[remote_sharded], block_shapes=[[(heads, 16, 4)]])
+        assert worker._get_attention_dcp_sizes(spec, 0, remote, 4) == (
+            2 if local_sharded else 1,
+            4 if remote_sharded else 1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -150,7 +191,16 @@ def test_layout_uses_independent_endpoint_flags(worker, spec_type, heads, local_
 def test_routing_and_block_mapping_follow_layout(
     worker, local_sharded, remote_sharded, local_heads, remote_heads, expected
 ):
-    spec = FullAttentionSpec(dcp_sharded=local_sharded)
+    spec = (
+        FullAttentionSpec(**cast(dict[str, Any], {}), dcp_sharded=local_sharded)
+        if vllm_version_is("0.33.0")
+        else AttentionSpec(
+            **cast(
+                dict[str, Any], {"block_size": 16, "num_kv_heads": local_heads, "head_size": 4, "dtype": torch.float16}
+            ),
+            dcp_sharded=local_sharded,
+        )
+    )
     worker.block_shapes = [[(local_heads, 16, 4)]]
     remote = SimpleNamespace(dcp_sharded=[remote_sharded], block_shapes=[[(remote_heads, 16, 4)]])
     groups = worker._get_layer_remote_tp_rank_groups(0, 0, spec, remote, 1, 4, 2)
@@ -160,7 +210,7 @@ def test_routing_and_block_mapping_follow_layout(
         "request",
         groups,
         remote_size,
-        0,
+        0 if vllm_version_is("0.33.0") else FullAttentionManager.config(),
         16,
         16,
         [10, 11],
@@ -189,8 +239,15 @@ def test_scheduler_prompt_blocks_follow_layout(sharded, expected):
     cls = load_class("base_scheduler.py", "MooncakeBaseConnectorScheduler", {"_get_transfer_block_ids"})
     scheduler = cls()
     scheduler.dcp_size = 2
-    scheduler.group_unique_specs = [[FullAttentionSpec(dcp_sharded=sharded)]]
-    scheduler.group_block_size = [16]
+    if vllm_version_is("0.33.0"):
+        scheduler.group_unique_specs = [[FullAttentionSpec(dcp_sharded=sharded)]]
+        scheduler.group_block_size = [16]
+    else:
+        spec = AttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.float16, dcp_sharded=sharded)
+        scheduler.kv_cache_groups = [
+            KVCacheGroup({"layer": spec}, FullAttentionManager.config(), block_size=16, dcp_sharded=sharded)
+        ]
+
     assert scheduler._get_transfer_block_ids(([0, 1, 2, 3, 4],), 64) == (expected,)
 
 
@@ -220,7 +277,16 @@ def test_handshake_rejects_missing_layer_flags():
 @pytest.mark.parametrize("remote_replicas", [1, 2])
 @pytest.mark.parametrize("remote_scale", [1, 4])
 def test_indexer_replication_uses_explicit_metadata(worker, local_replicas, remote_replicas, remote_scale):
-    spec = AscendSFAIndexerCacheSpec(dcp_sharded=True, sfa_dcp_replicated_indexer_size=local_replicas)
+    spec = AscendSFAIndexerCacheSpec(
+        **cast(
+            dict[str, Any],
+            {}
+            if vllm_version_is("0.33.0")
+            else {"block_size": 16, "num_kv_heads": 1, "head_size": 4, "dtype": torch.float16},
+        ),
+        dcp_sharded=True,
+        sfa_dcp_replicated_indexer_size=local_replicas,
+    )
     remote = SimpleNamespace(
         dcp_sharded=[True],
         indexer_replication_sizes=[remote_replicas],

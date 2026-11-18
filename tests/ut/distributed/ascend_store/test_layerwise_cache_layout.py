@@ -1,15 +1,19 @@
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import pytest
 import torch
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheTensor,
-    MambaSpec,
-    UniformTypeKVCacheSpecs,
-    compute_layout_strides,
-)
+from vllm.v1.kv_cache_interface import KVCacheTensor, MambaSpec, compute_layout_strides
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+else:
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
@@ -32,8 +36,8 @@ def _make_full_attention_spec(
     *,
     num_kv_heads: int = 1,
     head_size: int = 8,
-) -> FullAttentionSpec:
-    return FullAttentionSpec(
+) -> AttentionSpec:
+    return AttentionSpec(
         block_size=2,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
@@ -76,11 +80,17 @@ def test_no_reuse_skips_topology_validation():
         kv_cache_tensors=original_tensors.copy(),
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": layer_names,
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(layer_names, spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(layer_names, spec)},
+                )
             )
         ],
     )
@@ -99,11 +109,17 @@ def test_base_layers_are_merged_into_shared_slots():
         kv_cache_tensors=original_tensors,
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": layer_names,
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(layer_names, spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(layer_names, spec)},
+                )
             )
         ],
     )
@@ -235,11 +251,15 @@ def test_incompatible_cache_specs_use_separate_slots():
         kv_cache_tensors=[_make_kv_cache_tensor(32, [layer_name]) for layer_name in layer_names],
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=layer_specs,
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": layer_names,
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=layer_specs),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": layer_specs},
+                )
             )
         ],
     )
@@ -265,11 +285,17 @@ def test_partial_layout_skips_tensor_merge():
         kv_cache_tensors=original_tensors.copy(),
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": layer_names,
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(layer_names, spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(layer_names, spec)},
+                )
             )
         ],
     )
@@ -442,18 +468,30 @@ def test_multi_group_sfa_descriptors_are_merged_by_main_component():
         ],
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=main_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(main_names, main_spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": main_names,
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(main_names, main_spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(main_names, main_spec)},
+                )
             ),
             SimpleNamespace(
-                layer_names=indexer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(indexer_names, indexer_spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": indexer_names,
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(indexer_names, indexer_spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(indexer_names, indexer_spec)},
+                )
             ),
         ],
     )
@@ -517,18 +555,30 @@ def test_component_sharing_merges_main_across_a_and_b_layers():
         ],
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=list(main_by_layer.values()),
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(main_by_layer.values(), main_spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": list(main_by_layer.values()),
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(main_by_layer.values(), main_spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(main_by_layer.values(), main_spec)},
+                )
             ),
             SimpleNamespace(
-                layer_names=list(indexer_by_layer.values()),
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(indexer_by_layer.values(), indexer_spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": list(indexer_by_layer.values()),
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(indexer_by_layer.values(), indexer_spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(indexer_by_layer.values(), indexer_spec)},
+                )
             ),
         ],
     )
@@ -581,16 +631,22 @@ def test_packed_cache_tensor_descriptors_are_rejected():
     kv_cache_config = SimpleNamespace(
         num_blocks=1,
         kv_cache_tensors=[
-            (KVCacheTensor(size=16, layers=[layer_name], layer_stride=16, block_stride=64, offset=8))
+            KVCacheTensor(size=16, layers=[layer_name], layer_stride=16, block_stride=64, offset=8)
             for layer_name in layer_names
         ],
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=layer_names,
-                kv_cache_spec=UniformTypeKVCacheSpecs(
-                    block_size=2,
-                    kv_cache_specs=dict.fromkeys(layer_names, spec),
-                ),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": layer_names,
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(
+                            block_size=2, kv_cache_specs=dict.fromkeys(layer_names, spec)
+                        ),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(layer_names, spec)},
+                )
             )
         ],
     )
@@ -619,7 +675,16 @@ def test_standardized_multi_layer_descriptor_becomes_private_reuse_slots(offset)
                 offset=offset,
             )
         ],
-        kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=spec)],
+        kv_cache_groups=[
+            SimpleNamespace(
+                **cast(
+                    dict[str, Any],
+                    {"layer_names": names, "kv_cache_spec": spec}
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(names, spec)},
+                )
+            )
+        ],
     )
 
     apply_layerwise_kv_cache_plan(config, _make_vllm_config(4, 1))
@@ -647,7 +712,16 @@ def test_out_of_bounds_contiguous_descriptor_is_rejected():
                 block_stride=spec.page_size_bytes,
             )
         ],
-        kv_cache_groups=[SimpleNamespace(layer_names=names, kv_cache_spec=spec)],
+        kv_cache_groups=[
+            SimpleNamespace(
+                **cast(
+                    dict[str, Any],
+                    {"layer_names": names, "kv_cache_spec": spec}
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": dict.fromkeys(names, spec)},
+                )
+            )
+        ],
     )
     with pytest.raises(ValueError, match="exceeds its backing allocation"):
         apply_layerwise_kv_cache_plan(config, _make_vllm_config(3, 1))
@@ -684,8 +758,15 @@ def test_mixed_indexers_share_max_capacity_without_changing_reuse_order(c8_first
         ],
         kv_cache_groups=[
             SimpleNamespace(
-                layer_names=list(specs),
-                kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
+                **cast(
+                    dict[str, Any],
+                    {
+                        "layer_names": list(specs),
+                        "kv_cache_spec": UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
+                    }
+                    if vllm_version_is("0.33.0")
+                    else {"kv_cache_specs": specs},
+                )
             )
         ],
     )
@@ -739,8 +820,15 @@ def _make_generic_indexer_descriptors(replication=1, quantized=True):
             kv_cache_tensors=tensors,
             kv_cache_groups=[
                 SimpleNamespace(
-                    layer_names=list(specs),
-                    kv_cache_spec=UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
+                    **cast(
+                        dict[str, Any],
+                        {
+                            "layer_names": list(specs),
+                            "kv_cache_spec": UniformTypeKVCacheSpecs(block_size=2, kv_cache_specs=specs),
+                        }
+                        if vllm_version_is("0.33.0")
+                        else {"kv_cache_specs": specs},
+                    )
                 )
             ],
         ),

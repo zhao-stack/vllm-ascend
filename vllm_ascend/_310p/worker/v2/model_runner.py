@@ -15,19 +15,25 @@ import torch_npu
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import initialize_mamba_ssu_backend
-from vllm.utils.math_utils import cdiv
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.utils.math_utils import cdiv
+
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.torch_utils import get_dtype_size
-from vllm.v1 import kv_cache_interface
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1 import kv_cache_interface
+
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    MambaSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.attn_utils import (
@@ -55,12 +61,7 @@ from vllm_ascend._310p.worker.v2.states import Ascend310PRequestState
 from vllm_ascend._310p.worker.v2.structured_outputs import apply_grammar_bitmask
 from vllm_ascend.core.kv_cache_interface import get_storage_block_size
 from vllm_ascend.ops.rotary_embedding import update_cos_sin
-from vllm_ascend.utils import (
-    ACL_FORMAT_FRACTAL_NZ,
-    get_kv_cache_tensor_layers,
-    shared_experts_calculation_stream,
-    vllm_version_is,
-)
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, get_kv_cache_tensor_layers, shared_experts_calculation_stream
 from vllm_ascend.worker.v2.attn_utils import build_attn_state
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
@@ -771,19 +772,21 @@ class NPUModelRunner310V2(NPUModelRunner):
         if pending_copies:
             self._copy_kv_cache_blocks_310p(pending_copies)
 
-    def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
-        """Restore linear-attention specs omitted by some upstream V2 versions."""
-        kv_cache_spec = super().get_kv_cache_spec()
-        static_forward_context = self.compilation_config.static_forward_context
-        for layer_name, layer in static_forward_context.items():
-            if "linear_attn" not in layer_name or layer_name in kv_cache_spec:
-                continue
-            get_spec = getattr(layer, "get_kv_cache_spec", None)
-            if get_spec is None:
-                continue
-            if spec := get_spec(self.vllm_config):
-                kv_cache_spec[layer_name] = spec
-        return kv_cache_spec
+    if vllm_version_is("0.33.0"):
+
+        def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+            """Restore linear-attention specs omitted by some upstream V2 versions."""
+            kv_cache_spec = super().get_kv_cache_spec()
+            static_forward_context = self.compilation_config.static_forward_context
+            for layer_name, layer in static_forward_context.items():
+                if "linear_attn" not in layer_name or layer_name in kv_cache_spec:
+                    continue
+                get_spec = getattr(layer, "get_kv_cache_spec", None)
+                if get_spec is None:
+                    continue
+                if spec := get_spec(self.vllm_config):
+                    kv_cache_spec[layer_name] = spec
+            return kv_cache_spec
 
     def initialize_kv_cache(
         self,
@@ -794,28 +797,42 @@ class NPUModelRunner310V2(NPUModelRunner):
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
 
-        block_sizes = []
-        max_num_blocks_per_group = []
-        slot_mapping_enabled = []
-        circular_buffer_spec = kv_cache_interface.CircularBufferSpec
-        for kv_cache_group in kv_cache_config.kv_cache_groups:
-            spec = kv_cache_group.kv_cache_spec
-            block_sizes.append(spec.block_size)
-            layer_spec = next(iter(spec.kv_cache_specs.values())) if isinstance(spec, UniformTypeKVCacheSpecs) else spec
-            slot_mapping_enabled.append(
-                circular_buffer_spec is None or not isinstance(layer_spec, circular_buffer_spec)
-            )
-            max_num_blocks = cdiv(self.max_model_len, spec.block_size)
-            if spec.block_size <= 128:
-                alignment = 128 // spec.block_size
-                max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
-            if isinstance(spec, MambaSpec):
-                # Without prefix caching, hybrid recurrent state uses one page
-                # per request plus speculative slots (same as 820_new).
-                max_num_blocks = (
-                    max_num_blocks if self.cache_config.enable_prefix_caching else 1
-                ) + spec.num_speculative_blocks
-            max_num_blocks_per_group.append(max_num_blocks)
+        block_sizes = (
+            [] if vllm_version_is("0.33.0") else [group.block_size for group in kv_cache_config.kv_cache_groups]
+        )
+        max_num_blocks_per_group = (
+            []
+            if vllm_version_is("0.33.0")
+            else [
+                group.block_table_width(self.vllm_config, self.max_model_len)
+                for group in kv_cache_config.kv_cache_groups
+            ]
+        )
+        slot_mapping_enabled = (
+            [] if vllm_version_is("0.33.0") else [group.uses_slot_mapping for group in kv_cache_config.kv_cache_groups]
+        )
+        if vllm_version_is("0.33.0"):
+            circular_buffer_spec = kv_cache_interface.CircularBufferSpec
+            for kv_cache_group in kv_cache_config.kv_cache_groups:
+                spec = kv_cache_group.kv_cache_spec
+                block_sizes.append(spec.block_size)
+                layer_spec = (
+                    next(iter(spec.kv_cache_specs.values())) if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+                )
+                slot_mapping_enabled.append(
+                    circular_buffer_spec is None or not isinstance(layer_spec, circular_buffer_spec)
+                )
+                max_num_blocks = cdiv(self.max_model_len, spec.block_size)
+                if spec.block_size <= 128:
+                    alignment = 128 // spec.block_size
+                    max_num_blocks = cdiv(max_num_blocks, alignment) * alignment
+                if isinstance(spec, MambaSpec):
+                    # Without prefix caching, hybrid recurrent state uses one page
+                    # per request plus speculative slots (same as 820_new).
+                    max_num_blocks = (
+                        max_num_blocks if self.cache_config.enable_prefix_caching else 1
+                    ) + spec.num_speculative_blocks
+                max_num_blocks_per_group.append(max_num_blocks)
 
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             kv_cache_config, self.vllm_config, self.device
@@ -879,9 +896,20 @@ class NPUModelRunner310V2(NPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
-        if kv_cache_config.needs_kv_cache_zeroing:
-            self._init_kv_zero_meta()
-            self.kv_block_zeroer.enabled = self._needs_kv_cache_zeroing_310p(kv_cache_config)
+        if kv_cache_config.needs_kv_cache_zeroing if vllm_version_is("0.33.0") else self.cache_config.use_replayssm:
+            if vllm_version_is("0.33.0"):
+                self._init_kv_zero_meta()
+                self.kv_block_zeroer.enabled = self._needs_kv_cache_zeroing_310p(kv_cache_config)
+            else:
+                from vllm.v1.worker.replayssm_utils import initialize_replayssm_ring_trackers
+
+                initialize_replayssm_ring_trackers(kv_cache_config, self.compilation_config.static_forward_context)
+
+        if not vllm_version_is("0.33.0"):
+            if kv_cache_config.needs_kv_cache_zeroing:
+                self._init_kv_zero_meta()
+                self.kv_block_zeroer.enabled = self._needs_kv_cache_zeroing_310p(kv_cache_config)
+
         self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
         self._install_pc_eager_cudagraph_dispatch()
 
@@ -897,12 +925,18 @@ class NPUModelRunner310V2(NPUModelRunner):
 
     def _adjust_kernel_block_sizes(self, kv_cache_config: KVCacheConfig) -> None:
         for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            group_spec = kv_cache_group.kv_cache_spec
-            if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                specs = tuple(group_spec.kv_cache_specs.values())
-            else:
-                specs = (group_spec,)
-            attention_specs = [spec for spec in specs if isinstance(spec, AttentionSpec)]
+            if vllm_version_is("0.33.0"):
+                group_spec = kv_cache_group.kv_cache_spec
+                if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                    specs = tuple(group_spec.kv_cache_specs.values())
+                else:
+                    specs = (group_spec,)
+
+            attention_specs = (
+                [spec for spec in specs if isinstance(spec, AttentionSpec)]
+                if vllm_version_is("0.33.0")
+                else [spec for spec in kv_cache_group.kv_cache_specs.values() if isinstance(spec, AttentionSpec)]
+            )
             # Hybrid groups may be pure MambaSpec; skip kernel-block sizing.
             if not attention_specs:
                 continue
@@ -948,13 +982,17 @@ class NPUModelRunner310V2(NPUModelRunner):
         layer_specs: dict[str, KVCacheSpec] = {}
         layer_group_ids: dict[str, int] = {}
         for group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
-            group_spec = kv_cache_group.kv_cache_spec
-            for layer_name in kv_cache_group.layer_names:
-                if isinstance(group_spec, UniformTypeKVCacheSpecs):
-                    layer_specs[layer_name] = group_spec.kv_cache_specs[layer_name]
-                else:
-                    layer_specs[layer_name] = group_spec
-                layer_group_ids[layer_name] = group_id
+            if vllm_version_is("0.33.0"):
+                group_spec = kv_cache_group.kv_cache_spec
+                for layer_name in kv_cache_group.layer_names:
+                    if isinstance(group_spec, UniformTypeKVCacheSpecs):
+                        layer_specs[layer_name] = group_spec.kv_cache_specs[layer_name]
+                    else:
+                        layer_specs[layer_name] = group_spec
+                    layer_group_ids[layer_name] = group_id
+            else:
+                layer_specs.update(kv_cache_group.kv_cache_specs)
+                layer_group_ids.update((name, group_id) for name in kv_cache_group.kv_cache_specs)
 
         layer_backends = {
             layer_name: group.backend

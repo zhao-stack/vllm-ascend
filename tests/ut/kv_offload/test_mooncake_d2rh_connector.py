@@ -6,6 +6,8 @@ Covers block-map translation, CPU staging, handshake metadata, content-based
 host caching, offset-qualified block maps, and scheduler helpers.
 """
 
+from __future__ import annotations
+
 import sys
 import threading
 import types
@@ -15,6 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
+from vllm_ascend.utils import vllm_version_is
 
 # The connector eagerly imports ``mooncake.engine``, which is not a UT
 # dependency. Sibling test files install the same stub at import time, but
@@ -26,8 +30,11 @@ if "mooncake.engine" not in sys.modules:
         _fake_engine = types.ModuleType("mooncake.engine")
         _fake_engine.__dict__["TransferEngine"] = MagicMock()
         sys.modules["mooncake.engine"] = _fake_engine
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec  # noqa
+else:
+    from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec  # noqa
 
-from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec  # noqa: E402
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_d2rh_connector as d2rh  # noqa: E402
 
 
@@ -729,16 +736,29 @@ class TestSchedulerBlockSize:
     block size needed by Mooncake transfer metadata.
     """
 
-    @staticmethod
-    def _swa_spec(block_size: int, model_version: str | None) -> AscendSlidingWindowMLASpec:
-        return AscendSlidingWindowMLASpec(
-            block_size=block_size,
-            num_kv_heads=1,
-            head_size=16,
-            dtype=torch.float16,
-            sliding_window=128,
-            model_version=model_version,
-        )
+    if vllm_version_is("0.33.0"):
+
+        @staticmethod
+        def _swa_spec(block_size: int, model_version: str | None) -> AscendSlidingWindowMLASpec:
+            return AscendSlidingWindowMLASpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=16,
+                dtype=torch.float16,
+                sliding_window=128,
+                model_version=model_version,
+            )
+    else:
+
+        @staticmethod
+        def _swa_spec(block_size: int, model_version: str | None) -> AscendMLAAttentionSpec:
+            return AscendMLAAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=16,
+                dtype=torch.float16,
+                model_version=model_version,
+            )
 
     def test_dsv4_swa_spec_overrides_hybrid_cache_quantum(self):
         scheduler = object.__new__(d2rh.MooncakeConnectorScheduler)

@@ -36,9 +36,20 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.deepseek_v4.compressor import CompressorStateCache
-from vllm.v1.kv_cache_interface import KVCacheSpec
 
-from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+else:
+    from vllm.v1.kv_cache_interface import KVCacheLayerConfig, MLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.worker.device_metadata import DeviceMetadataStage, wait_for_device_metadata
 
@@ -56,21 +67,40 @@ class AscendCompressorStateCache(CompressorStateCache):
         self.compress_ratio = compress_ratio
         self.block_size = block_size
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        from vllm_ascend.models.layer.attention.layer import dsv4_block_sizes
+    if vllm_version_is("0.33.0"):
 
-        pads = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][1]
-        page_size_padded = pads[0] if self.state_dim == 2 * 256 and self.compress_ratio == 4 else pads[1]
+        def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+            from vllm_ascend.models.layer.attention.layer import dsv4_block_sizes
 
-        return AscendSlidingWindowMLASpec(
-            block_size=self.block_size,
-            num_kv_heads=1,
-            head_size=self.state_dim,
-            dtype=self.dtype,
-            sliding_window=self.sliding_window,
-            alignment=None,
-            page_size_padded=page_size_padded,
-        )
+            pads = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][1]
+            page_size_padded = pads[0] if self.state_dim == 2 * 256 and self.compress_ratio == 4 else pads[1]
+
+            return AscendSlidingWindowMLASpec(
+                block_size=self.block_size,
+                num_kv_heads=1,
+                head_size=self.state_dim,
+                dtype=self.dtype,
+                sliding_window=self.sliding_window,
+                alignment=None,
+                page_size_padded=page_size_padded,
+            )
+    else:
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+            from vllm_ascend.models.layer.attention.layer import dsv4_block_sizes
+
+            pads = dsv4_block_sizes(vllm_config)[vllm_config.cache_config.block_size][1]
+            page_size_padded = pads[0] if self.state_dim == 2 * 256 and self.compress_ratio == 4 else pads[1]
+
+            spec = MLAAttentionSpec(
+                block_size=self.block_size,
+                num_kv_heads=1,
+                head_size=self.state_dim,
+                dtype=self.dtype,
+                alignment=None,
+                page_size_padded=page_size_padded,
+            )
+            return SlidingWindowManager.layer_config(spec, sliding_window=self.sliding_window)
 
     def forward(self): ...
 

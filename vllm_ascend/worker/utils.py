@@ -4,19 +4,18 @@ from contextlib import contextmanager
 import torch
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    EncoderOnlyAttentionSpec,
-    KVCacheConfig,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec, UniformTypeKVCacheSpecs
+
 from vllm.v1.worker.utils import (
     AttentionGroup,
     prepare_kernel_block_sizes,
     select_common_block_size,
 )
-
-from vllm_ascend.utils import vllm_version_is
 
 
 def copy_kv_cache_blocks_inplace(
@@ -159,18 +158,29 @@ def prepare_ascend_kernel_block_sizes(
         List of kernel block sizes for each cache group.
     """
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
+    if vllm_version_is("0.33.0"):
+        # Upstream drops only encoder-only groups, so this index tracks its output.
+        index = 0
 
-    # Upstream drops only encoder-only groups, so this index tracks its output.
-    index = 0
     for group_id, group in enumerate(kv_cache_config.kv_cache_groups):
-        spec = group.kv_cache_spec
-        if isinstance(spec, UniformTypeKVCacheSpecs):
-            spec = next(iter(spec.kv_cache_specs.values()))
-        if isinstance(spec, EncoderOnlyAttentionSpec):
-            continue
-        if index >= len(kernel_block_sizes):
-            break
-        manager_block_size = group.kv_cache_spec.block_size
+        spec = group.kv_cache_spec if vllm_version_is("0.33.0") else next(iter(group.kv_cache_specs.values()), None)
+        if vllm_version_is("0.33.0"):
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                spec = next(iter(spec.kv_cache_specs.values()))
+            if isinstance(spec, EncoderOnlyAttentionSpec):
+                continue
+
+        if (
+            index >= len(kernel_block_sizes)
+            if vllm_version_is("0.33.0")
+            else not isinstance(spec, AttentionSpec) or not attn_groups[group_id]
+        ):
+            if vllm_version_is("0.33.0"):
+                break
+            else:
+                continue
+
+        manager_block_size = (group.kv_cache_spec if vllm_version_is("0.33.0") else group).block_size
         strides = _group_tensor_strides(kv_cache_config, group.layer_names)
         block_outermost_packed = any(0 < layer_stride < block_stride for layer_stride, block_stride in strides)
         aliases_layers = any(layer_stride == 0 and block_stride > 0 for layer_stride, block_stride in strides)
@@ -178,17 +188,32 @@ def prepare_ascend_kernel_block_sizes(
             spec.has_layer_views
             and isinstance(spec, AttentionSpec)
             and aliases_layers
-            and not block_outermost_packed
-            and kernel_block_sizes[index] == manager_block_size
-            and group_id < len(attn_groups)
+            and (not block_outermost_packed)
+            and (kernel_block_sizes[index] == manager_block_size)
+            and (group_id < len(attn_groups))
             and attn_groups[group_id]
+            if vllm_version_is("0.33.0")
+            else spec.has_layer_views
+            and aliases_layers
+            and (not block_outermost_packed)
+            and (kernel_block_sizes[group_id] == manager_block_size)
         ):
-            kernel_block_sizes[index] = select_common_block_size(
-                manager_block_size,
-                [attn_group.backend for attn_group in attn_groups[group_id]],
-                [attn_group.kv_cache_spec for attn_group in attn_groups[group_id]],
-            )
-        index += 1
+            if vllm_version_is("0.33.0"):
+                kernel_block_sizes[index] = select_common_block_size(
+                    manager_block_size,
+                    [attn_group.backend for attn_group in attn_groups[group_id]],
+                    [attn_group.kv_cache_spec for attn_group in attn_groups[group_id]],
+                )
+            else:
+                kernel_block_sizes[group_id] = select_common_block_size(
+                    manager_block_size,
+                    [attn_group.backend for attn_group in attn_groups[group_id]],
+                    [attn_group.kv_cache_spec for attn_group in attn_groups[group_id]],
+                )
+
+        if vllm_version_is("0.33.0"):
+            index += 1
+
     return kernel_block_sizes
 
 

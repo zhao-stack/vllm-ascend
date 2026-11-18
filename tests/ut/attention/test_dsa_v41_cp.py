@@ -11,7 +11,7 @@ tests check persistent addresses and state controls, not NPU graph replay.
 import importlib
 from dataclasses import fields, replace
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import numpy as np
@@ -19,12 +19,25 @@ import pytest
 import torch
 import vllm.distributed as vllm_distributed
 from vllm.config import CUDAGraphMode
-from vllm.v1.kv_cache_interface import CircularBufferSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import CircularBufferSpec
+else:
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
 
 from vllm_ascend.attention import dsa_v41
 from vllm_ascend.attention.context_parallel import dsa_cp, dsa_v41_cp
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
+from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+else:
+    from vllm_ascend.core.kv_cache_interface import AscendCircularBufferSpec
+
 from vllm_ascend.models.deepseek_v41.cache_config import STATE_RING_ROWS
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
 from vllm_ascend.models.deepseek_v41.indexer import DeepseekV41Indexer
@@ -342,10 +355,18 @@ def builders(monkeypatch):
         )
         common = dict(block_size=8, num_kv_heads=1, head_size=2, dtype=torch.float32)
         specs = {
-            "swa": AscendSlidingWindowMLASpec(**common, sliding_window=4),
+            "swa": (
+                AscendSlidingWindowMLASpec(**common, **cast(dict[str, Any], {"sliding_window": 4}))
+                if vllm_version_is("0.33.0")
+                else MLAAttentionSpec(**common, **cast(dict[str, Any], {"model_version": "deepseek_v41"}))
+            ),
             "long_kv": AscendMLAAttentionSpec(**common, tokens_per_state=2),
             "index_k": AscendMLAAttentionSpec(**common, tokens_per_state=2, scale_dim=1),
-            "compressor_state": CircularBufferSpec(**common, tokens_per_state=2),
+            "compressor_state": (
+                CircularBufferSpec(**common, tokens_per_state=2)
+                if vllm_version_is("0.33.0")
+                else AscendCircularBufferSpec(**common, tokens_per_state=2)
+            ),
         }
         monkeypatch.setattr(dsa_v41_cp, "get_pcp_group", lambda: SimpleNamespace(rank_in_group=rank))
         monkeypatch.setattr(dsa_cp, "get_tp_group", lambda: SimpleNamespace(world_size=world, rank_in_group=rank))

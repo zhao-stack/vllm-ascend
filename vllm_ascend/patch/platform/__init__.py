@@ -20,8 +20,12 @@ import vllm_ascend.patch.platform.patch_distributed  # noqa
 import vllm_ascend.patch.platform.patch_glm53_reasoning  # noqa
 import vllm_ascend.patch.platform.patch_kimi_k31_config  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_admission  # noqa
-import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
-import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    import vllm_ascend.patch.platform.patch_kv_cache_utils  # noqa
+    import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
+
 import vllm_ascend.patch.platform.patch_mla_prefill_backend  # noqa
 import vllm_ascend.patch.platform.patch_parallel_config  # noqa
 import vllm_ascend.patch.platform.patch_pp_mtp  # noqa
@@ -36,17 +40,23 @@ import vllm_ascend.patch.platform.patch_minimax_m2_config  # noqa
 
 import vllm_ascend.patch.platform.patch_structured_output  # noqa
 import vllm_ascend.patch.platform.patch_torch_accelerator  # noqa
-import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
+
+if vllm_version_is("0.33.0"):
+    import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
+
 
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
+if vllm_version_is("0.33.0"):
+    import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
 
-import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
 import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 import vllm_ascend.patch.platform.patch_engine_core  # noqa
 import vllm_ascend.patch.platform.patch_metrics_level  # noqa
 
-import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
+if vllm_version_is("0.33.0"):
+    import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
+
 import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 import vllm_ascend.patch.platform.patch_replayssm_config  # noqa
 
@@ -57,6 +67,63 @@ import vllm_ascend.patch.platform.patch_fused_moe  # noqa
 import vllm_ascend.patch.platform.patch_engram_config  # noqa
 
 import vllm_ascend.patch.platform.patch_example_connector  # noqa
+
+if not vllm_version_is("0.33.0"):
+    # ** File: platform/patch_example_connector.py **
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #   1. `vllm.distributed.ec_transfer.ec_connector.example_connector.ECExampleConnector.start_load_caches`
+    #    Why:
+    #       The upstream method only qualifies the safetensors load device with an
+    #       index when `current_platform.is_cuda_alike()` returns True. Ascend NPU
+    #       returns False, so in TP>1 every rank loads the EC cache to the default
+    #       device (npu:0), causing rank 1 to access cross-device tensors and
+    #       trigger NPU AI Core errcode=95 (MTE DDR address out of range).
+    #    How:
+    #       Monkey-patch `start_load_caches` to extend the device-index
+    #       qualification to `device == "npu"`. The patch only takes effect on EC
+    #       consumer nodes; producers and non-EC deployments fall through to the
+    #       original upstream behavior.
+    #    Related PR (if no, explain why):
+    #       No upstream PR currently covers this Ascend-specific behavior.
+    #    Future Plan:
+    #       Remove this patch when upstream's `is_cuda_alike()` covers Ascend NPU
+    #       or when the device-index qualification is applied unconditionally.
+    #
+    # ** File: platform/patch_mamba_config.py **
+    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    #   1. `vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config`
+    #    Why:
+    #       GLM-Next's compressed indexer requires both Ascend C128 block alignment
+    #       and C16 alignment after applying `index_kpool`. The generic Mamba
+    #       configuration does not satisfy these requirements.
+    #    How:
+    #       Detect sparse index-kpool models, align the attention block size, and
+    #       pad the Mamba page using the complete recurrent-state size.
+    #    Related PR (if no, explain why):
+    #       https://github.com/vllm-project/vllm/pull/53906
+    #       https://github.com/vllm-project/vllm/pull/55449
+    #    Future Plan:
+    #       Remove this patch when vLLM supports backend-specific block and page
+    #       alignment constraints.
+    #
+    # ** File: platform/patch_kv_cache_admission.py **
+    # Targets SWA and chunked-local admission in SingleTypeKVCacheManager.
+    # First-time admission shifts the cap past skipped prefix entries. Existing
+    # requests offset the cap only with non-NULL blocks held exclusively by that
+    # request; releasing shared blocks does not return capacity to the pool.
+    # Uncapped allocation and full-attention managers retain upstream behavior.
+    # Upstream plan: contribute physical-block accounting to vLLM and remove this
+    # patch once both supported vLLM versions cover first-time and shared-block
+    # admission accounting.
+
+    import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
+
+    import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
+
+    import vllm_ascend.patch.platform.patch_mamba_block_aligned_split  # noqa
+
+    import vllm_ascend.patch.platform.patch_swa_bounded_replay  # noqa
+
 
 # ** File: platform/patch_example_connector.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -77,7 +144,6 @@ import vllm_ascend.patch.platform.patch_example_connector  # noqa
 #    Future Plan:
 #       Remove this patch when upstream's `is_cuda_alike()` covers Ascend NPU
 #       or when the device-index qualification is applied unconditionally.
-#
 # ** File: platform/patch_kv_cache_utils.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.kv_cache_planning` (both supported versions, vLLM #61183)
@@ -94,12 +160,10 @@ import vllm_ascend.patch.platform.patch_example_connector  # noqa
 #    Future Plan:
 #       Remove this patch when upstream's generic KV-cache layout supports the
 #       Ascend GLM-Next cache topology.
-#
 #       On both supported versions, Ascend grouping and pool accounting live
 #       in AscendKVCacheConfigBuilder, which the platform selects through
 #       NPUPlatform.get_kv_cache_config_builder_cls. Its default materialization
 #       delegates to the patched planning functions in this file.
-#
 # ** File: platform/patch_mamba_config.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config`
@@ -116,7 +180,6 @@ import vllm_ascend.patch.platform.patch_example_connector  # noqa
 #    Future Plan:
 #       Remove this patch when vLLM supports backend-specific block and page
 #       alignment constraints.
-#
 # ** File: platform/patch_mamba_block_aligned_split.py **
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.core.sched.scheduler.Scheduler._mamba_block_aligned_split`

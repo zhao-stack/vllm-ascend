@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+from __future__ import annotations
+
 import contextlib
 import copy
 import hashlib
@@ -47,21 +49,26 @@ from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.utils.math_utils import cdiv
 from vllm.utils.network_utils import get_ip, make_zmq_path, make_zmq_socket
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import (
-    FullAttentionSpec,
-    KVCacheConfig,
-    MambaSpec,
-    MLAAttentionSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-)
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec, MLAAttentionSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import SlidingWindowSpec, UniformTypeKVCacheSpecs
+
 from vllm.v1.request import RequestStatus
 
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
-from vllm_ascend.core.kv_cache_interface import (
-    AscendSFAIndexerCacheSpec,
-    AscendSlidingWindowMLASpec,
-)
+from vllm_ascend.core.kv_cache_interface import AscendSFAIndexerCacheSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     PD_QOS_DEFAULT,
@@ -1649,20 +1656,20 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
             self.connector_scheduler = None
             self.connector_worker = MooncakeConnectorWorker(vllm_config, str(self.engine_id), kv_cache_config)
 
-    def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
+    def get_loaded_kv_cache_group_ids(self, request: Request) -> tuple[int, ...]:
         # vLLM main's scheduler uses this for skip_zeroing_group_ids.
         # Mooncake restores the request's own transfer blocks.
         return self._kv_cache_config.transfer_group_ids
 
-    def on_new_request(self, request: "Request") -> None:
+    def on_new_request(self, request: Request) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
-    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+    def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(request, blocks, num_external_tokens)
 
@@ -1675,7 +1682,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     def request_finished(
         self,
-        request: "Request",
+        request: Request,
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
@@ -1683,7 +1690,7 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
 
     def request_finished_all_groups(
         self,
-        request: "Request",
+        request: Request,
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
@@ -1710,24 +1717,21 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         return self.connector_worker.get_transfer_results()
 
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+    def start_load_kv(self, forward_context: ForwardContext, **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, MooncakeConnectorMetadata)
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """MooncakeConnector does not do layerwise saving."""
-        pass
 
     def save_kv_layer(
-        self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
+        self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: AttentionMetadata, **kwargs
     ) -> None:
         """MooncakeConnector does not save explicitly."""
-        pass
 
     def wait_for_save(self):
         """MooncakeConnector does not save explicitly."""
-        pass
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """
@@ -1814,35 +1818,50 @@ class MooncakeConnectorScheduler:
         return isinstance(compress_ratios, (list, tuple, dict))
 
     def _get_group_transfer_info(self, group: Any) -> GroupTransferInfo:
-        specs = self._get_group_unique_specs(group)
-        first_spec = specs[0] if specs else group.kv_cache_spec
-        block_size = getattr(group.kv_cache_spec, "block_size", getattr(first_spec, "block_size", self.block_size))
-        is_state_group = any(isinstance(spec, MambaSpec) for spec in specs)
-        sliding_window = 0
-        compress_ratio = 1
-        for spec in specs:
-            if isinstance(spec, SlidingWindowSpec):
-                sliding_window = spec.sliding_window
-            elif hasattr(spec, "compress_ratio"):
-                compress_ratio = spec.compress_ratio
+        if vllm_version_is("0.33.0"):
+            specs = self._get_group_unique_specs(group)
+            first_spec = specs[0] if specs else group.kv_cache_spec
+            block_size = getattr(group.kv_cache_spec, "block_size", getattr(first_spec, "block_size", self.block_size))
+            is_state_group = any(isinstance(spec, MambaSpec) for spec in specs)
+            sliding_window = 0
+            compress_ratio = 1
+            for spec in specs:
+                if isinstance(spec, SlidingWindowSpec):
+                    sliding_window = spec.sliding_window
+                elif hasattr(spec, "compress_ratio"):
+                    compress_ratio = spec.compress_ratio
+        else:
+            window = getattr(group.manager_config.params, "sliding_window", 0)
 
         return GroupTransferInfo(
-            tokens_per_block=block_size * max(1, int(compress_ratio)),
-            blocks_per_window=cdiv(sliding_window, block_size) + 1 if sliding_window else 0,
-            is_state_group=is_state_group,
-            dcp_sharded=first_spec.dcp_sharded,
+            tokens_per_block=block_size * max(1, int(compress_ratio))
+            if vllm_version_is("0.33.0")
+            else group.block_size,
+            blocks_per_window=cdiv(
+                sliding_window if vllm_version_is("0.33.0") else window,
+                block_size if vllm_version_is("0.33.0") else group.block_size,
+            )
+            + 1
+            if (sliding_window if vllm_version_is("0.33.0") else window)
+            else 0,
+            is_state_group=is_state_group
+            if vllm_version_is("0.33.0")
+            else any(isinstance(spec, MambaSpec) for spec in group.distinct_specs),
+            dcp_sharded=(first_spec if vllm_version_is("0.33.0") else group).dcp_sharded,
         )
 
-    def _get_group_unique_specs(self, group: Any) -> list[Any]:
-        if not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
-            return [group.kv_cache_spec]
+    if vllm_version_is("0.33.0"):
 
-        specs = []
-        for layer_name in group.layer_names:
-            layer_spec = group.kv_cache_spec.kv_cache_specs[layer_name]
-            if layer_spec not in specs:
-                specs.append(layer_spec)
-        return specs
+        def _get_group_unique_specs(self, group: Any) -> list[Any]:
+            if not isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+                return [group.kv_cache_spec]
+
+            specs = []
+            for layer_name in group.layer_names:
+                layer_spec = group.kv_cache_spec.kv_cache_specs[layer_name]
+                if layer_spec not in specs:
+                    specs.append(layer_spec)
+            return specs
 
     def _get_transfer_block_ids(self, block_ids: BlockIds, prompt_len: int) -> BlockIds:
         """Return blocks that contain prompt KV, dropping MTP extra blocks.
@@ -1908,7 +1927,7 @@ class MooncakeConnectorScheduler:
             return num_prompt_tokens - 1
         return num_prompt_tokens
 
-    def _truncate_request_for_prefill(self, request: "Request") -> None:
+    def _truncate_request_for_prefill(self, request: Request) -> None:
         """P-side only: drop the last prompt token so the prefiller computes
         h(N-1) instead of h(N). The decoder recomputes the last token to
         derive h(N) correctly.
@@ -1937,14 +1956,14 @@ class MooncakeConnectorScheduler:
             request.update_block_hashes()
             params["_p_side_truncated"] = True
 
-    def on_new_request(self, request: "Request") -> None:
+    def on_new_request(self, request: Request) -> None:
         # Truncate before local prefix-cache lookup so its hit count stays
         # consistent with the prompt length used by the scheduler.
         params = request.kv_transfer_params
         if params is not None and params.get("do_remote_decode") and self.need_truncate:
             self._truncate_request_for_prefill(request)
 
-    def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self, request: Request, num_computed_tokens: int) -> tuple[int, bool]:
         """
         For remote prefill, pull all prompt blocks from remote
         asynchronously relative to engine execution.
@@ -1979,7 +1998,7 @@ class MooncakeConnectorScheduler:
         # No remote prefill for this request.
         return 0, False
 
-    def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+    def update_state_after_alloc(self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int):
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
@@ -2039,7 +2058,7 @@ class MooncakeConnectorScheduler:
 
     def request_finished(
         self,
-        request: "Request",
+        request: Request,
         block_ids: BlockIds,
     ) -> tuple[bool, dict[str, Any] | None]:
         """
@@ -2194,16 +2213,22 @@ class MooncakeConnectorWorker:
         self.kv_cache_config = kv_cache_config
         self.num_blocks: int = kv_cache_config.num_blocks
         self.kv_group2layeridx: dict[int, tuple[dict[str, Any], list[int]]] = {}
-        _is_fullattn_group = []
-        for g in self.kv_cache_config.kv_cache_groups:
-            if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs):
-                is_fullattn_spec = []
-                for layer_name in g.layer_names:
-                    layer_spec = g.kv_cache_spec.kv_cache_specs[layer_name]
-                    is_fullattn_spec.append(isinstance(layer_spec, FullAttentionSpec))
-                _is_fullattn_group.append(all(is_fullattn_spec))
-            else:
-                _is_fullattn_group.append(isinstance(g.kv_cache_spec, FullAttentionSpec))
+        _is_fullattn_group = (
+            []
+            if vllm_version_is("0.33.0")
+            else [group.manager_cls is FullAttentionManager for group in kv_cache_config.kv_cache_groups]
+        )
+        if vllm_version_is("0.33.0"):
+            for g in self.kv_cache_config.kv_cache_groups:
+                if isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs):
+                    is_fullattn_spec = []
+                    for layer_name in g.layer_names:
+                        layer_spec = g.kv_cache_spec.kv_cache_specs[layer_name]
+                        is_fullattn_spec.append(isinstance(layer_spec, AttentionSpec))
+                    _is_fullattn_group.append(all(is_fullattn_spec))
+                else:
+                    _is_fullattn_group.append(isinstance(g.kv_cache_spec, AttentionSpec))
+
         self.use_hybrid = (
             not self.vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
             and not all(_is_fullattn_group)
@@ -2278,62 +2303,121 @@ class MooncakeConnectorWorker:
         assert self._decode_pp_size == 1, "decode pp size must be 1"
         self._prefill_pp_layer_partition = prefill_parallel_config.get("pp_layer_partition")
 
-    @staticmethod
-    def _serialize_kv_group_spec(
-        group_spec: Any,
-        layer_names: list[str] | None = None,
-        kv_cache_spec: Any | None = None,
-        kv_cache_group_id: int | None = None,
-        total_num_kv_heads: int | None = None,
-    ) -> dict[str, Any]:
-        def to_msgpackable(value: Any) -> Any:
-            if value is None or isinstance(value, (str, int, float, bool)):
-                return value
-            if isinstance(value, dict):
-                return {str(k): to_msgpackable(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [to_msgpackable(item) for item in value]
-            try:
-                builtins_value = msgspec.to_builtins(value)
-                if builtins_value is value:
+    if vllm_version_is("0.33.0"):
+
+        @staticmethod
+        def _serialize_kv_group_spec(
+            group_spec: Any,
+            layer_names: list[str] | None = None,
+            kv_cache_spec: Any | None = None,
+            kv_cache_group_id: int | None = None,
+            total_num_kv_heads: int | None = None,
+        ) -> dict[str, Any]:
+            def to_msgpackable(value: Any) -> Any:
+                if value is None or isinstance(value, (str, int, float, bool)):
+                    return value
+                if isinstance(value, dict):
+                    return {str(k): to_msgpackable(v) for k, v in value.items()}
+                if isinstance(value, (list, tuple)):
+                    return [to_msgpackable(item) for item in value]
+                try:
+                    builtins_value = msgspec.to_builtins(value)
+                    if builtins_value is value:
+                        return repr(value)
+                    return to_msgpackable(builtins_value)
+                except TypeError:
                     return repr(value)
-                return to_msgpackable(builtins_value)
-            except TypeError:
-                return repr(value)
 
-        if layer_names is None:
-            layer_names = list(group_spec.layer_names)
-        if kv_cache_spec is None:
-            kv_cache_spec = group_spec.kv_cache_spec
-        spec = kv_cache_spec
-        if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
-            spec = {layer_name: kv_cache_spec.kv_cache_specs[layer_name] for layer_name in layer_names}
-        serialized_kv_cache_spec = to_msgpackable(spec)
-        if not isinstance(serialized_kv_cache_spec, dict):
-            serialized_kv_cache_spec = {"repr": serialized_kv_cache_spec}
-        num_key_value_heads = MooncakeConnectorWorker._get_spec_num_key_value_heads(spec)
-        if num_key_value_heads is not None:
-            serialized_kv_cache_spec["num_kv_heads"] = num_key_value_heads
-            serialized_kv_cache_spec["num_key_value_heads"] = num_key_value_heads
-        if total_num_kv_heads is not None:
-            serialized_kv_cache_spec["total_num_kv_heads"] = total_num_kv_heads
+            if layer_names is None:
+                layer_names = list(group_spec.layer_names)
+            if kv_cache_spec is None:
+                kv_cache_spec = group_spec.kv_cache_spec
+            spec = kv_cache_spec
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                spec = {layer_name: kv_cache_spec.kv_cache_specs[layer_name] for layer_name in layer_names}
+            serialized_kv_cache_spec = to_msgpackable(spec)
+            if not isinstance(serialized_kv_cache_spec, dict):
+                serialized_kv_cache_spec = {"repr": serialized_kv_cache_spec}
+            num_key_value_heads = MooncakeConnectorWorker._get_spec_num_key_value_heads(spec)
+            if num_key_value_heads is not None:
+                serialized_kv_cache_spec["num_kv_heads"] = num_key_value_heads
+                serialized_kv_cache_spec["num_key_value_heads"] = num_key_value_heads
+            if total_num_kv_heads is not None:
+                serialized_kv_cache_spec["total_num_kv_heads"] = total_num_kv_heads
 
-        serialized = {
-            "layer_names": layer_names,
-            "kv_cache_spec_type": type(kv_cache_spec).__name__,
-            "kv_cache_spec": serialized_kv_cache_spec,
-        }
-        serialized["dcp_sharded"] = kv_cache_spec.dcp_sharded
-        serialized["block_size"] = kv_cache_spec.block_size
-        if kv_cache_group_id is not None:
-            serialized["kv_cache_group_id"] = kv_cache_group_id
-        if isinstance(kv_cache_spec, MambaSpec):
-            serialized["shapes"] = [list(shape) for shape in kv_cache_spec.shapes]
-            serialized["dtype_sizes"] = [
-                torch.tensor([], dtype=dtype).element_size()
-                for dtype in kv_cache_spec.dtypes  # type: ignore[misc]
-            ]
-        return serialized
+            serialized = {
+                "layer_names": layer_names,
+                "kv_cache_spec_type": type(kv_cache_spec).__name__,
+                "kv_cache_spec": serialized_kv_cache_spec,
+            }
+            serialized["dcp_sharded"] = kv_cache_spec.dcp_sharded
+            serialized["block_size"] = kv_cache_spec.block_size
+            if kv_cache_group_id is not None:
+                serialized["kv_cache_group_id"] = kv_cache_group_id
+            if isinstance(kv_cache_spec, MambaSpec):
+                serialized["shapes"] = [list(shape) for shape in kv_cache_spec.shapes]
+                serialized["dtype_sizes"] = [
+                    torch.tensor([], dtype=dtype).element_size()
+                    for dtype in kv_cache_spec.dtypes  # type: ignore[misc]
+                ]
+            return serialized
+    else:
+
+        @staticmethod
+        def _serialize_kv_group_spec(
+            group_spec: Any,
+            kv_cache_spec: Any,
+            layer_names: list[str] | None = None,
+            kv_cache_group_id: int | None = None,
+            total_num_kv_heads: int | None = None,
+        ) -> dict[str, Any]:
+            def to_msgpackable(value: Any) -> Any:
+                if value is None or isinstance(value, (str, int, float, bool)):
+                    return value
+                if isinstance(value, dict):
+                    return {str(k): to_msgpackable(v) for k, v in value.items()}
+                if isinstance(value, (list, tuple)):
+                    return [to_msgpackable(item) for item in value]
+                try:
+                    builtins_value = msgspec.to_builtins(value)
+                    if builtins_value is value:
+                        return repr(value)
+                    return to_msgpackable(builtins_value)
+                except TypeError:
+                    return repr(value)
+
+            if layer_names is None:
+                layer_names = list(group_spec.layer_names)
+            spec = kv_cache_spec
+            serialized_kv_cache_spec = to_msgpackable(spec)
+            if not isinstance(serialized_kv_cache_spec, dict):
+                serialized_kv_cache_spec = {"repr": serialized_kv_cache_spec}
+            num_key_value_heads = MooncakeConnectorWorker._get_spec_num_key_value_heads(spec)
+            if num_key_value_heads is not None:
+                serialized_kv_cache_spec["num_kv_heads"] = num_key_value_heads
+                serialized_kv_cache_spec["num_key_value_heads"] = num_key_value_heads
+            if total_num_kv_heads is not None:
+                serialized_kv_cache_spec["total_num_kv_heads"] = total_num_kv_heads
+            window = getattr(group_spec.manager_config.params, "sliding_window", 0)
+            if window:
+                serialized_kv_cache_spec["sliding_window"] = window
+
+            serialized = {
+                "layer_names": layer_names,
+                "kv_cache_spec_type": type(kv_cache_spec).__name__,
+                "kv_cache_spec": serialized_kv_cache_spec,
+            }
+            serialized["dcp_sharded"] = kv_cache_spec.dcp_sharded
+            serialized["block_size"] = kv_cache_spec.block_size
+            if kv_cache_group_id is not None:
+                serialized["kv_cache_group_id"] = kv_cache_group_id
+            if isinstance(kv_cache_spec, MambaSpec):
+                serialized["shapes"] = [list(shape) for shape in kv_cache_spec.shapes]
+                serialized["dtype_sizes"] = [
+                    torch.tensor([], dtype=dtype).element_size()
+                    for dtype in kv_cache_spec.dtypes  # type: ignore[misc]
+                ]
+            return serialized
 
     def _is_index_cache_layer(self, layer_name: str) -> bool:
         """Whether a layer needs the independent SFA metadata plane.
@@ -2349,16 +2433,24 @@ class MooncakeConnectorWorker:
         kv_cache_config: KVCacheConfig,
     ) -> dict[str, Any]:
         """Return the real per-layer specs retained by the KV cache config."""
-        layer_specs: dict[str, Any] = {}
-        for group in kv_cache_config.kv_cache_groups:
-            group_kv_spec = group.kv_cache_spec
-            if isinstance(group_kv_spec, UniformTypeKVCacheSpecs):
+        if vllm_version_is("0.33.0"):
+            layer_specs: dict[str, Any] = {}
+            for group in kv_cache_config.kv_cache_groups:
+                group_kv_spec = group.kv_cache_spec
+                if isinstance(group_kv_spec, UniformTypeKVCacheSpecs):
+                    for layer_name in group.layer_names:
+                        layer_specs[layer_name] = group_kv_spec.kv_cache_specs[layer_name]
+                    continue
                 for layer_name in group.layer_names:
-                    layer_specs[layer_name] = group_kv_spec.kv_cache_specs[layer_name]
-                continue
-            for layer_name in group.layer_names:
-                layer_specs[layer_name] = group_kv_spec
-        return layer_specs
+                    layer_specs[layer_name] = group_kv_spec
+
+        return (
+            layer_specs
+            if vllm_version_is("0.33.0")
+            else {
+                name: spec for group in kv_cache_config.kv_cache_groups for name, spec in group.kv_cache_specs.items()
+            }
+        )
 
     @staticmethod
     def _get_spec_num_key_value_heads(spec: Any) -> int | None:
@@ -2395,7 +2487,11 @@ class MooncakeConnectorWorker:
         # grouping, but remains a distinct key-only transfer layout.
         if isinstance(spec, AscendSFAIndexerCacheSpec):
             return 1
-        if isinstance(spec, (MLAAttentionSpec, AscendSlidingWindowMLASpec)):
+        if (
+            isinstance(spec, (MLAAttentionSpec, AscendSlidingWindowMLASpec))
+            if vllm_version_is("0.33.0")
+            else isinstance(spec, MLAAttentionSpec)
+        ):
             return 1
         local_num_kv_heads = self._get_spec_num_key_value_heads(spec)
         if local_num_kv_heads is None:
@@ -2496,10 +2592,12 @@ class MooncakeConnectorWorker:
         return [kv_cache_tuple]
 
     def _get_layer_spec(self, layer_name: str) -> Any:
-        layer_spec = self._layer_specs[layer_name]
-        if isinstance(layer_spec, UniformTypeKVCacheSpecs):
-            layer_spec = layer_spec.kv_cache_specs[layer_name]
-        return layer_spec
+        if vllm_version_is("0.33.0"):
+            layer_spec = self._layer_specs[layer_name]
+            if isinstance(layer_spec, UniformTypeKVCacheSpecs):
+                layer_spec = layer_spec.kv_cache_specs[layer_name]
+
+        return layer_spec if vllm_version_is("0.33.0") else self._layer_specs[layer_name]
 
     @staticmethod
     def _recover_aligned_kv_tensor_base(

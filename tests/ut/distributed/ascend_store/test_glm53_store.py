@@ -9,19 +9,32 @@ import unittest
 from dataclasses import replace
 from itertools import product
 from types import MethodType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import numpy as np
 import torch
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
-from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
+
+from vllm_ascend.utils import vllm_version_is
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+
+from vllm.v1.kv_cache_interface import MambaSpec
+
+if vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
 
 from tests.ut.distributed.ascend_store.test_mooncake_hybrid import MemoryRangeStore
 from tests.ut.distributed.ascend_store.test_pool_worker import make_worker, start_patch
 from tests.ut.models.test_glm5next_cache_config import make_config, make_specs
+
+if not vllm_version_is("0.33.0"):
+    from tests.ut.models.test_glm5next_cache_config import make_layer_configs
+
 from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import create_kv_pool_scheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
@@ -41,13 +54,19 @@ from vllm_ascend.utils import get_kv_cache_tensor_layers
 
 
 def make_glm53_plan(layer_offset=0, *, use_recoverssm=False):
-    register_all_kvcache_specs(None)
+    if vllm_version_is("0.33.0"):
+        register_all_kvcache_specs(None)
+
     specs = {}
     for name, spec in make_specs(pool=4).items():
         parts = name.split(".")
         parts[2] = str(int(parts[2]) + layer_offset)
         if isinstance(spec, MambaSpec):
-            spec = replace(spec, mamba_cache_mode="align", mamba_type=MambaAttentionBackendEnum.GDN_ATTN)
+            spec = replace(
+                spec,
+                **cast(dict[str, Any], {"mamba_cache_mode": "align"} if vllm_version_is("0.33.0") else {}),
+                mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+            )
             if use_recoverssm:
                 spec = replace(
                     spec,
@@ -56,7 +75,9 @@ def make_glm53_plan(layer_offset=0, *, use_recoverssm=False):
                 )
         specs[".".join(parts)] = spec
     config = make_config()
-    groups = get_glm5_next_kv_cache_groups(config, specs)
+    groups = get_glm5_next_kv_cache_groups(
+        config, specs if vllm_version_is("0.33.0") else make_layer_configs(specs, mamba_cache_mode="align")
+    )
     return get_glm5_next_kv_cache_config(config, groups, 24 * get_glm5_next_pool_bytes_per_block(groups))
 
 
@@ -72,39 +93,70 @@ def make_glm53_caches(plan):
             storage[name] = raw
     caches = {}
     for group in plan.kv_cache_groups:
-        specs = group.kv_cache_spec
-        specs = (
-            specs.kv_cache_specs
-            if isinstance(specs, UniformTypeKVCacheSpecs)
-            else dict.fromkeys(group.layer_names, specs)
-        )
-        for name, spec in specs.items():
-            raw = storage[name]
-            if isinstance(spec, MambaSpec):
-                views = []
-                offset = 0
-                for shape, dtype in zip(spec.shapes, spec.dtypes):
-                    view = raw[offset:].view(dtype)
-                    strides = torch.empty(shape).stride()
-                    views.append(
-                        view.as_strided(
-                            (plan.num_blocks, *shape), (spec.page_size_bytes // view.element_size(), *strides)
+        if vllm_version_is("0.33.0"):
+            specs = group.kv_cache_spec
+            specs = (
+                specs.kv_cache_specs
+                if isinstance(specs, UniformTypeKVCacheSpecs)
+                else dict.fromkeys(group.layer_names, specs)
+            )
+            for name, spec in specs.items():
+                raw = storage[name]
+                if isinstance(spec, MambaSpec):
+                    views = []
+                    offset = 0
+                    for shape, dtype in zip(spec.shapes, spec.dtypes):
+                        view = raw[offset:].view(dtype)
+                        strides = torch.empty(shape).stride()
+                        views.append(
+                            view.as_strided(
+                                (plan.num_blocks, *shape), (spec.page_size_bytes // view.element_size(), *strides)
+                            )
                         )
+                        offset += views[-1][0].numel() * view.element_size()
+                    caches[name] = tuple(views)
+                else:
+                    shape = (
+                        (2, 4, 128)
+                        if isinstance(spec, AscendIndexerKPoolTailSpec)
+                        else ((128, 1, 128) if "k_cache" in name else (512, 1, 512))
                     )
-                    offset += views[-1][0].numel() * view.element_size()
-                caches[name] = tuple(views)
-            else:
-                shape = (
-                    (2, 4, 128)
-                    if isinstance(spec, AscendIndexerKPoolTailSpec)
-                    else ((128, 1, 128) if "k_cache" in name else (512, 1, 512))
-                )
-                view = raw.view(spec.dtype)
-                strides = torch.empty(shape).stride()
-                view = view.as_strided(
-                    (plan.num_blocks, *shape), (spec.page_size_bytes // view.element_size(), *strides)
-                )
-                caches[name] = (view, view[..., :0]) if name.endswith(".attn") else (view,)
+                    view = raw.view(spec.dtype)
+                    strides = torch.empty(shape).stride()
+                    view = view.as_strided(
+                        (plan.num_blocks, *shape), (spec.page_size_bytes // view.element_size(), *strides)
+                    )
+                    caches[name] = (view, view[..., :0]) if name.endswith(".attn") else (view,)
+        else:
+            for name in group.layer_names:
+                spec = group.kv_cache_specs[name]
+                raw = storage[name]
+                if isinstance(spec, MambaSpec):
+                    views = []
+                    offset = 0
+                    for shape, dtype in zip(spec.shapes, spec.dtypes):
+                        view = raw[offset:].view(dtype)
+                        strides = torch.empty(shape).stride()
+                        views.append(
+                            view.as_strided(
+                                (plan.num_blocks, *shape), (spec.page_size_bytes // view.element_size(), *strides)
+                            )
+                        )
+                        offset += views[-1][0].numel() * view.element_size()
+                    caches[name] = tuple(views)
+                else:
+                    shape = (
+                        (2, 4, 128)
+                        if isinstance(spec, AscendIndexerKPoolTailSpec)
+                        else ((128, 1, 128) if "k_cache" in name else (512, 1, 512))
+                    )
+                    view = raw.view(spec.dtype)
+                    strides = torch.empty(shape).stride()
+                    view = view.as_strided(
+                        (plan.num_blocks, *shape), (spec.page_size_bytes // view.element_size(), *strides)
+                    )
+                    caches[name] = (view, view[..., :0]) if name.endswith(".attn") else (view,)
+
     return caches
 
 
@@ -292,16 +344,32 @@ class TestGLM53Store(unittest.TestCase):
         # One persistent state, two states with extra records, and two states
         # whose verification records live outside the KV cache.
         for group, backend, components in zip(plan.kv_cache_groups[2:], (short_conv, gdn, gdn), (1, 5, 2)):
-            spec = group.kv_cache_spec
-            spec = replace(
-                spec,
-                mamba_type=backend,
-                shapes=(*spec.shapes, (1, 6))[:components],
-                dtypes=(*spec.dtypes, torch.float32)[:components],
+            if not vllm_version_is("0.33.0"):
+                (spec,) = group.distinct_specs
+
+            spec = (
+                group.kv_cache_spec
+                if vllm_version_is("0.33.0")
+                else replace(
+                    spec,
+                    mamba_type=backend,
+                    shapes=(*spec.shapes, (1, 6))[:components],
+                    dtypes=(*spec.dtypes, torch.float32)[:components],
+                )
             )
-            group.kv_cache_spec = UniformTypeKVCacheSpecs(
-                block_size=spec.block_size, kv_cache_specs=dict.fromkeys(group.layer_names, spec)
-            )
+            if vllm_version_is("0.33.0"):
+                spec = replace(
+                    spec,
+                    mamba_type=backend,
+                    shapes=(*spec.shapes, (1, 6))[:components],
+                    dtypes=(*spec.dtypes, torch.float32)[:components],
+                )
+                group.kv_cache_spec = UniformTypeKVCacheSpecs(
+                    block_size=spec.block_size, kv_cache_specs=dict.fromkeys(group.layer_names, spec)
+                )
+            else:
+                group.kv_cache_specs = dict.fromkeys(group.layer_names, spec)
+
         caches = make_glm53_caches(plan)
         worker = make_worker(
             self, kv_cache_config=plan, use_mla=True, num_layers=4, use_recoverssm=True, mamba_copy_funcs=copy_funcs
