@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -13,11 +12,13 @@ import torch_npu
 from vllm.config import ParallelConfig
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
 from vllm.v1.kv_cache_interface import MLAAttentionSpec, SparseCacheRole
+
 from vllm_ascend.utils import vllm_version_is
+
 if vllm_version_is("0.33.0"):
-    from vllm.v1.kv_cache_interface import FullAttentionSpec, FullAttentionSpec as AttentionSpec
+    from vllm.v1.kv_cache_interface import FullAttentionSpec as AttentionSpec
 else:
-    from vllm.v1.kv_cache_interface import AttentionSpec, AttentionSpec as FullAttentionSpec
+    from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention import indexer as indexer_module
 from vllm_ascend.attention.indexer import (
@@ -630,7 +631,7 @@ def test_indexer_owner_reports_data_scale_and_replication(monkeypatch, c4, c8, r
     backend.enable_sparse_li_c4, backend.enable_sparse_li_c8 = c4, c8
     backend.c4_k_cache_dtype, backend.c4_k_scale_cache_dtype = torch.uint8, torch.float8_e8m0fnu
     backend.c8_k_cache_dtype, backend.c8_k_scale_cache_dtype = torch.int8, torch.float16
-    source = MLAAttentionSpec(
+    source = (MLAAttentionSpec if vllm_version_is("0.33.0") else AscendSFAIndexerCacheSpec)(
         block_size=128,
         num_kv_heads=1,
         head_size=132,

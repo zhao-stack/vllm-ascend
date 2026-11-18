@@ -16,6 +16,18 @@ from vllm_ascend.attention.indexer import AscendSFAIndexerBackend
 from vllm_ascend.attention.mla_v1 import AscendMLAAttention, AscendMLABackend, AscendMLAImpl
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+
+
+def _mock_parent_spec(monkeypatch, source):
+    if vllm_version_is("0.33.0"):
+        monkeypatch.setattr(MLAAttention, "get_kv_cache_spec", lambda *_: source)
+    else:
+        config = replace(FullAttentionManager.layer_config(source), is_draft=getattr(source, "is_draft", False))
+        monkeypatch.setattr(MLAAttention, "get_kv_cache_config", lambda *_: config)
 
 
 @pytest.mark.parametrize(
@@ -30,7 +42,7 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
     ],
 )
 def test_mla_owner_preserves_upstream_spec_metadata(monkeypatch, model_type, heads):
-    source = MLAAttentionSpec(
+    source = (MLAAttentionSpec if vllm_version_is("0.33.0") else AscendMLAAttentionSpec)(
         block_size=128,
         num_kv_heads=1,
         head_size=576,
@@ -47,12 +59,13 @@ def test_mla_owner_preserves_upstream_spec_metadata(monkeypatch, model_type, hea
         cache_role=SparseCacheRole.SPARSE,
         is_index_group_leader=True,
     )
-    monkeypatch.setattr(MLAAttention, "get_kv_cache_spec", lambda *_: source)
+    _mock_parent_spec(monkeypatch, source)
     layer = AscendMLAAttention.__new__(AscendMLAAttention)
     torch.nn.Module.__init__(layer)
     layer.attn_backend = AscendMLABackend
     layer.kv_lora_rank = 512
     layer.qk_rope_head_dim = 64
+    layer.non_causal_multi_token_decode = True
     layer.num_heads = 12
     layer.model_version = None
     layer.indexes_kv_by_block_stride = True
@@ -91,6 +104,7 @@ def _make_owner(impl, backend, rope_dim=64):
     layer.num_heads = 12
     layer.kv_lora_rank = 512
     layer.qk_rope_head_dim = rope_dim
+    layer.non_causal_multi_token_decode = False
     return layer
 
 
@@ -101,7 +115,7 @@ def _get_owner_spec(monkeypatch, layer):
         head_size=layer.kv_lora_rank + layer.qk_rope_head_dim,
         dtype=torch.bfloat16,
     )
-    monkeypatch.setattr(MLAAttention, "get_kv_cache_spec", lambda *_: source)
+    _mock_parent_spec(monkeypatch, source)
     config = SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="glm_moe_dsa")),
     )
@@ -184,6 +198,11 @@ def test_worker_customizes_spec_once_without_reading_impl(monkeypatch, backend, 
     class Owner(MLAAttention):
         def get_kv_cache_spec(self, _config):
             return source
+
+        if not vllm_version_is("0.33.0"):
+
+            def get_kv_cache_config(self, _config):
+                return FullAttentionManager.layer_config(source)
 
         @property
         def impl(self):

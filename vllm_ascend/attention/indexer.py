@@ -25,6 +25,12 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.utils import select_common_block_size
 
@@ -156,6 +162,14 @@ class AscendSFAIndexerCache(DeepseekV32IndexerCache):
         # mypy --follow-imports skip cannot see the upstream dataclass fields.
         return replace(self.cache_spec, block_size=vllm_config.cache_config.block_size)  # type: ignore[call-arg]
 
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig | None:
+            spec = self.get_kv_cache_spec(vllm_config)
+            if spec is None:
+                return None
+            return FullAttentionManager.layer_config(spec)
+
     def get_attn_backend(self):
         return self.backend_cls
 
@@ -282,7 +296,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             self.c4_k_op_dtype = torch_npu.float4_e2m1fn_x2
 
         vllm_config = get_current_vllm_config()
-        spec = self._build_cache_spec(self.k_cache.get_kv_cache_spec(vllm_config), vllm_config)
+        if vllm_version_is("0.33.0"):
+            source = self.k_cache.get_kv_cache_spec(vllm_config)
+        else:
+            layer_config = self.k_cache.get_kv_cache_config(vllm_config)
+            assert layer_config is not None
+            source = layer_config.spec
+        spec = self._build_cache_spec(source, vllm_config)
         # TODO: Make upstream DeepseekV32IndexerCache a PluggableLayer so the
         # Ascend cache layer can be selected directly and create its backend,
         # instead of the backend replacing an already-created cache layer.

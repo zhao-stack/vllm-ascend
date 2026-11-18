@@ -9,7 +9,9 @@ import torch
 from vllm.config.attention import AttentionConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention import MLAAttention
+
 from vllm_ascend.utils import vllm_version_is
+
 if not vllm_version_is("0.33.0"):
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager, MambaManager, SlidingWindowManager
 from vllm.v1.kv_cache_interface import (
@@ -18,9 +20,6 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
-    SlidingWindowSpec,
-    UniformTypeKVCacheSpecs,
-    SparseCacheRole,
 )
 
 if vllm_version_is("0.33.0"):
@@ -53,7 +52,8 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSASWABackend,
 )
 from vllm_ascend.attention.mla_v1 import AscendMLAAttention, AscendMLABackend, AscendMLAImpl
-from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAImpl, AscendSFAMetadataBuilder
+from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadataBuilder
+
 if not vllm_version_is("0.33.0"):
     from vllm_ascend.core.kv_cache_config_builder import _place_deepseek_v4_cache
 from vllm_ascend.core.kv_cache_interface import (
@@ -1262,7 +1262,12 @@ def test_draft_layer_specs_are_tagged_for_eagle_groups(monkeypatch, is_draft_lay
         lambda *_args, **_kwargs: {"model.layers.0.self_attn.attn": layer},
     )
 
-    assert (spec if vllm_version_is("0.33.0") else config).is_draft is is_draft_layer
+    if vllm_version_is("0.33.0"):
+        spec = attn_utils.get_kv_cache_spec(vllm_config)["model.layers.0.self_attn.attn"]
+        assert spec.is_draft is is_draft_layer
+    else:
+        config = attn_utils.get_kv_cache_layer_configs(vllm_config)["model.layers.0.self_attn.attn"]
+        assert config.is_draft is is_draft_layer
 
 
 @pytest.mark.parametrize(
@@ -1275,7 +1280,7 @@ def test_draft_layer_specs_are_tagged_for_eagle_groups(monkeypatch, is_draft_lay
 def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(
     monkeypatch, model_type, expected_num_heads, source_is_draft, is_draft_layer, non_causal, dcp_sharded
 ):
-    source_spec = MLAAttentionSpec(
+    source_spec = (MLAAttentionSpec if vllm_version_is("0.33.0") else AscendMLAAttentionSpec)(
         block_size=128,
         num_kv_heads=1,
         head_size=576,
@@ -1296,7 +1301,12 @@ def test_mla_cache_spec_uses_physical_heads_for_kimi_k3(
     layer.model_version = None
     layer.indexes_kv_by_block_stride = False
     layer.is_draft_layer = is_draft_layer
-    monkeypatch.setattr(MLAAttention, "get_kv_cache_spec", lambda *_: source_spec)
+    layer.non_causal_multi_token_decode = non_causal
+    if vllm_version_is("0.33.0"):
+        monkeypatch.setattr(MLAAttention, "get_kv_cache_spec", lambda *_: source_spec)
+    else:
+        parent_config = replace(FullAttentionManager.layer_config(source_spec), is_draft=source_is_draft)
+        monkeypatch.setattr(MLAAttention, "get_kv_cache_config", lambda *_: parent_config)
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             dtype=torch.bfloat16,

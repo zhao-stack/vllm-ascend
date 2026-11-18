@@ -1,5 +1,5 @@
 from copy import copy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Any, ClassVar, NamedTuple, TypeVar
 
 import numpy as np
@@ -28,6 +28,11 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID  # type: ignore
 from vllm.v1.attention.ops.pcp import _gather_prefill_cache_inputs  # type: ignore[import-not-found]
 from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
+
+from vllm_ascend.utils import vllm_version_is
+
+if not vllm_version_is("0.33.0"):
+    from vllm.v1.kv_cache_interface import KVCacheLayerConfig
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -169,8 +174,49 @@ class AscendMLAAttention(MLAAttention):
 
     supports_pcp_dcp: ClassVar[bool] = True
 
+    if not vllm_version_is("0.33.0"):
+
+        def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig:
+            """Publish the complete cache demand using the selected execution format."""
+            layer_config = super().get_kv_cache_config(vllm_config)
+            spec = layer_config.spec
+            if getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None:
+                return layer_config
+            values = {field.name: getattr(spec, field.name) for field in fields(spec) if field.init}
+            model_type = getattr(vllm_config.model_config.hf_text_config, "model_type", None)
+            storage_heads = self.num_heads
+            if model_type == "kimi_linear":
+                # Preserve the existing Kimi Linear cache head-count contract.
+                storage_heads = spec.num_heads
+            head_size, dtype, cache_dtype_str, use_sfa_turboquant, use_sfa_c8 = self._get_kv_cache_format(spec)
+
+            # Preserve upstream metadata and apply all owner fields together.
+            # Reuse the physical packing selected by the execution implementation.
+            values.update(
+                num_heads=storage_heads,
+                is_draft=layer_config.is_draft or self.is_draft_layer,
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+                model_version=spec.model_version or getattr(self, "model_version", None),
+                indexes_kv_by_block_stride=bool(
+                    getattr(spec, "indexes_kv_by_block_stride", False)
+                    or getattr(self, "indexes_kv_by_block_stride", False)
+                ),
+                cache_sparse_sfa_turboquant=use_sfa_turboquant,
+                cache_sparse_sfa_c8=use_sfa_c8,
+                store_on_host=(
+                    not (layer_config.is_draft or self.is_draft_layer)
+                    and getattr(self.impl, "store_kv_cache_on_host", False)
+                ),
+                head_size=head_size,
+                dtype=dtype,
+                cache_dtype_str=cache_dtype_str,
+            )
+            return replace(layer_config, spec=AscendMLAAttentionSpec(**values))
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> AscendMLAAttentionSpec:
         """Publish the complete cache demand using the selected execution format."""
+        if not vllm_version_is("0.33.0"):
+            return self.get_kv_cache_config(vllm_config).spec
         spec = super().get_kv_cache_spec(vllm_config)
         if getattr(getattr(vllm_config, "attention_config", None), "hisparse_config", None) is not None:
             return spec
