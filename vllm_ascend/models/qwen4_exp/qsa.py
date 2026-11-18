@@ -28,6 +28,8 @@ from vllm.logger import logger
 # this submodule is imported directly, independently of lazy package exports.
 from vllm.models.qwen4_exp.amd import model as _upstream_model  # noqa: F401
 from vllm.models.qwen4_exp.amd import qsa as upstream_qsa
+from vllm.models.qwen4_exp.amd import qsa_indexer as upstream_indexer  # type: ignore[import-not-found]
+from vllm.models.qwen4_exp.common import qsa_indexer  # type: ignore[import-not-found]
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     get_dtype_size,
@@ -50,27 +52,17 @@ from vllm_ascend.ops.triton.qwen4_exp.qsa import (
 from vllm_ascend.ops.triton.qwen4_exp.qsa import (
     qsa_store_cache_rows as qsa_store_cache_rows_fused,
 )
+
 from .attention_dispatch import build_qsa_request_plan, dispatch_qsa_attention
 from .gbsa import GBSA_PAGE_SIZE, qsa_gbsa_attention
 from .lightning_indexer import QSAIndexerMetadataProtocol, qsa_select_paged_tokens_lightning_v2
 
 if TYPE_CHECKING:
-    import vllm.models.qwen4_exp.amd.qsa_indexer as upstream_indexer
-    import vllm.models.qwen4_exp.common.qsa_indexer as qsa_indexer
-    from vllm.models.qwen4_exp.common.qsa_indexer import (
-        QSAIndexerBackend,
-        QSAIndexerMetadataBuilder,
-        QSARawKeyCache,
-    )
-
     from vllm_ascend.worker.v2.pcp_manager import AscendPCPAttentionContext
 
     class _PCPQSAIndexerMetadata(QSAIndexerMetadataProtocol, Protocol):
         write_metadata: QSAIndexerMetadataProtocol
 
-
-import vllm.models.qwen4_exp.amd.qsa_indexer as upstream_indexer  # type: ignore[import-not-found]
-import vllm.models.qwen4_exp.common.qsa_indexer as qsa_indexer  # type: ignore[import-not-found]
 
 QSAIndexerBackend = qsa_indexer.QSAIndexerBackend
 QSAIndexerMetadataBuilder = qsa_indexer.QSAIndexerMetadataBuilder
@@ -314,7 +306,6 @@ class AscendQSAIndexer(upstream_indexer.QSAIndexer):
             self.k_layernorm,
             first_positions,
         )
-
 
     def forward(  # type: ignore[misc, override]
         self,

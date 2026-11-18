@@ -5,7 +5,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.ops import metadata as upstream_metadata_ops
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker import cp_utils
