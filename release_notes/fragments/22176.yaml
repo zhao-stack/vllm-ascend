@@ -1,0 +1,4 @@
+pr: 22176
+entries:
+  - category: dependency
+    text: Aligned vLLM main support with the native KV cache manager configuration API introduced in vLLM PR 61452 while retaining vLLM v0.33.0 support.
