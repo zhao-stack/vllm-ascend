@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.config.model import ModelConfig
+from vllm.v1 import outputs
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCore
 from vllm.v1.structured_output import StructuredOutputManager
@@ -260,7 +261,7 @@ def test_pp_mtp_spec_tokens_are_written_from_model_runner_output_for_sync_and_as
     assert request.spec_token_ids == [301, 302]
 
 
-def test_pp_mtp_helpers_and_patch_reentry():
+def test_pp_mtp_helpers_and_patch_reentry(monkeypatch):
     assert _is_pd_prefill_node(SimpleNamespace(kv_transfer_config=SimpleNamespace(kv_role="kv_producer"))) is True
     vllm_config = SimpleNamespace(
         kv_transfer_config=None,
@@ -273,7 +274,18 @@ def test_pp_mtp_helpers_and_patch_reentry():
     assert _use_pp_mtp_runtime_patch(vllm_config, use_pp=True) is False
 
     _apply_patch()
-    _patch_model_runner_output()
+
+    class ReleaseModelRunnerOutput(SimpleNamespace):
+        pass
+
+    with monkeypatch.context() as patch:
+        patch.setattr(outputs, "ModelRunnerOutput", ReleaseModelRunnerOutput)
+        patch.setattr(outputs, "EMPTY_MODEL_RUNNER_OUTPUT", ReleaseModelRunnerOutput())
+        _patch_model_runner_output()
+        patched_init = ReleaseModelRunnerOutput.__init__
+        _patch_model_runner_output()
+        assert ReleaseModelRunnerOutput.__init__ is patched_init
+
     _patch_engine_core()
     _patch_scheduler_update_after_schedule()
     _patch_scheduler_make_cached_request_data()
