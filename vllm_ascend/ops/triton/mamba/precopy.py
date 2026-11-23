@@ -3,6 +3,10 @@
 
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.utils import vllm_version_is
+
+_BLOCK_TABLES_IN_REQUEST_ORDER = not vllm_version_is("0.33.0")
+
 
 @triton.jit
 def _copy_mamba_state_block(
@@ -132,6 +136,7 @@ def precopy_mamba_align_fused_kernel(
     HAS_IDX_MAPPING: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr = 1,
     ZERO_TEMPORAL_TOKEN_BIAS: tl.constexpr = False,
+    BLOCK_TABLES_IN_REQUEST_ORDER: tl.constexpr = _BLOCK_TABLES_IN_REQUEST_ORDER,
 ):
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
@@ -159,9 +164,12 @@ def precopy_mamba_align_fused_kernel(
         conv_width = tl.load(state_conv_widths_ptr + state_idx)
         token_bias = tl.where(conv_width > 0, token_bias, 0)
 
+    # Main's initialized context binds the persistent request-slot tables.
+    # The release runner still binds the gathered batch tables lazily.
+    bt_row_idx = req_idx if BLOCK_TABLES_IN_REQUEST_ORDER else batch_idx
     _copy_mamba_state_block(
         state_idx,
-        batch_idx,
+        bt_row_idx,
         src_col,
         dst_col,
         token_bias,

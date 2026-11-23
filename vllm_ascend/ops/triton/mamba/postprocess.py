@@ -4,6 +4,10 @@
 
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.utils import vllm_version_is
+
+_BLOCK_TABLES_IN_REQUEST_ORDER = not vllm_version_is("0.33.0")
+
 
 @triton.jit
 def _copy_temporal_state(
@@ -77,9 +81,7 @@ def postprocess_mamba_fused_kernel(
     state_dim_row_stride_ptr,  # int64: bytes between rows for DS conv
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
-    # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
-    # per-request decision arrays are in req-state-slot order; the block table
-    # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
+    # Optional batch-to-request mapping for the per-request decision arrays.
     idx_mapping_ptr,
     # Runtime parameter (varies per batch - NOT constexpr to avoid recompilation)
     num_reqs,
@@ -103,6 +105,7 @@ def postprocess_mamba_fused_kernel(
     # 3D grid (num_reqs, total_states, TEMPORAL_TILES). Default 1 preserves
     # the existing 2D-grid contract.
     TEMPORAL_TILES: tl.constexpr = 1,
+    BLOCK_TABLES_IN_REQUEST_ORDER: tl.constexpr = _BLOCK_TABLES_IN_REQUEST_ORDER,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -177,7 +180,8 @@ def postprocess_mamba_fused_kernel(
     group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
     block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
 
-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
+    # The release runner's context is initialized with gathered batch rows.
+    bt_row_idx = req_idx if BLOCK_TABLES_IN_REQUEST_ORDER else batch_idx
     block_table_base = block_table_typed + bt_row_idx * block_table_stride_req
 
     # Widen block ids to int64 before they reach `block_id * state_block_stride`

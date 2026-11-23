@@ -40,6 +40,7 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.utils import vllm_version_is
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
 
@@ -719,6 +720,7 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
             self._page_rows,
             max(1, retained_width) if self._lookahead else 0,
             self._tail_inputs[key],
+            use_slot_mapping=vllm_version_is("0.33.0"),
         )
         return AscendIndexerKPoolTailMetadata(
             block_table=block_table,
